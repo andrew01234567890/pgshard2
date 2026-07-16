@@ -518,12 +518,13 @@ func (*GateCloseResponse) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_router_admin_proto_rawDescGZIP(), []int{9}
 }
 
+// Opening uses the min_topology_generation stored on the closed gate itself
+// (topology.proto Gate); the request cannot lower it.
 type GateOpenRequest struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	GateId                string                 `protobuf:"bytes,1,opt,name=gate_id,json=gateId,proto3" json:"gate_id,omitempty"`
-	MinTopologyGeneration uint64                 `protobuf:"varint,2,opt,name=min_topology_generation,json=minTopologyGeneration,proto3" json:"min_topology_generation,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GateId        string                 `protobuf:"bytes,1,opt,name=gate_id,json=gateId,proto3" json:"gate_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GateOpenRequest) Reset() {
@@ -561,13 +562,6 @@ func (x *GateOpenRequest) GetGateId() string {
 		return x.GateId
 	}
 	return ""
-}
-
-func (x *GateOpenRequest) GetMinTopologyGeneration() uint64 {
-	if x != nil {
-		return x.MinTopologyGeneration
-	}
-	return 0
 }
 
 type GateOpenResponse struct {
@@ -722,10 +716,9 @@ const file_pgshard_v1_router_admin_proto_rawDesc = "" +
 	"\x0equiesced_epoch\x18\x01 \x01(\x04R\rquiescedEpoch\"8\n" +
 	"\x10GateCloseRequest\x12$\n" +
 	"\x04gate\x18\x01 \x01(\v2\x10.pgshard.v1.GateR\x04gate\"\x13\n" +
-	"\x11GateCloseResponse\"b\n" +
+	"\x11GateCloseResponse\"*\n" +
 	"\x0fGateOpenRequest\x12\x17\n" +
-	"\agate_id\x18\x01 \x01(\tR\x06gateId\x126\n" +
-	"\x17min_topology_generation\x18\x02 \x01(\x04R\x15minTopologyGeneration\"\x12\n" +
+	"\agate_id\x18\x01 \x01(\tR\x06gateId\"\x12\n" +
 	"\x10GateOpenResponse\"\x17\n" +
 	"\x15FlushPlanCacheRequest\"2\n" +
 	"\x16FlushPlanCacheResponse\x12\x18\n" +

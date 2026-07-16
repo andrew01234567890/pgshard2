@@ -7,7 +7,12 @@ import "pgshard/v1/common.proto";
 
 option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
 
-// Position in the unified stream: one LSN per serving shard.
+// Position in the unified stream: one entry per serving shard.
+//
+// Resume semantics: each lsn is the commit LSN of the last transaction that
+// was fully delivered for that shard. Resuming from a VGtid delivers
+// transactions whose commit LSN is strictly greater — never a duplicate of
+// the recorded transaction, never a skip.
 message VGtid {
   repeated ShardGtid shard_gtids = 1;
 }
@@ -16,39 +21,25 @@ message ShardGtid {
   string shard = 1;
   Lsn lsn = 2;
   // Tables whose snapshot copy already completed (SNAPSHOT_AND_FOLLOW resume).
-  repeated string tables_copied = 3;
-}
-
-enum StartMode {
-  START_MODE_UNSPECIFIED = 0;
-  START_MODE_POSITION = 1;
-  START_MODE_LATEST = 2;
-  START_MODE_SNAPSHOT_AND_FOLLOW = 3;
+  repeated TableRef tables_copied = 3;
 }
 
 message StreamRequest {
   string subscription_id = 1;
-  StartMode mode = 2;
-  VGtid position = 3;
   // Empty means all sharded tables.
-  repeated TableRef tables = 4;
+  repeated TableRef tables = 2;
+  oneof start {
+    // Resume strictly after this position (see VGtid).
+    VGtid position = 3;
+    // Start at the current end of each shard's stream.
+    bool latest = 4;
+    // Stream a consistent snapshot of the tables first, then follow.
+    bool snapshot_and_follow = 5;
+  }
 }
 
 message StreamResponse {
   VEvent event = 1;
-}
-
-enum VEventType {
-  V_EVENT_TYPE_UNSPECIFIED = 0;
-  V_EVENT_TYPE_BEGIN = 1;
-  V_EVENT_TYPE_FIELD = 2;
-  V_EVENT_TYPE_ROW = 3;
-  V_EVENT_TYPE_COMMIT = 4;
-  V_EVENT_TYPE_DDL = 5;
-  V_EVENT_TYPE_JOURNAL = 6;
-  V_EVENT_TYPE_VGTID = 7;
-  V_EVENT_TYPE_HEARTBEAT = 8;
-  V_EVENT_TYPE_COPY_COMPLETED = 9;
 }
 
 message Field {
@@ -81,6 +72,18 @@ message RowEvent {
   repeated CellValue after = 4;
 }
 
+message BeginEvent {
+  Lsn lsn = 1;
+}
+
+message CommitEvent {
+  // Commit LSN of the transaction; after delivering the matching VGtid this
+  // becomes the shard's resume position.
+  Lsn lsn = 1;
+}
+
+message HeartbeatEvent {}
+
 message DdlEvent {
   string sql = 1;
   string migration_id = 2;
@@ -105,16 +108,18 @@ message CopyCompletedEvent {
 }
 
 message VEvent {
-  VEventType type = 1;
-  string shard = 2;
-  google.protobuf.Timestamp commit_time = 3;
-  oneof payload {
+  string shard = 1;
+  google.protobuf.Timestamp commit_time = 2;
+  oneof event {
+    BeginEvent begin = 3;
     FieldEvent field = 4;
     RowEvent row = 5;
-    DdlEvent ddl = 6;
-    JournalEvent journal = 7;
-    VGtid vgtid = 8;
-    CopyCompletedEvent copy_completed = 9;
+    CommitEvent commit = 6;
+    DdlEvent ddl = 7;
+    JournalEvent journal = 8;
+    VGtid vgtid = 9;
+    HeartbeatEvent heartbeat = 10;
+    CopyCompletedEvent copy_completed = 11;
   }
 }
 

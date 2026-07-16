@@ -47,6 +47,10 @@ message InstanceStatus {
 message PromoteRequest {
   // Operator's decision record; agent refuses if it is not the target.
   string target_primary = 1;
+  // Monotonic failover-decision epoch. The agent persists the highest epoch
+  // it has seen and rejects requests with a lower one, so a delayed message
+  // from an older failover cannot reverse a newer decision.
+  uint64 decision_epoch = 2;
 }
 
 message PromoteResponse {
@@ -58,6 +62,8 @@ message RejoinAsStandbyRequest {
   PgEndpoint upstream = 1;
   // Run pg_rewind first if the timeline diverged.
   bool allow_rewind = 2;
+  // See PromoteRequest.decision_epoch: stale requests are rejected.
+  uint64 decision_epoch = 3;
 }
 
 message RejoinAsStandbyResponse {
@@ -66,6 +72,8 @@ message RejoinAsStandbyResponse {
 
 message FenceRequest {
   bool fenced = 1;
+  // See PromoteRequest.decision_epoch: stale requests are rejected.
+  uint64 decision_epoch = 2;
 }
 
 message FenceResponse {}
@@ -149,7 +157,8 @@ message PrepareSourceRequest {
 
 message PrepareSourceResponse {
   // Free WAL headroom for slot retention, from max_slot_wal_keep_size.
-  uint64 wal_headroom_bytes = 1;
+  // Absent means unlimited (max_slot_wal_keep_size = -1).
+  optional uint64 wal_headroom_bytes = 1;
 }
 
 message StartWorkflowRequest {
@@ -193,6 +202,8 @@ message EmitJournalResponse {
 message ShardStreamRequest {
   string subscription_id = 1;
   string shard = 2;
+  // Position of the last fully delivered commit: the stream resumes with
+  // transactions whose commit LSN is strictly greater than this.
   Lsn from_lsn = 3;
   repeated TableRef tables = 4;
   SourcePolicy source_policy = 5;
@@ -210,6 +221,9 @@ message DropSlotResponse {}
 
 message ExecSchemaRequest {
   string sql = 1;
+  // Idempotency key: the agent records completed operation ids and returns
+  // success without re-executing on retry (DDL is not generally idempotent).
+  string operation_id = 2;
 }
 
 message ExecSchemaResponse {}

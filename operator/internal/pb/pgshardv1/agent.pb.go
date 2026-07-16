@@ -460,6 +460,10 @@ type PromoteRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Operator's decision record; agent refuses if it is not the target.
 	TargetPrimary string `protobuf:"bytes,1,opt,name=target_primary,json=targetPrimary,proto3" json:"target_primary,omitempty"`
+	// Monotonic failover-decision epoch. The agent persists the highest epoch
+	// it has seen and rejects requests with a lower one, so a delayed message
+	// from an older failover cannot reverse a newer decision.
+	DecisionEpoch uint64 `protobuf:"varint,2,opt,name=decision_epoch,json=decisionEpoch,proto3" json:"decision_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -499,6 +503,13 @@ func (x *PromoteRequest) GetTargetPrimary() string {
 		return x.TargetPrimary
 	}
 	return ""
+}
+
+func (x *PromoteRequest) GetDecisionEpoch() uint64 {
+	if x != nil {
+		return x.DecisionEpoch
+	}
+	return 0
 }
 
 type PromoteResponse struct {
@@ -557,7 +568,9 @@ type RejoinAsStandbyRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Upstream *PgEndpoint            `protobuf:"bytes,1,opt,name=upstream,proto3" json:"upstream,omitempty"`
 	// Run pg_rewind first if the timeline diverged.
-	AllowRewind   bool `protobuf:"varint,2,opt,name=allow_rewind,json=allowRewind,proto3" json:"allow_rewind,omitempty"`
+	AllowRewind bool `protobuf:"varint,2,opt,name=allow_rewind,json=allowRewind,proto3" json:"allow_rewind,omitempty"`
+	// See PromoteRequest.decision_epoch: stale requests are rejected.
+	DecisionEpoch uint64 `protobuf:"varint,3,opt,name=decision_epoch,json=decisionEpoch,proto3" json:"decision_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -606,6 +619,13 @@ func (x *RejoinAsStandbyRequest) GetAllowRewind() bool {
 	return false
 }
 
+func (x *RejoinAsStandbyRequest) GetDecisionEpoch() uint64 {
+	if x != nil {
+		return x.DecisionEpoch
+	}
+	return 0
+}
+
 type RejoinAsStandbyResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Rewound       bool                   `protobuf:"varint,1,opt,name=rewound,proto3" json:"rewound,omitempty"`
@@ -651,8 +671,10 @@ func (x *RejoinAsStandbyResponse) GetRewound() bool {
 }
 
 type FenceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Fenced        bool                   `protobuf:"varint,1,opt,name=fenced,proto3" json:"fenced,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Fenced bool                   `protobuf:"varint,1,opt,name=fenced,proto3" json:"fenced,omitempty"`
+	// See PromoteRequest.decision_epoch: stale requests are rejected.
+	DecisionEpoch uint64 `protobuf:"varint,2,opt,name=decision_epoch,json=decisionEpoch,proto3" json:"decision_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -692,6 +714,13 @@ func (x *FenceRequest) GetFenced() bool {
 		return x.Fenced
 	}
 	return false
+}
+
+func (x *FenceRequest) GetDecisionEpoch() uint64 {
+	if x != nil {
+		return x.DecisionEpoch
+	}
+	return 0
 }
 
 type FenceResponse struct {
@@ -1476,7 +1505,8 @@ func (x *PrepareSourceRequest) GetTables() []*TableRef {
 type PrepareSourceResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Free WAL headroom for slot retention, from max_slot_wal_keep_size.
-	WalHeadroomBytes uint64 `protobuf:"varint,1,opt,name=wal_headroom_bytes,json=walHeadroomBytes,proto3" json:"wal_headroom_bytes,omitempty"`
+	// Absent means unlimited (max_slot_wal_keep_size = -1).
+	WalHeadroomBytes *uint64 `protobuf:"varint,1,opt,name=wal_headroom_bytes,json=walHeadroomBytes,proto3,oneof" json:"wal_headroom_bytes,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -1512,8 +1542,8 @@ func (*PrepareSourceResponse) Descriptor() ([]byte, []int) {
 }
 
 func (x *PrepareSourceResponse) GetWalHeadroomBytes() uint64 {
-	if x != nil {
-		return x.WalHeadroomBytes
+	if x != nil && x.WalHeadroomBytes != nil {
+		return *x.WalHeadroomBytes
 	}
 	return 0
 }
@@ -1949,11 +1979,13 @@ type ShardStreamRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SubscriptionId string                 `protobuf:"bytes,1,opt,name=subscription_id,json=subscriptionId,proto3" json:"subscription_id,omitempty"`
 	Shard          string                 `protobuf:"bytes,2,opt,name=shard,proto3" json:"shard,omitempty"`
-	FromLsn        *Lsn                   `protobuf:"bytes,3,opt,name=from_lsn,json=fromLsn,proto3" json:"from_lsn,omitempty"`
-	Tables         []*TableRef            `protobuf:"bytes,4,rep,name=tables,proto3" json:"tables,omitempty"`
-	SourcePolicy   SourcePolicy           `protobuf:"varint,5,opt,name=source_policy,json=sourcePolicy,proto3,enum=pgshard.v1.SourcePolicy" json:"source_policy,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Position of the last fully delivered commit: the stream resumes with
+	// transactions whose commit LSN is strictly greater than this.
+	FromLsn       *Lsn         `protobuf:"bytes,3,opt,name=from_lsn,json=fromLsn,proto3" json:"from_lsn,omitempty"`
+	Tables        []*TableRef  `protobuf:"bytes,4,rep,name=tables,proto3" json:"tables,omitempty"`
+	SourcePolicy  SourcePolicy `protobuf:"varint,5,opt,name=source_policy,json=sourcePolicy,proto3,enum=pgshard.v1.SourcePolicy" json:"source_policy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ShardStreamRequest) Reset() {
@@ -2146,8 +2178,11 @@ func (*DropSlotResponse) Descriptor() ([]byte, []int) {
 }
 
 type ExecSchemaRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Sql           string                 `protobuf:"bytes,1,opt,name=sql,proto3" json:"sql,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Sql   string                 `protobuf:"bytes,1,opt,name=sql,proto3" json:"sql,omitempty"`
+	// Idempotency key: the agent records completed operation ids and returns
+	// success without re-executing on retry (DDL is not generally idempotent).
+	OperationId   string `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2185,6 +2220,13 @@ func (*ExecSchemaRequest) Descriptor() ([]byte, []int) {
 func (x *ExecSchemaRequest) GetSql() string {
 	if x != nil {
 		return x.Sql
+	}
+	return ""
+}
+
+func (x *ExecSchemaRequest) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
 	}
 	return ""
 }
@@ -2377,20 +2419,23 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	" \x01(\bR\x10archivingHealthy\x12)\n" +
 	"\x10postgres_version\x18\v \x01(\tR\x0fpostgresVersion\x12\x1b\n" +
 	"\tsystem_id\x18\f \x01(\x04R\bsystemId\x12\x16\n" +
-	"\x06fenced\x18\r \x01(\bR\x06fenced\"7\n" +
+	"\x06fenced\x18\r \x01(\bR\x06fenced\"^\n" +
 	"\x0ePromoteRequest\x12%\n" +
-	"\x0etarget_primary\x18\x01 \x01(\tR\rtargetPrimary\"f\n" +
+	"\x0etarget_primary\x18\x01 \x01(\tR\rtargetPrimary\x12%\n" +
+	"\x0edecision_epoch\x18\x02 \x01(\x04R\rdecisionEpoch\"f\n" +
 	"\x0fPromoteResponse\x12!\n" +
 	"\fnew_timeline\x18\x01 \x01(\rR\vnewTimeline\x120\n" +
 	"\vpromote_lsn\x18\x02 \x01(\v2\x0f.pgshard.v1.LsnR\n" +
-	"promoteLsn\"o\n" +
+	"promoteLsn\"\x96\x01\n" +
 	"\x16RejoinAsStandbyRequest\x122\n" +
 	"\bupstream\x18\x01 \x01(\v2\x16.pgshard.v1.PgEndpointR\bupstream\x12!\n" +
-	"\fallow_rewind\x18\x02 \x01(\bR\vallowRewind\"3\n" +
+	"\fallow_rewind\x18\x02 \x01(\bR\vallowRewind\x12%\n" +
+	"\x0edecision_epoch\x18\x03 \x01(\x04R\rdecisionEpoch\"3\n" +
 	"\x17RejoinAsStandbyResponse\x12\x18\n" +
-	"\arewound\x18\x01 \x01(\bR\arewound\"&\n" +
+	"\arewound\x18\x01 \x01(\bR\arewound\"M\n" +
 	"\fFenceRequest\x12\x16\n" +
-	"\x06fenced\x18\x01 \x01(\bR\x06fenced\"\x0f\n" +
+	"\x06fenced\x18\x01 \x01(\bR\x06fenced\x12%\n" +
+	"\x0edecision_epoch\x18\x02 \x01(\x04R\rdecisionEpoch\"\x0f\n" +
 	"\rFenceResponse\"\x15\n" +
 	"\x13ReloadConfigRequest\"\x16\n" +
 	"\x14ReloadConfigResponse\"/\n" +
@@ -2433,9 +2478,10 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06detail\x18\x02 \x01(\tR\x06detail\"f\n" +
 	"\x14PrepareSourceRequest\x12 \n" +
 	"\vpublication\x18\x01 \x01(\tR\vpublication\x12,\n" +
-	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\"E\n" +
-	"\x15PrepareSourceResponse\x12,\n" +
-	"\x12wal_headroom_bytes\x18\x01 \x01(\x04R\x10walHeadroomBytes\"D\n" +
+	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\"a\n" +
+	"\x15PrepareSourceResponse\x121\n" +
+	"\x12wal_headroom_bytes\x18\x01 \x01(\x04H\x00R\x10walHeadroomBytes\x88\x01\x01B\x15\n" +
+	"\x13_wal_headroom_bytes\"D\n" +
 	"\x14StartWorkflowRequest\x12,\n" +
 	"\x04spec\x18\x01 \x01(\v2\x18.pgshard.v1.WorkflowSpecR\x04spec\"\x17\n" +
 	"\x15StartWorkflowResponse\"B\n" +
@@ -2464,9 +2510,10 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06events\x18\x01 \x03(\v2\x12.pgshard.v1.VEventR\x06events\"%\n" +
 	"\x0fDropSlotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\"\x12\n" +
-	"\x10DropSlotResponse\"%\n" +
+	"\x10DropSlotResponse\"H\n" +
 	"\x11ExecSchemaRequest\x12\x10\n" +
-	"\x03sql\x18\x01 \x01(\tR\x03sql\"\x14\n" +
+	"\x03sql\x18\x01 \x01(\tR\x03sql\x12!\n" +
+	"\foperation_id\x18\x02 \x01(\tR\voperationId\"\x14\n" +
 	"\x12ExecSchemaResponse\"\xd6\x01\n" +
 	"\x14MigrationStepRequest\x12!\n" +
 	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x121\n" +
@@ -2683,6 +2730,7 @@ func file_pgshard_v1_agent_proto_init() {
 	file_pgshard_v1_common_proto_init()
 	file_pgshard_v1_vstream_proto_init()
 	file_pgshard_v1_workflow_proto_init()
+	file_pgshard_v1_agent_proto_msgTypes[24].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

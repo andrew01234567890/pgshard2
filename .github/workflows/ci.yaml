@@ -51,6 +51,7 @@ jobs:
       - uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1
         with:
           setup_only: true
+          version: 1.71.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: operator/go.mod
@@ -58,7 +59,12 @@ jobs:
       - name: Lint and regenerate
         run: make proto
       - name: Generated code is committed and fresh
-        run: git diff --exit-code
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::generated code is stale or untracked — run 'make proto' and commit"
+            exit 1
+          fi
       - name: Breaking-change check against main
         run: |
           if git cat-file -e origin/main:buf.yaml 2>/dev/null; then

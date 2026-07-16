@@ -52,9 +52,10 @@ message GateCloseRequest {
 
 message GateCloseResponse {}
 
+// Opening uses the min_topology_generation stored on the closed gate itself
+// (topology.proto Gate); the request cannot lower it.
 message GateOpenRequest {
   string gate_id = 1;
-  uint64 min_topology_generation = 2;
 }
 
 message GateOpenResponse {}
