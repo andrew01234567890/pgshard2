@@ -1,0 +1,9 @@
+apiVersion: pgshard.dev/v1alpha1
+kind: PgShardShard
+metadata:
+  labels:
+    app.kubernetes.io/name: pgshard
+    app.kubernetes.io/managed-by: kustomize
+  name: pgshardshard-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,403 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardshards.pgshard.dev
+spec:
+  group: pgshard.dev
+  names:
+    kind: PgShardShard
+    listKind: PgShardShardList
+    plural: pgshardshards
+    singular: pgshardshard
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterRef
+      name: Cluster
+      type: string
+    - jsonPath: .spec.keyRange.start
+      name: Range
+      type: string
+    - jsonPath: .spec.serving
+      name: Serving
+      type: boolean
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.currentPrimary
+      name: Primary
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PgShardShard is one shard of a PgShardCluster (operator-managed).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardShardSpec defines the desired state of one shard. The operator
+              writes it; the shard's agents watch it.
+            properties:
+              clusterRef:
+                type: string
+                x-kubernetes-validations:
+                - message: clusterRef is immutable
+                  rule: self == oldSelf
+              fenced:
+                description: 'Fenced freezes the shard: agents keep PostgreSQL down
+                  until lifted.'
+                type: boolean
+              image:
+                type: string
+              keyRange:
+                description: |-
+                  KeyRange is a half-open range [start, end) over the 64-bit keyspace in
+                  the canonical trimmed big-endian hex syntax: "40" means
+                  0x4000000000000000; an empty start is 0 and an empty end is the top of
+                  the keyspace. A shard's identity IS its range: reshards never mutate it,
+                  they create new shards and retire old ones.
+                properties:
+                  end:
+                    maxLength: 16
+                    pattern: ^([0-9a-f]{2}){0,8}$
+                    type: string
+                  start:
+                    maxLength: 16
+                    pattern: ^([0-9a-f]{2}){0,8}$
+                    type: string
+                type: object
+              postgresConfigHash:
+                description: |-
+                  Content hash of the shard's rendered PostgreSQL configuration; a
+                  change drives the rolling-restart/reload flow.
+                type: string
+              replicas:
+                description: Instances including the primary.
+                format: int32
+                maximum: 9
+                minimum: 1
+                type: integer
+              replicationLinks:
+                items:
+                  description: |-
+                    ReplicationLink directs the agents to run a logical-replication workflow
+                    (reshard seeding forward or reverse); the data-plane engine executes it.
+                  properties:
+                    keyRangeFilter:
+                      description: Rows outside this range are filtered agent-side.
+                      properties:
+                        end:
+                          maxLength: 16
+                          pattern: ^([0-9a-f]{2}){0,8}$
+                          type: string
+                        start:
+                          maxLength: 16
+                          pattern: ^([0-9a-f]{2}){0,8}$
+                          type: string
+                      type: object
+                    name:
+                      type: string
+                    publication:
+                      type: string
+                    slot:
+                      type: string
+                    sourceShard:
+                      description: |-
+                        Exactly one of sourceShard/targetShard names the peer; the other end
+                        is this shard.
+                      type: string
+                    targetShard:
+                      type: string
+                  required:
+                  - name
+                  - publication
+                  - slot
+                  type: object
+                type: array
+              resources:
+                description: ResourceRequirements describes the compute resource requirements.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              role:
+                default: data
+                enum:
+                - data
+                - system
+                type: string
+              serving:
+                default: false
+                description: |-
+                  Serving is false for reshard targets before cutover and for
+                  decommissioned sources after it.
+                type: boolean
+              stanza:
+                description: |-
+                  pgBackRest stanza (includes the stanza generation suffix; a restore
+                  starts a new generation).
+                type: string
+              storage:
+                description: StorageSpec describes per-instance persistent storage.
+                properties:
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  storageClass:
+                    type: string
+                  walSeparate:
+                    description: WalSeparate provisions a dedicated WAL volume.
+                    type: boolean
+                required:
+                - size
+                type: object
+            required:
+            - clusterRef
+            - keyRange
+            - replicas
+            type: object
+            x-kubernetes-validations:
+            - message: keyRange is immutable; reshard creates new shards
+              rule: self.keyRange == oldSelf.keyRange
+          status:
+            description: |-
+              PgShardShardStatus is the observed state of one shard. The
+              targetPrimary/currentPrimary pair is the CNPG-style failover handshake:
+              the operator sets the target; the elected agent promotes (guarded by the
+              shard's Kubernetes Lease) and the operator records currentPrimary once
+              the promotion is confirmed.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentPrimary:
+                type: string
+              decisionEpoch:
+                description: |-
+                  Monotonic failover-decision epoch carried on agent Promote/Fence
+                  calls; agents reject anything older than the highest they have seen.
+                format: int64
+                type: integer
+              instances:
+                items:
+                  description: |-
+                    InstanceState is the operator's aggregated view of one instance,
+                    populated by polling the in-pod agent (agents do not write status).
+                  properties:
+                    pod:
+                      type: string
+                    ready:
+                      type: boolean
+                    replayLagSeconds:
+                      type: string
+                    role:
+                      description: InstanceRole of a PostgreSQL instance within the
+                        shard.
+                      enum:
+                      - primary
+                      - replica
+                      type: string
+                    syncState:
+                      type: string
+                    walReplayLsn:
+                      type: string
+                    walWriteLsn:
+                      description: Current WAL positions in PostgreSQL X/X text form.
+                      type: string
+                  required:
+                  - pod
+                  type: object
+                type: array
+              lastBarrier:
+                description: BarrierRecord is the shard-local fact of the last consistency
+                  barrier.
+                properties:
+                  id:
+                    type: string
+                  lsn:
+                    type: string
+                  restorePoint:
+                    type: string
+                  time:
+                    format: date-time
+                    type: string
+                type: object
+              links:
+                items:
+                  description: ReplicationLinkStatus reports link progress.
+                  properties:
+                    lagBytes:
+                      format: int64
+                      type: integer
+                    lagSeconds:
+                      type: string
+                    name:
+                      type: string
+                    phase:
+                      description: ReplicationLinkPhase tracks a seeding/reverse link's
+                        lifecycle.
+                      enum:
+                      - Pending
+                      - Copying
+                      - CatchingUp
+                      - Synced
+                      - Stopped
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              phase:
+                enum:
+                - Provisioning
+                - Ready
+                - FailingOver
+                - SwitchingOver
+                - Degraded
+                - Restoring
+                - Decommissioning
+                type: string
+              stanzaInitialized:
+                type: boolean
+              targetPrimary:
+                type: string
+              targetPrimaryTimestamp:
+                format: date-time
+                type: string
+              timeline:
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

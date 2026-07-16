@@ -3,9 +3,28 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.15.0
-domain: pgshard.dev
+domain: dev
 layout:
 - go.kubebuilder.io/v4
 projectName: pgshard
 repo: github.com/andrew01234567890/pgshard2/operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: dev
+  group: pgshard
+  kind: PgShardCluster
+  path: github.com/andrew01234567890/pgshard2/operator/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: dev
+  group: pgshard
+  kind: PgShardShard
+  path: github.com/andrew01234567890/pgshard2/operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
