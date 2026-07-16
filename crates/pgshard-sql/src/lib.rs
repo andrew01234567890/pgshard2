@@ -9,7 +9,7 @@
 //! This is the one place the "PG18-only" product briefly runs a PG17 grammar.
 
 use pg_query::NodeEnum;
-use pg_query::protobuf::TransactionStmtKind;
+use pg_query::protobuf::{SelectStmt, TransactionStmtKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -33,6 +33,9 @@ pub enum StatementKind {
     TxnOther,
     Set,
     Show,
+    /// DDL plus broadcast utility — schema/catalog changes and
+    /// VACUUM/ANALYZE/REINDEX/CLUSTER, GRANT, COMMENT, SECURITY LABEL — that
+    /// route to every shard rather than by shard key.
     Ddl,
     Copy,
     PrepareExec,
@@ -57,6 +60,12 @@ impl Parsed {
     /// `INSERT INTO t (a, b) ...` and `INSERT INTO t (b, a) ...` collide.
     /// The planner must therefore bind shard keys by column *name* from the
     /// AST — never by parameter index inferred from a fingerprint match.
+    ///
+    /// It also collapses variable-length constant lists: `id IN (1, 2, 3)`,
+    /// `id IN (1)`, and multi-row `VALUES`/INSERT all share a fingerprint. List
+    /// and row *cardinality* is not in the key — the count of shard-key values
+    /// must be read from the AST, or a multi-shard query could reuse (and
+    /// under-route through) a cached single-shard plan.
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
@@ -68,10 +77,12 @@ impl Parsed {
     /// Relations referenced anywhere in the query, as written
     /// (schema-qualified when the query qualified them), deduped.
     ///
-    /// CTE names are excluded across the whole parse, not per statement, so in
-    /// a multi-statement simple-protocol batch a real table whose name matches
-    /// a CTE defined in an earlier statement can be missed. The extended
-    /// protocol parses one statement per message and is unaffected.
+    /// libpg_query excludes CTE names parse-wide, so a real relation whose
+    /// *unqualified* name equals a CTE name is dropped — even within a single
+    /// statement, in any protocol: `WITH orders AS (...) SELECT FROM orders`
+    /// returns no `orders`. Schema-qualifying the relation avoids it (the CTE
+    /// name never carries a schema). The planner must not read an empty result
+    /// as "no relations" for a query that has a WITH clause.
     pub fn tables(&self) -> &[String] {
         &self.tables
     }
@@ -103,8 +114,8 @@ pub fn parse(sql: &str) -> Result<Parsed, SqlError> {
     })
 }
 
-/// libpg_query's literal-normalization (`$n` placeholders); used by tests to
-/// assert fingerprint stability and by slow-query logging.
+/// libpg_query's literal-normalization (`$n` placeholders): the canonical text
+/// a fingerprint is computed over.
 pub fn normalize(sql: &str) -> Result<String, SqlError> {
     pg_query::normalize(sql).map_err(SqlError::Parse)
 }
@@ -116,17 +127,23 @@ fn classify(node: Option<&NodeEnum>) -> StatementKind {
     match node {
         // `SELECT ... INTO newtable` creates a relation: it is DDL, not a read.
         NodeEnum::SelectStmt(s) if s.into_clause.is_some() => StatementKind::Ddl,
+        // A data-modifying CTE (`WITH x AS (DELETE/INSERT/UPDATE/MERGE ...)
+        // SELECT ...`) writes; keep it off the read path instead of labeling
+        // it Select. Other is the conservative bucket — never a read signal.
+        NodeEnum::SelectStmt(s) if has_writable_cte(s) => StatementKind::Other,
         NodeEnum::SelectStmt(_) => StatementKind::Select,
         NodeEnum::InsertStmt(_) => StatementKind::Insert,
         NodeEnum::UpdateStmt(_) => StatementKind::Update,
         NodeEnum::DeleteStmt(_) => StatementKind::Delete,
         NodeEnum::MergeStmt(_) => StatementKind::Merge,
-        NodeEnum::TransactionStmt(t) => match t.kind() {
-            TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => {
+        // TransactionStmt.kind is a raw i32; decode via try_from so the crate
+        // builds whether or not prost regenerated the enum accessor.
+        NodeEnum::TransactionStmt(t) => match TransactionStmtKind::try_from(t.kind) {
+            Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
                 StatementKind::TxnBegin
             }
-            TransactionStmtKind::TransStmtCommit => StatementKind::TxnCommit,
-            TransactionStmtKind::TransStmtRollback => StatementKind::TxnRollback,
+            Ok(TransactionStmtKind::TransStmtCommit) => StatementKind::TxnCommit,
+            Ok(TransactionStmtKind::TransStmtRollback) => StatementKind::TxnRollback,
             _ => StatementKind::TxnOther,
         },
         NodeEnum::VariableSetStmt(_) => StatementKind::Set,
@@ -149,6 +166,7 @@ fn classify(node: Option<&NodeEnum>) -> StatementKind {
         | NodeEnum::RefreshMatViewStmt(_)
         | NodeEnum::CreateForeignTableStmt(_)
         | NodeEnum::CreateStatsStmt(_)
+        | NodeEnum::AlterStatsStmt(_)
         | NodeEnum::AlterDomainStmt(_)
         | NodeEnum::CreateDomainStmt(_)
         | NodeEnum::CreateFunctionStmt(_)
@@ -169,8 +187,13 @@ fn classify(node: Option<&NodeEnum>) -> StatementKind {
         | NodeEnum::CreateTableSpaceStmt(_)
         | NodeEnum::CreateAmStmt(_)
         | NodeEnum::CreateFdwStmt(_)
+        | NodeEnum::AlterFdwStmt(_)
         | NodeEnum::CreateForeignServerStmt(_)
+        | NodeEnum::AlterForeignServerStmt(_)
         | NodeEnum::CreateUserMappingStmt(_)
+        | NodeEnum::AlterUserMappingStmt(_)
+        | NodeEnum::DropUserMappingStmt(_)
+        | NodeEnum::ImportForeignSchemaStmt(_)
         | NodeEnum::CreatePublicationStmt(_)
         | NodeEnum::AlterPublicationStmt(_)
         | NodeEnum::CreateSubscriptionStmt(_)
@@ -190,6 +213,29 @@ fn classify(node: Option<&NodeEnum>) -> StatementKind {
         | NodeEnum::GrantRoleStmt(_) => StatementKind::Ddl,
         _ => StatementKind::Other,
     }
+}
+
+/// True when a SELECT carries a data-modifying CTE (`WITH x AS (INSERT/UPDATE/
+/// DELETE/MERGE ...) SELECT ...`). Such a statement writes, so it must not be
+/// classified as a plain read.
+fn has_writable_cte(select: &SelectStmt) -> bool {
+    let Some(with) = select.with_clause.as_ref() else {
+        return false;
+    };
+    with.ctes.iter().any(|node| {
+        let Some(NodeEnum::CommonTableExpr(cte)) = node.node.as_ref() else {
+            return false;
+        };
+        matches!(
+            cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            Some(
+                NodeEnum::InsertStmt(_)
+                    | NodeEnum::UpdateStmt(_)
+                    | NodeEnum::DeleteStmt(_)
+                    | NodeEnum::MergeStmt(_)
+            )
+        )
+    })
 }
 
 #[cfg(test)]
@@ -240,8 +286,17 @@ mod tests {
             ("SELECT * INTO dst FROM src", StatementKind::Ddl),
             ("REFRESH MATERIALIZED VIEW mv", StatementKind::Ddl),
             ("CREATE STATISTICS st ON a, b FROM t", StatementKind::Ddl),
+            ("ALTER STATISTICS st SET STATISTICS 100", StatementKind::Ddl),
             (
                 "CREATE FOREIGN TABLE ft (id int) SERVER srv",
+                StatementKind::Ddl,
+            ),
+            (
+                "IMPORT FOREIGN SCHEMA remote LIMIT TO (t) FROM SERVER srv INTO local",
+                StatementKind::Ddl,
+            ),
+            (
+                "DROP USER MAPPING FOR CURRENT_USER SERVER srv",
                 StatementKind::Ddl,
             ),
             ("CREATE PUBLICATION p FOR ALL TABLES", StatementKind::Ddl),
@@ -252,6 +307,16 @@ mod tests {
             (
                 "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DO NOTHING",
                 StatementKind::Merge,
+            ),
+            // A data-modifying CTE writes; it must not be classified as a read.
+            (
+                "WITH d AS (DELETE FROM orders WHERE id = 1 RETURNING id) SELECT count(*) FROM d",
+                StatementKind::Other,
+            ),
+            // A read-only CTE stays a Select.
+            (
+                "WITH recent AS (SELECT id FROM orders LIMIT 10) SELECT count(*) FROM recent",
+                StatementKind::Select,
             ),
             ("COPY t FROM STDIN", StatementKind::Copy),
             ("PREPARE p AS SELECT 1", StatementKind::PrepareExec),
