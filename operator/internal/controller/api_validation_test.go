@@ -25,7 +25,10 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
 
-const valNamespace = "default"
+const (
+	valNamespace  = "default"
+	customerIDCol = "customer_id"
+)
 
 var _ = Describe("API validation", func() {
 
@@ -156,7 +159,7 @@ var _ = Describe("API validation", func() {
 		_ = k8sClient.Delete(ctx, seqOnly)
 		// A valid sharded table is admitted.
 		ok := tc("tc-ok", []pgshardv1alpha1.TableEntry{
-			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id"},
+			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol},
 		})
 		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
 		_ = k8sClient.Delete(ctx, ok)
@@ -209,7 +212,7 @@ var _ = Describe("API validation", func() {
 		Expect(k8sClient.Create(ctx, route("rt-inject", pgshardv1alpha1.PgShardRoutingSpec{
 			Tables: []pgshardv1alpha1.RoutingTable{{
 				Schema: "public", Name: `orders"; DROP TABLE x; --`,
-				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id",
+				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol,
 			}},
 		}))).NotTo(Succeed())
 		// A host carrying connection-string metacharacters is rejected.
@@ -229,7 +232,7 @@ var _ = Describe("API validation", func() {
 			}},
 			Tables: []pgshardv1alpha1.RoutingTable{{
 				Schema: "public", Name: "orders",
-				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id",
+				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol,
 			}},
 		})
 		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
