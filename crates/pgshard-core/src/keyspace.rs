@@ -53,10 +53,6 @@ impl KeyRange {
         self.end.map_or(1u128 << 64, u128::from)
     }
 
-    pub fn is_full(&self) -> bool {
-        self.start == 0 && self.end.is_none()
-    }
-
     pub fn contains(&self, id: KeyspaceId) -> bool {
         id.0 >= self.start && u128::from(id.0) < self.end_exclusive()
     }
@@ -67,7 +63,8 @@ impl KeyRange {
     }
 
     /// Splits into `parts` contiguous sub-ranges of near-equal width
-    /// (boundaries at `start + round(i * width / parts)`).
+    /// (boundaries at `start + floor(i * width / parts)`, matching the Go
+    /// implementation in operator/internal/topology).
     pub fn split_evenly(&self, parts: u32) -> Result<Vec<KeyRange>, KeyRangeError> {
         if parts == 0 {
             return Err(KeyRangeError::InvalidSplit(parts));
@@ -101,13 +98,8 @@ pub fn format_bound(v: u64) -> String {
         return String::new();
     }
     let full = format!("{v:016x}");
-    let trimmed = full.trim_end_matches("00");
-    // An odd number of remaining digits would change the byte alignment.
-    if trimmed.len() % 2 == 1 {
-        format!("{trimmed}0")
-    } else {
-        trimmed.to_string()
-    }
+    // Trimming the two-char unit "00" keeps the length even (byte-aligned).
+    full.trim_end_matches("00").to_string()
 }
 
 pub fn parse_bound(s: &str) -> Result<u64, KeyRangeError> {

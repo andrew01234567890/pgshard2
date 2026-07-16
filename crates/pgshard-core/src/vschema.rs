@@ -46,6 +46,8 @@ pub enum TableDef {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum VSchemaError {
+    #[error("empty schema or table name in {0:?}.{1:?}")]
+    EmptyTableName(String, String),
     #[error("table {0} declared twice")]
     DuplicateTable(TableName),
     #[error("table {0}: shard key column is empty")]
@@ -65,6 +67,9 @@ pub struct VSchema {
 
 impl VSchema {
     pub fn insert(&mut self, table: TableName, def: TableDef) -> Result<(), VSchemaError> {
+        if table.schema.is_empty() || table.name.is_empty() {
+            return Err(VSchemaError::EmptyTableName(table.schema, table.name));
+        }
         if self.tables.contains_key(&table) {
             return Err(VSchemaError::DuplicateTable(table));
         }
@@ -134,6 +139,19 @@ mod tests {
         assert_eq!(
             schema.insert(orders.clone(), TableDef::Global),
             Err(VSchemaError::DuplicateTable(orders))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_names() {
+        let mut schema = VSchema::default();
+        assert_eq!(
+            schema.insert(TableName::new("", "orders"), TableDef::Global),
+            Err(VSchemaError::EmptyTableName("".into(), "orders".into()))
+        );
+        assert_eq!(
+            schema.insert(TableName::new("public", ""), TableDef::Global),
+            Err(VSchemaError::EmptyTableName("public".into(), "".into()))
         );
     }
 

@@ -21,7 +21,8 @@ proptest! {
 
     #[test]
     fn split_partitions_and_preserves_bounds(range in key_range(), parts in 1u32..=64) {
-        prop_assume!(range.end().is_none_or(|e| e - range.start() >= u64::from(parts)));
+        let width = range.end().map_or(1u128 << 64, u128::from) - u128::from(range.start());
+        prop_assume!(width >= u128::from(parts));
         let split = range.split_evenly(parts).unwrap();
         prop_assert_eq!(split.len(), parts as usize);
         prop_assert_eq!(split.first().unwrap().start(), range.start());
