@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,6 +52,10 @@ const (
 	// binary from its own image into this shared volume; the postgres
 	// container runs it as PID 1.
 	agentVolumePath = "/pgshard"
+
+	portNamePostgres  = "postgres"
+	agentVolumeName   = "agent"
+	headlessSvcSuffix = "-pods"
 )
 
 // ShardImages are the images shard pods run; wired from manager flags.
@@ -140,7 +145,7 @@ func (r *PgShardShardReconciler) ensureServices(
 		{"-rw", withRole(shardSelector(shard), roleLabelPrimary), false},
 		{"-ro", withRole(shardSelector(shard), roleLabelReplica), false},
 		{"-r", shardSelector(shard), false},
-		{"-pods", shardSelector(shard), true},
+		{headlessSvcSuffix, shardSelector(shard), true},
 	}
 	for _, spec := range services {
 		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
@@ -150,7 +155,7 @@ func (r *PgShardShardReconciler) ensureServices(
 			svc.Labels = shardSelector(shard)
 			svc.Spec.Selector = spec.selector
 			svc.Spec.Ports = []corev1.ServicePort{{
-				Name: "postgres", Port: 5432, TargetPort: intstr.FromString("postgres"),
+				Name: portNamePostgres, Port: 5432, TargetPort: intstr.FromString(portNamePostgres),
 			}}
 			if spec.headless {
 				svc.Spec.ClusterIP = corev1.ClusterIPNone
@@ -168,9 +173,7 @@ func (r *PgShardShardReconciler) ensureServices(
 
 func withRole(selector map[string]string, role string) map[string]string {
 	out := map[string]string{labelRole: role}
-	for k, v := range selector {
-		out[k] = v
-	}
+	maps.Copy(out, selector)
 	return out
 }
 
@@ -260,7 +263,7 @@ func (r *PgShardShardReconciler) instancePod(
 				Image:   r.Images.Agent,
 				Command: []string{"cp", "/pgshard-agent", agentVolumePath + "/pgshard-agent"},
 				VolumeMounts: []corev1.VolumeMount{{
-					Name: "agent", MountPath: agentVolumePath,
+					Name: agentVolumeName, MountPath: agentVolumePath,
 				}},
 			}},
 			Containers: []corev1.Container{{
@@ -307,7 +310,7 @@ func (r *PgShardShardReconciler) instancePod(
 				},
 			}},
 			Volumes: []corev1.Volume{
-				{Name: "agent", VolumeSource: corev1.VolumeSource{
+				{Name: agentVolumeName, VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				}},
 				{Name: "data", VolumeSource: corev1.VolumeSource{
