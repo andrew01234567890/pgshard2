@@ -133,10 +133,12 @@ type RoutingGate struct {
 // operator writes it; every change is one write with a strictly monotonic
 // epoch, and consumers apply an update iff epoch > lastApplied.
 //
-// The epoch and topology generation are enforced monotonic non-decreasing
-// across updates: a router that saw a higher epoch must never observe the
-// object regress to a lower one (which it would silently discard as stale).
-// +kubebuilder:validation:XValidation:rule="self.epoch >= oldSelf.epoch",message="epoch must not decrease"
+// Every spec change must strictly increase the epoch: consumers apply an
+// update iff epoch > lastApplied, so a change that reused the current epoch
+// would be silently ignored. An equal epoch is therefore allowed only for an
+// identical (idempotent) re-apply. The topology generation may stay equal
+// across non-structural epoch bumps but must never decrease.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf || self.epoch > oldSelf.epoch",message="any change must strictly increase epoch"
 // +kubebuilder:validation:XValidation:rule="self.topologyGeneration >= oldSelf.topologyGeneration",message="topologyGeneration must not decrease"
 type PgShardRoutingSpec struct {
 	// +kubebuilder:validation:Minimum=1

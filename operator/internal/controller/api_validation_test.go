@@ -179,6 +179,17 @@ var _ = Describe("API validation", func() {
 		r.Spec.TopologyGeneration = 1 // generation regression
 		Expect(k8sClient.Update(ctx, r)).NotTo(Succeed())
 
+		// A spec change that reuses the current epoch is rejected — consumers
+		// keyed on epoch>lastApplied would silently ignore it.
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
+		r.Spec.WriteLeaseSeconds = 20 // change without an epoch bump
+		Expect(k8sClient.Update(ctx, r)).NotTo(Succeed())
+
+		// A no-op re-apply at the same epoch is allowed.
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
+		Expect(k8sClient.Update(ctx, r)).To(Succeed())
+
+		// A change with a strict epoch increase is allowed.
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
 		r.Spec.Epoch = 6
 		r.Spec.TopologyGeneration = 3
