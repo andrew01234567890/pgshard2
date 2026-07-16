@@ -34,13 +34,17 @@ clean:
 
 .PHONY: kind-up kind-down e2e
 
+# Must match the operator Makefile's KIND_CLUSTER default; override both in
+# lockstep. The kubectl context KIND creates is "kind-<cluster>".
+KIND_CLUSTER ?= pgshard-test-e2e
+
 kind-up:
-	$(MAKE) -C operator setup-test-e2e
-	kubectl --context kind-pgshard-test-e2e apply -f test/e2e/manifests/minio.yaml
-	kubectl --context kind-pgshard-test-e2e -n pgshard-e2e rollout status deployment/minio --timeout=180s
+	$(MAKE) -C operator setup-test-e2e KIND_CLUSTER=$(KIND_CLUSTER)
+	kubectl --context kind-$(KIND_CLUSTER) apply -f test/e2e/manifests/minio.yaml
+	kubectl --context kind-$(KIND_CLUSTER) -n pgshard-e2e rollout status deployment/minio --timeout=180s
 
 kind-down:
-	$(MAKE) -C operator cleanup-test-e2e
+	$(MAKE) -C operator cleanup-test-e2e KIND_CLUSTER=$(KIND_CLUSTER)
 
 e2e: kind-up
-	$(MAKE) -C operator test-e2e
+	$(MAKE) -C operator test-e2e KIND_CLUSTER=$(KIND_CLUSTER)
