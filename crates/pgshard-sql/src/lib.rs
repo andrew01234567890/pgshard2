@@ -6,8 +6,8 @@
 //! it accepts PostgreSQL 18 SQL minus syntax introduced in 18 itself, and
 //! is upgraded when libpg_query publishes the 18 grammar.
 
-use pg_query::protobuf::TransactionStmtKind;
 use pg_query::NodeEnum;
+use pg_query::protobuf::TransactionStmtKind;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -219,10 +219,9 @@ mod tests {
 
     #[test]
     fn extracts_tables_including_qualified_and_joins() {
-        let parsed = parse(
-            "SELECT o.id FROM public.orders o JOIN customers c ON c.id = o.customer_id",
-        )
-        .unwrap();
+        let parsed =
+            parse("SELECT o.id FROM public.orders o JOIN customers c ON c.id = o.customer_id")
+                .unwrap();
         let mut tables = parsed.tables().to_vec();
         tables.sort();
         assert_eq!(tables, vec!["customers", "public.orders"]);
