@@ -1,0 +1,9 @@
+apiVersion: pgshard.dev/v1alpha1
+kind: PgShardRouting
+metadata:
+  labels:
+    app.kubernetes.io/name: pgshard
+    app.kubernetes.io/managed-by: kustomize
+  name: pgshardrouting-sample
+spec:
+  # TODO(user): Add fields here

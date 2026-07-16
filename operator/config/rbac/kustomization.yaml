@@ -22,6 +22,12 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the pgshard itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- pgshardtableconfig_admin_role.yaml
+- pgshardtableconfig_editor_role.yaml
+- pgshardtableconfig_viewer_role.yaml
+- pgshardrouting_admin_role.yaml
+- pgshardrouting_editor_role.yaml
+- pgshardrouting_viewer_role.yaml
 - pgshardshard_admin_role.yaml
 - pgshardshard_editor_role.yaml
 - pgshardshard_viewer_role.yaml
