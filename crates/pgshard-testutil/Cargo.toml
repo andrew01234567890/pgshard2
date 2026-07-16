@@ -1,0 +1,15 @@
+[package]
+name = "pgshard-testutil"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1.52.4", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7.18"
+
+[lints]
+workspace = true
