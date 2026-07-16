@@ -31,3 +31,16 @@ fmt:
 clean:
 	cargo clean
 	rm -rf operator/bin
+
+.PHONY: kind-up kind-down e2e
+
+kind-up:
+	$(MAKE) -C operator setup-test-e2e
+	kubectl --context kind-pgshard-test-e2e apply -f test/e2e/manifests/minio.yaml
+	kubectl --context kind-pgshard-test-e2e -n pgshard-e2e rollout status deployment/minio --timeout=180s
+
+kind-down:
+	$(MAKE) -C operator cleanup-test-e2e
+
+e2e: kind-up
+	$(MAKE) -C operator test-e2e

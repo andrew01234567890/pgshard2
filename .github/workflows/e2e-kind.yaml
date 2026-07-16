@@ -1,0 +1,46 @@
+name: E2E (KIND)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - name: Install KIND
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Create cluster
+        run: make -C operator setup-test-e2e
+      - name: Deploy MinIO
+        run: |
+          kubectl --context kind-pgshard-test-e2e apply -f test/e2e/manifests/minio.yaml
+          kubectl --context kind-pgshard-test-e2e -n pgshard-e2e rollout status deployment/minio --timeout=180s
+      - name: Run e2e suite
+        run: make -C operator test-e2e
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/e2e-artifacts
+          kubectl --context kind-pgshard-test-e2e get pods -A -o wide > /tmp/e2e-artifacts/pods.txt 2>&1 || true
+          kubectl --context kind-pgshard-test-e2e get events -A --sort-by=.lastTimestamp > /tmp/e2e-artifacts/events.txt 2>&1 || true
+          kubectl --context kind-pgshard-test-e2e logs -n pgshard-system -l control-plane=controller-manager --tail=-1 > /tmp/e2e-artifacts/manager.log 2>&1 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: e2e-artifacts
+          path: /tmp/e2e-artifacts/
