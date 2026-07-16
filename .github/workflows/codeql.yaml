@@ -1,0 +1,43 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "30 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: go
+            build-mode: autobuild
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: matrix.language == 'go'
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+      - uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4
+        with:
+          category: "/language:${{ matrix.language }}"
