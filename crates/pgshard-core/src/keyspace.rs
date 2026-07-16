@@ -63,8 +63,8 @@ impl KeyRange {
     }
 
     /// Splits into `parts` contiguous sub-ranges of near-equal width
-    /// (boundaries at `start + floor(i * width / parts)`, matching the Go
-    /// implementation in operator/internal/topology).
+    /// (boundaries at `start + floor(i * width / parts)`; the operator's Go
+    /// implementation must match this byte for byte).
     pub fn split_evenly(&self, parts: u32) -> Result<Vec<KeyRange>, KeyRangeError> {
         if parts == 0 {
             return Err(KeyRangeError::InvalidSplit(parts));
