@@ -29,7 +29,7 @@ var _ = Describe("API validation", func() {
 
 	newCluster := func(name string) *pgshardv1alpha1.PgShardCluster {
 		return &pgshardv1alpha1.PgShardCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: resourceNamespace},
 			Spec: pgshardv1alpha1.PgShardClusterSpec{
 				Postgres: pgshardv1alpha1.PostgresSpec{Version: "18"},
 				Shards:   pgshardv1alpha1.ShardsSpec{InitialCount: 4},
@@ -68,7 +68,7 @@ var _ = Describe("API validation", func() {
 
 	It("rejects malformed and mutated key ranges", func() {
 		s := &pgshardv1alpha1.PgShardShard{
-			ObjectMeta: metav1.ObjectMeta{Name: "val-shard", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: "val-shard", Namespace: resourceNamespace},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
 				ClusterRef: "c",
 				KeyRange:   pgshardv1alpha1.KeyRange{Start: "40", End: "80"},
@@ -98,7 +98,7 @@ var _ = Describe("API validation", func() {
 	It("requires exactly one of a replication link's source/target shard", func() {
 		base := func(name string, link pgshardv1alpha1.ReplicationLink) *pgshardv1alpha1.PgShardShard {
 			return &pgshardv1alpha1.PgShardShard{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: resourceNamespace},
 				Spec: pgshardv1alpha1.PgShardShardSpec{
 					ClusterRef:       "c",
 					KeyRange:         pgshardv1alpha1.KeyRange{End: "80"},
