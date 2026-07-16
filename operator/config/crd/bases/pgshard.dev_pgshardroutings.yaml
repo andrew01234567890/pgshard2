@@ -21,10 +21,6 @@ spec:
     - jsonPath: .spec.topologyGeneration
       name: Generation
       type: integer
-    - jsonPath: .spec.shards[*].name
-      name: Shards
-      priority: 1
-      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:

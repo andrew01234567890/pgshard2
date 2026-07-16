@@ -68,7 +68,7 @@ type SequenceEntry struct {
 // Multiple PgShardTableConfig objects union together (app teams own their
 // tables independently); the routing compiler validates that no table is
 // declared twice across the union.
-// +kubebuilder:validation:XValidation:rule="self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn) && t.shardKeyColumn != ”))",message="sharded tables must declare shardKeyColumn"
+// +kubebuilder:validation:XValidation:rule="self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn) && size(t.shardKeyColumn) > 0))",message="sharded tables must declare shardKeyColumn"
 type PgShardTableConfigSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterRef is immutable"
 	ClusterRef string `json:"clusterRef"`

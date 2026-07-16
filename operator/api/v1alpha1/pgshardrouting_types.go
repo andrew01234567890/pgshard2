@@ -173,7 +173,6 @@ type PgShardRoutingStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Epoch",type=integer,JSONPath=`.spec.epoch`
 // +kubebuilder:printcolumn:name="Generation",type=integer,JSONPath=`.spec.topologyGeneration`
-// +kubebuilder:printcolumn:name="Shards",type=integer,JSONPath=`.spec.shards[*].name`,priority=1
 
 // PgShardRouting is the operator-compiled routing view (one per cluster).
 type PgShardRouting struct {

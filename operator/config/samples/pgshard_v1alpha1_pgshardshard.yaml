@@ -6,4 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: pgshardshard-sample
 spec:
-  # TODO(user): Add fields here
+  clusterRef: pgshardcluster-sample
+  keyRange:
+    end: "80"
+  replicas: 2
