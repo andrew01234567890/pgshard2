@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,11 +24,26 @@ import (
 // platform-fixed set, and the restart classification.
 const (
 	SyncQuorum          = "quorum"
+	SyncOff             = "off"
 	ParamWalLevel       = "wal_level"
 	ParamSharedBuffers  = "shared_buffers"
 	ParamWorkMem        = "work_mem"
 	ParamRandomPageCost = "random_page_cost"
+	ParamMaxConnections = "max_connections"
 	ssdRandomPageCost   = "1.1"
+	logicalWalLevel     = "logical"
+
+	sharedBuffersCap = int64(32) << 30
+	maintenanceCap   = int64(2) << 30
+	workMemFloor     = int64(4) << 20
+	// io_workers has a hard PostgreSQL maximum of 32; exceeding it is a FATAL
+	// at startup.
+	ioWorkersMax = 32
+	// PostgreSQL's logical-replication launcher permanently holds one
+	// max_worker_processes slot, so a pool sized to a 1-vCPU class would
+	// starve the apply/tablesync workers that reshard and CDC require. Floor
+	// the pool (PostgreSQL's own stock default is 8).
+	minWorkerProcesses = 8
 )
 
 type classProfile struct {
@@ -42,7 +59,7 @@ type classProfile struct {
 // Size classes: modest max_connections everywhere because the routers own
 // pooling.
 var classProfiles = map[pgshardv1alpha1.SizeClass]classProfile{
-	"S":  {cpu: "1", memory: "4Gi", replicas: 2, syncMode: "off", syncNumber: 0, maxConnections: 100, maxWalSize: "2GB"},
+	"S":  {cpu: "1", memory: "4Gi", replicas: 2, syncMode: SyncOff, syncNumber: 0, maxConnections: 100, maxWalSize: "2GB"},
 	"M":  {cpu: "4", memory: "16Gi", replicas: 3, syncMode: SyncQuorum, syncNumber: 1, maxConnections: 200, maxWalSize: "8GB"},
 	"L":  {cpu: "8", memory: "64Gi", replicas: 3, syncMode: SyncQuorum, syncNumber: 1, maxConnections: 300, maxWalSize: "16GB"},
 	"XL": {cpu: "16", memory: "128Gi", replicas: 5, syncMode: SyncQuorum, syncNumber: 2, maxConnections: 400, maxWalSize: "32GB"},
@@ -53,7 +70,7 @@ type Inputs struct {
 	Class     pgshardv1alpha1.SizeClass
 	Overrides *pgshardv1alpha1.SizeOverrides
 	// User-supplied parameters, merged last (they win over derived values,
-	// but never over platform-fixed ones).
+	// but never over platform-fixed ones). Sanitized before use.
 	UserParameters map[string]string
 	// Slots/senders headroom beyond replicas (reshard links, CDC streams).
 	SlotHeadroom int32
@@ -70,12 +87,55 @@ type Rendered struct {
 	ConfigHash string
 }
 
-// Platform-fixed parameters: required for pgshard to function; user
-// overrides are rejected silently by re-setting them last.
+var gucNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_.]*$`)
+
+// rejectedParameters are execution- or library-loading GUCs a user must never
+// set through spec.parameters: PostgreSQL runs them as shell commands or loads
+// them as native code under the postgres OS user (archive_command RCE, a
+// malicious shared_preload_libraries, etc.). Platform-fixed GUCs are enforced
+// separately by re-asserting them last.
+var rejectedParameters = map[string]bool{
+	"archive_command":           true,
+	"restore_command":           true,
+	"archive_cleanup_command":   true,
+	"recovery_end_command":      true,
+	"shared_preload_libraries":  true,
+	"session_preload_libraries": true,
+	"local_preload_libraries":   true,
+}
+
+// sanitizeUserParameters normalizes keys (trim + lowercase, since PostgreSQL
+// GUC names are case-insensitive and whitespace-insignificant) and rejects any
+// that are malformed, carry a newline (which would inject extra
+// postgresql.conf directives and defeat the platform-fixed keys), name an
+// execution-capable GUC, or collide after normalization.
+func sanitizeUserParameters(in map[string]string) (map[string]string, error) {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		key := strings.ToLower(strings.TrimSpace(k))
+		if !gucNameRe.MatchString(key) {
+			return nil, fmt.Errorf("invalid parameter name %q", k)
+		}
+		if strings.ContainsAny(v, "\r\n") {
+			return nil, fmt.Errorf("parameter %q value must not contain a newline", key)
+		}
+		if rejectedParameters[key] {
+			return nil, fmt.Errorf("parameter %q may not be set via spec.parameters", key)
+		}
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("parameter %q specified more than once (case/whitespace variants)", key)
+		}
+		out[key] = v
+	}
+	return out, nil
+}
+
+// Platform-fixed parameters: required for pgshard to function; user overrides
+// are rejected by re-setting them last.
 func platformFixed(replicas, headroom int32) map[string]string {
 	slots := int(replicas) + int(headroom)
 	return map[string]string{
-		ParamWalLevel:            "logical",
+		ParamWalLevel:            logicalWalLevel,
 		"archive_mode":           "on",
 		"hot_standby_feedback":   "on",
 		"sync_replication_slots": "on",
@@ -84,6 +144,18 @@ func platformFixed(replicas, headroom int32) map[string]string {
 		"max_wal_senders":        fmt.Sprintf("%d", slots),
 		"wal_log_hints":          "on", // pg_rewind without checksums assumption
 	}
+}
+
+// pickQuantity prefers a Limits entry, falls back to Requests (a common
+// requests-only override), then the class default.
+func pickQuantity(rr *corev1.ResourceRequirements, name corev1.ResourceName, fallback resource.Quantity) resource.Quantity {
+	if v, ok := rr.Limits[name]; ok {
+		return v
+	}
+	if v, ok := rr.Requests[name]; ok {
+		return v
+	}
+	return fallback
 }
 
 func Render(in Inputs) (Rendered, error) {
@@ -96,6 +168,11 @@ func Render(in Inputs) (Rendered, error) {
 		return Rendered{}, fmt.Errorf("unknown size class %q", class)
 	}
 
+	userParams, err := sanitizeUserParameters(in.UserParameters)
+	if err != nil {
+		return Rendered{}, err
+	}
+
 	cpu := resource.MustParse(profile.cpu)
 	memory := resource.MustParse(profile.memory)
 	replicas := profile.replicas
@@ -103,12 +180,8 @@ func Render(in Inputs) (Rendered, error) {
 
 	if o := in.Overrides; o != nil {
 		if o.Resources != nil {
-			if v, ok := o.Resources.Limits[corev1.ResourceCPU]; ok {
-				cpu = v
-			}
-			if v, ok := o.Resources.Limits[corev1.ResourceMemory]; ok {
-				memory = v
-			}
+			cpu = pickQuantity(o.Resources, corev1.ResourceCPU, cpu)
+			memory = pickQuantity(o.Resources, corev1.ResourceMemory, memory)
 		}
 		if o.ReplicasPerShard != nil {
 			replicas = *o.ReplicasPerShard
@@ -117,7 +190,10 @@ func Render(in Inputs) (Rendered, error) {
 			sync = *o.Synchronous
 		}
 	}
-	if sync.Mode != "off" && sync.Number >= replicas {
+	if replicas < 1 {
+		return Rendered{}, fmt.Errorf("replicasPerShard (%d) must be at least 1", replicas)
+	}
+	if sync.Mode != SyncOff && sync.Number >= replicas {
 		return Rendered{}, fmt.Errorf(
 			"synchronous.number (%d) must be smaller than replicasPerShard (%d)",
 			sync.Number, replicas)
@@ -126,40 +202,36 @@ func Render(in Inputs) (Rendered, error) {
 	memBytes := memory.Value()
 	cpuCores := max(cpu.MilliValue()/1000, 1)
 
+	// A user-overridden max_connections must drive work_mem, or per-backend
+	// memory is under-divided and the aggregate blows past the memory limit.
+	maxConn := profile.maxConnections
+	if v, ok := userParams[ParamMaxConnections]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			maxConn = n
+		}
+	}
+
 	params := map[string]string{}
 
 	// PGTune-conventional formulas off the memory limit.
-	sharedBuffers := memBytes / 4
-	if cap := int64(32) << 30; sharedBuffers > cap {
-		sharedBuffers = cap
-	}
-	params[ParamSharedBuffers] = mb(sharedBuffers)
+	params[ParamSharedBuffers] = mb(min(memBytes/4, sharedBuffersCap))
 	params["effective_cache_size"] = mb(memBytes * 70 / 100)
-	maintenance := memBytes / 16
-	if cap := int64(2) << 30; maintenance > cap {
-		maintenance = cap
-	}
-	params["maintenance_work_mem"] = mb(maintenance)
-	workMem := memBytes / 4 / int64(profile.maxConnections)
-	if floor := int64(4) << 20; workMem < floor {
-		workMem = floor
-	}
-	params[ParamWorkMem] = mb(workMem)
-	params["max_connections"] = fmt.Sprintf("%d", profile.maxConnections)
+	params["maintenance_work_mem"] = mb(min(memBytes/16, maintenanceCap))
+	params[ParamWorkMem] = mb(max(memBytes/4/int64(maxConn), workMemFloor))
+	params[ParamMaxConnections] = strconv.Itoa(maxConn)
 	params["max_wal_size"] = profile.maxWalSize
 	params["checkpoint_completion_target"] = "0.9"
 	params[ParamRandomPageCost] = ssdRandomPageCost
 	params["effective_io_concurrency"] = "256"
 	params["wal_compression"] = "zstd"
-	params["max_worker_processes"] = fmt.Sprintf("%d", cpuCores)
+	params["max_worker_processes"] = fmt.Sprintf("%d", max(cpuCores, minWorkerProcesses))
 	params["max_parallel_workers"] = fmt.Sprintf("%d", cpuCores)
 
 	// PostgreSQL 18 asynchronous I/O.
 	params["io_method"] = "worker"
-	ioWorkers := max(cpuCores/2, 3)
-	params["io_workers"] = fmt.Sprintf("%d", ioWorkers)
+	params["io_workers"] = fmt.Sprintf("%d", min(max(cpuCores/2, 3), ioWorkersMax))
 
-	maps.Copy(params, in.UserParameters)
+	maps.Copy(params, userParams)
 	maps.Copy(params, platformFixed(replicas, in.SlotHeadroom))
 
 	resources := corev1.ResourceRequirements{
@@ -180,33 +252,47 @@ func mb(bytes int64) string {
 	return fmt.Sprintf("%dMB", bytes>>20)
 }
 
+// hashConfig length-prefixes every field so no key/value content (including a
+// stray '=' or delimiter) can make two distinct parameter maps collide.
 func hashConfig(params map[string]string, cpu, memory string) string {
 	keys := slices.Sorted(maps.Keys(params))
-	var b strings.Builder
-	fmt.Fprintf(&b, "cpu=%s\nmemory=%s\n", cpu, memory)
+	h := sha256.New()
+	field := func(s string) { _, _ = fmt.Fprintf(h, "%d:%s", len(s), s) }
+	field("cpu")
+	field(cpu)
+	field("memory")
+	field(memory)
 	for _, k := range keys {
-		fmt.Fprintf(&b, "%s=%s\n", k, params[k])
+		field(k)
+		field(params[k])
 	}
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// restartParameters mirrors pg_settings.context == 'postmaster' for every
-// parameter Render can emit; anything else we set is reloadable.
-var restartParameters = map[string]bool{
-	ParamSharedBuffers:      true,
-	"max_connections":       true,
-	"max_worker_processes":  true,
-	ParamWalLevel:           true,
-	"archive_mode":          true,
-	"max_wal_senders":       true,
-	"max_replication_slots": true,
-	"io_method":             true,
-	"wal_log_hints":         true,
+// reloadableParameters lists the GUCs Render emits whose pg_settings.context is
+// sighup/user (applied by pg_reload_conf). Every other changed key — including
+// any postmaster-context GUC and any unrecognized user parameter — requires a
+// restart; defaulting unknown keys to restart is the safe choice, since
+// mislabeling a restart-only change as reloadable makes it silently never
+// apply.
+var reloadableParameters = map[string]bool{
+	"effective_cache_size":         true,
+	"maintenance_work_mem":         true,
+	ParamWorkMem:                   true,
+	"max_wal_size":                 true,
+	"checkpoint_completion_target": true,
+	ParamRandomPageCost:            true,
+	"effective_io_concurrency":     true,
+	"wal_compression":              true,
+	"max_parallel_workers":         true,
+	"io_workers":                   true,
+	"hot_standby_feedback":         true,
+	"sync_replication_slots":       true,
+	"password_encryption":          true,
 }
 
 // ClassifyDiff splits changed parameters into reload-safe and
-// restart-requiring sets.
+// restart-requiring sets. Unknown keys default to restart.
 func ClassifyDiff(old, new map[string]string) (reload, restart []string) {
 	seen := map[string]bool{}
 	for k := range old {
@@ -220,10 +306,10 @@ func ClassifyDiff(old, new map[string]string) (reload, restart []string) {
 		if old[k] == new[k] {
 			continue
 		}
-		if restartParameters[k] {
-			restart = append(restart, k)
-		} else {
+		if reloadableParameters[k] {
 			reload = append(reload, k)
+		} else {
+			restart = append(restart, k)
 		}
 	}
 	return reload, restart
