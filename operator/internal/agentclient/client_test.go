@@ -18,7 +18,7 @@ func dialFake(t *testing.T) (pgshardv1.AgentServiceClient, *fakes.FakeAgent) {
 		t.Fatal(err)
 	}
 	t.Cleanup(fake.Stop)
-	pool := NewPool()
+	pool := NewInsecurePool()
 	t.Cleanup(pool.Close)
 	host, port := fake.Addr()
 	client, err := pool.Get(host, port)
@@ -27,6 +27,8 @@ func dialFake(t *testing.T) (pgshardv1.AgentServiceClient, *fakes.FakeAgent) {
 	}
 	return client, fake
 }
+
+const podZero = "pod-0"
 
 func TestStatusAndPromoteHandshake(t *testing.T) {
 	client, _ := dialFake(t)
@@ -41,7 +43,7 @@ func TestStatusAndPromoteHandshake(t *testing.T) {
 	}
 
 	promoted, err := client.Promote(ctx, &pgshardv1.PromoteRequest{
-		TargetPrimary: "pod-0", DecisionEpoch: 5,
+		TargetPrimary: podZero, DecisionEpoch: 5,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -100,5 +102,33 @@ func TestExecSchemaIdempotency(t *testing.T) {
 	_, err = client.ExecSchema(ctx, &pgshardv1.ExecSchemaRequest{Sql: "SELECT 1"})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing operation_id must fail, got %v", err)
+	}
+}
+
+func TestPromoteIsIdempotentAtSameEpoch(t *testing.T) {
+	client, _ := dialFake(t)
+	ctx := context.Background()
+
+	first, err := client.Promote(ctx, &pgshardv1.PromoteRequest{TargetPrimary: podZero, DecisionEpoch: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Identical retry at the same epoch replays the same timeline (no re-execute).
+	retry, err := client.Promote(ctx, &pgshardv1.PromoteRequest{TargetPrimary: podZero, DecisionEpoch: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.NewTimeline != first.NewTimeline {
+		t.Fatalf("retry must be idempotent: %d != %d", retry.NewTimeline, first.NewTimeline)
+	}
+	// A different request at the same epoch is rejected.
+	_, err = client.Promote(ctx, &pgshardv1.PromoteRequest{TargetPrimary: "pod-9", DecisionEpoch: 5})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("differing same-epoch request must be rejected, got %v", err)
+	}
+	// A cross-method call at the same already-applied epoch is likewise rejected.
+	_, err = client.RejoinAsStandby(ctx, &pgshardv1.RejoinAsStandbyRequest{DecisionEpoch: 5})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("differing same-epoch rejoin must be rejected, got %v", err)
 	}
 }

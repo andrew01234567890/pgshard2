@@ -31,6 +31,11 @@ type FakeAgent struct {
 	// Highest decision epoch applied, per the contract on PromoteRequest.
 	DecisionEpoch uint64
 
+	// Request key applied at DecisionEpoch: an equal-epoch retry is only
+	// accepted when its key matches (idempotent replay), a differing one is
+	// rejected. Empty until the first epoch-guarded command.
+	appliedKey string
+
 	// Calls records method names in arrival order; controller tests assert
 	// command sequences (e.g. Fence before Promote) against it.
 	Calls []string
@@ -96,16 +101,37 @@ func (f *FakeAgent) GetStatus(
 	return &pgshardv1.GetStatusResponse{Status: clone}, nil
 }
 
-func (f *FakeAgent) checkEpochLocked(epoch uint64) error {
+// epochOutcome is what checkEpochLocked tells the caller to do.
+type epochOutcome int
+
+const (
+	epochApply  epochOutcome = iota // fresh, higher epoch: execute
+	epochReplay                     // identical equal-epoch retry: return prior result, do not re-execute
+)
+
+// checkEpochLocked enforces the decision-epoch contract from agent.proto:
+// zero is rejected, a lower epoch is rejected, an equal epoch is accepted
+// only when the request key is identical to the one already applied (then
+// the caller replays its prior response without re-executing), and a higher
+// epoch applies. key uniquely identifies the request payload.
+func (f *FakeAgent) checkEpochLocked(epoch uint64, key string) (epochOutcome, error) {
 	if epoch == 0 {
-		return status.Error(codes.InvalidArgument, "decision_epoch must be > 0")
+		return epochApply, status.Error(codes.InvalidArgument, "decision_epoch must be > 0")
 	}
 	if epoch < f.DecisionEpoch {
-		return status.Errorf(codes.FailedPrecondition,
+		return epochApply, status.Errorf(codes.FailedPrecondition,
 			"stale decision epoch %d < %d", epoch, f.DecisionEpoch)
 	}
+	if epoch == f.DecisionEpoch {
+		if f.appliedKey != key {
+			return epochApply, status.Errorf(codes.FailedPrecondition,
+				"decision epoch %d already applied a different request", epoch)
+		}
+		return epochReplay, nil
+	}
 	f.DecisionEpoch = epoch
-	return nil
+	f.appliedKey = key
+	return epochApply, nil
 }
 
 func (f *FakeAgent) Promote(
@@ -114,8 +140,12 @@ func (f *FakeAgent) Promote(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("Promote")
-	if err := f.checkEpochLocked(req.DecisionEpoch); err != nil {
+	outcome, err := f.checkEpochLocked(req.DecisionEpoch, "promote:"+req.TargetPrimary)
+	if err != nil {
 		return nil, err
+	}
+	if outcome == epochReplay {
+		return &pgshardv1.PromoteResponse{NewTimeline: f.Status.Timeline}, nil
 	}
 	f.Status.Role = pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY
 	f.Status.Timeline++
@@ -128,8 +158,13 @@ func (f *FakeAgent) RejoinAsStandby(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("RejoinAsStandby")
-	if err := f.checkEpochLocked(req.DecisionEpoch); err != nil {
+	outcome, err := f.checkEpochLocked(req.DecisionEpoch,
+		fmt.Sprintf("rejoin:%v:%v", req.Upstream, req.AllowRewind))
+	if err != nil {
 		return nil, err
+	}
+	if outcome == epochReplay {
+		return &pgshardv1.RejoinAsStandbyResponse{Rewound: req.AllowRewind}, nil
 	}
 	f.Status.Role = pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY
 	return &pgshardv1.RejoinAsStandbyResponse{Rewound: req.AllowRewind}, nil
@@ -141,8 +176,12 @@ func (f *FakeAgent) Fence(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("Fence")
-	if err := f.checkEpochLocked(req.DecisionEpoch); err != nil {
+	outcome, err := f.checkEpochLocked(req.DecisionEpoch, fmt.Sprintf("fence:%v", req.Fenced))
+	if err != nil {
 		return nil, err
+	}
+	if outcome == epochReplay {
+		return &pgshardv1.FenceResponse{}, nil
 	}
 	f.Status.Fenced = req.Fenced
 	return &pgshardv1.FenceResponse{}, nil
