@@ -72,7 +72,7 @@ var _ = Describe("PgShardShard pod lifecycle", func() {
 		Expect(k8sClient.Create(ctx, newShard("sh1"))).To(Succeed())
 		reconcile("sh1")
 
-		for _, suffix := range []string{"-rw", "-ro", "-r", "-pods"} {
+		for _, suffix := range []string{"-rw", "-ro", "-r", "-pods"} { //nolint:goconst // service suffixes read clearer inline
 			var svc corev1.Service
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sh1" + suffix, Namespace: ns}, &svc)).
 				To(Succeed(), suffix)
@@ -104,6 +104,8 @@ var _ = Describe("PgShardShard pod lifecycle", func() {
 		Expect(got.Status.Instances).To(HaveLen(2))
 	})
 
+	const sh2pod0 = "sh2-0"
+
 	It("is idempotent and recreates a deleted pod against the same PVC", func() {
 		Expect(k8sClient.Create(ctx, newShard("sh2"))).To(Succeed())
 		reconcile("sh2")
@@ -115,24 +117,24 @@ var _ = Describe("PgShardShard pod lifecycle", func() {
 		Expect(pods.Items).To(HaveLen(2))
 
 		var pvcBefore corev1.PersistentVolumeClaim
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sh2-0-data", Namespace: ns}, &pvcBefore)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sh2pod0 + "-data", Namespace: ns}, &pvcBefore)).To(Succeed())
 
 		var pod corev1.Pod
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sh2-0", Namespace: ns}, &pod)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sh2pod0, Namespace: ns}, &pod)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &pod, client.GracePeriodSeconds(0))).To(Succeed())
 		// envtest has no kubelet: force finalization so the name frees up.
 		Eventually(func() bool {
 			var gone corev1.Pod
-			err := k8sClient.Get(ctx, types.NamespacedName{Name: "sh2-0", Namespace: ns}, &gone)
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: sh2pod0, Namespace: ns}, &gone)
 			return err != nil
 		}, "10s", "200ms").Should(BeTrue())
 
 		reconcile("sh2")
 		var recreated corev1.Pod
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sh2-0", Namespace: ns}, &recreated)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sh2pod0, Namespace: ns}, &recreated)).To(Succeed())
 
 		var pvcAfter corev1.PersistentVolumeClaim
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sh2-0-data", Namespace: ns}, &pvcAfter)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sh2pod0 + "-data", Namespace: ns}, &pvcAfter)).To(Succeed())
 		Expect(pvcAfter.UID).To(Equal(pvcBefore.UID), "PVC identity must persist across pod recreation")
 	})
 
