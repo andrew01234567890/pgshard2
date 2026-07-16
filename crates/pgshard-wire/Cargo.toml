@@ -1,0 +1,20 @@
+[package]
+name = "pgshard-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+postgres-protocol = "0.6.12"
+thiserror = "2.0.18"
+tokio = { version = "1.52.4", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pgshard-testutil = { path = "../pgshard-testutil" }
+tokio-postgres = "0.7.18"
