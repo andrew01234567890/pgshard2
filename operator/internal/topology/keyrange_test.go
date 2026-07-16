@@ -155,3 +155,17 @@ func TestValidatePartitionRejectsGapsAndOverlaps(t *testing.T) {
 		t.Fatal("nonzero start must fail")
 	}
 }
+
+func TestZeroValueIsFullRange(t *testing.T) {
+	var r KeyRange
+	if !r.IsFull() || r != FullRange || r.String() != "-" {
+		t.Fatalf("zero value must be the full range: %+v", r)
+	}
+	if !r.Contains(KeyspaceID(0)) || !r.Contains(KeyspaceID(math.MaxUint64)) {
+		t.Fatal("zero value must contain the whole keyspace")
+	}
+	parsed := mustParse(t, "-")
+	if parsed != r {
+		t.Fatalf("parsed full range must equal zero value: %+v", parsed)
+	}
+}
