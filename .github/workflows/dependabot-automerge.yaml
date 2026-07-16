@@ -1,0 +1,23 @@
+name: Dependabot auto-merge
+
+# Explicit permissions below apply to dependabot-triggered runs (the
+# read-only default is only for workflows without a permissions block) —
+# this mirrors GitHub's documented automation recipe. Caveat: PRs that
+# modify .github/workflows (actions-ecosystem updates) cannot be merged by
+# GITHUB_TOKEN (workflow scope) and stay open for manual merge.
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]' && github.repository == 'andrew01234567890/pgshard2'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge (merges once required checks pass)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
