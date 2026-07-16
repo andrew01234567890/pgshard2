@@ -2,7 +2,8 @@ package pgconfig
 
 import (
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,11 +14,7 @@ import (
 )
 
 func renderToString(r Rendered) string {
-	keys := make([]string, 0, len(r.Parameters))
-	for k := range r.Parameters {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(r.Parameters))
 	var b strings.Builder
 	fmt.Fprintf(&b, "cpu=%s memory=%s replicas=%d sync=%s/%d\n",
 		r.Resources.Limits.Cpu(), r.Resources.Limits.Memory(),
@@ -109,18 +106,18 @@ func TestUserParametersWinExceptPlatformFixed(t *testing.T) {
 	r, err := Render(Inputs{
 		Class: "S",
 		UserParameters: map[string]string{
-			"work_mem":  "64MB",
-			"wal_level": "replica", // must not stick
+			ParamWorkMem:  "64MB",
+			ParamWalLevel: "replica", // must not stick
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Parameters["work_mem"] != "64MB" {
-		t.Errorf("user override lost: work_mem=%s", r.Parameters["work_mem"])
+	if r.Parameters[ParamWorkMem] != "64MB" {
+		t.Errorf("user override lost: work_mem=%s", r.Parameters[ParamWorkMem])
 	}
-	if r.Parameters["wal_level"] != "logical" {
-		t.Errorf("platform-fixed parameter overridden: wal_level=%s", r.Parameters["wal_level"])
+	if r.Parameters[ParamWalLevel] != "logical" {
+		t.Errorf("platform-fixed parameter overridden: wal_level=%s", r.Parameters[ParamWalLevel])
 	}
 }
 
@@ -145,15 +142,15 @@ func TestOverridesApply(t *testing.T) {
 	if r.ReplicasPerShard != 4 || r.Synchronous.Mode != "first" {
 		t.Fatalf("overrides not applied: %+v", r)
 	}
-	if r.Parameters["shared_buffers"] != "2048MB" {
-		t.Errorf("shared_buffers should derive from overridden memory: %s", r.Parameters["shared_buffers"])
+	if r.Parameters[ParamSharedBuffers] != "2048MB" {
+		t.Errorf("shared_buffers should derive from overridden memory: %s", r.Parameters[ParamSharedBuffers])
 	}
 }
 
 func TestRejectsImpossibleSyncQuorum(t *testing.T) {
 	n := int32(2)
 	_, err := Render(Inputs{Class: "S", Overrides: &pgshardv1alpha1.SizeOverrides{
-		Synchronous: &pgshardv1alpha1.SynchronousSpec{Mode: "quorum", Number: 2}, ReplicasPerShard: &n,
+		Synchronous: &pgshardv1alpha1.SynchronousSpec{Mode: SyncQuorum, Number: 2}, ReplicasPerShard: &n,
 	}})
 	if err == nil {
 		t.Fatal("quorum 2 with 2 replicas (1 standby) must be rejected")
@@ -161,8 +158,8 @@ func TestRejectsImpossibleSyncQuorum(t *testing.T) {
 }
 
 func TestClassifyDiff(t *testing.T) {
-	old := map[string]string{"work_mem": "10MB", "shared_buffers": "1024MB", "random_page_cost": "1.1"}
-	new := map[string]string{"work_mem": "20MB", "shared_buffers": "2048MB", "random_page_cost": "1.1", "io_workers": "4"}
+	old := map[string]string{ParamWorkMem: "10MB", ParamSharedBuffers: "1024MB", ParamRandomPageCost: ssdRandomPageCost}
+	new := map[string]string{ParamWorkMem: "20MB", ParamSharedBuffers: "2048MB", ParamRandomPageCost: ssdRandomPageCost, "io_workers": "4"}
 	reload, restart := ClassifyDiff(old, new)
 	if fmt.Sprint(reload) != "[io_workers work_mem]" {
 		t.Errorf("reload = %v", reload)

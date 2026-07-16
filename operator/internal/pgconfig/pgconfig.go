@@ -9,13 +9,24 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+)
+
+// Parameter and mode names that recur across the profile table, the
+// platform-fixed set, and the restart classification.
+const (
+	SyncQuorum          = "quorum"
+	ParamWalLevel       = "wal_level"
+	ParamSharedBuffers  = "shared_buffers"
+	ParamWorkMem        = "work_mem"
+	ParamRandomPageCost = "random_page_cost"
+	ssdRandomPageCost   = "1.1"
 )
 
 type classProfile struct {
@@ -32,9 +43,9 @@ type classProfile struct {
 // pooling.
 var classProfiles = map[pgshardv1alpha1.SizeClass]classProfile{
 	"S":  {cpu: "1", memory: "4Gi", replicas: 2, syncMode: "off", syncNumber: 0, maxConnections: 100, maxWalSize: "2GB"},
-	"M":  {cpu: "4", memory: "16Gi", replicas: 3, syncMode: "quorum", syncNumber: 1, maxConnections: 200, maxWalSize: "8GB"},
-	"L":  {cpu: "8", memory: "64Gi", replicas: 3, syncMode: "quorum", syncNumber: 1, maxConnections: 300, maxWalSize: "16GB"},
-	"XL": {cpu: "16", memory: "128Gi", replicas: 5, syncMode: "quorum", syncNumber: 2, maxConnections: 400, maxWalSize: "32GB"},
+	"M":  {cpu: "4", memory: "16Gi", replicas: 3, syncMode: SyncQuorum, syncNumber: 1, maxConnections: 200, maxWalSize: "8GB"},
+	"L":  {cpu: "8", memory: "64Gi", replicas: 3, syncMode: SyncQuorum, syncNumber: 1, maxConnections: 300, maxWalSize: "16GB"},
+	"XL": {cpu: "16", memory: "128Gi", replicas: 5, syncMode: SyncQuorum, syncNumber: 2, maxConnections: 400, maxWalSize: "32GB"},
 }
 
 // Inputs to Render.
@@ -64,7 +75,7 @@ type Rendered struct {
 func platformFixed(replicas, headroom int32) map[string]string {
 	slots := int(replicas) + int(headroom)
 	return map[string]string{
-		"wal_level":              "logical",
+		ParamWalLevel:            "logical",
 		"archive_mode":           "on",
 		"hot_standby_feedback":   "on",
 		"sync_replication_slots": "on",
@@ -122,7 +133,7 @@ func Render(in Inputs) (Rendered, error) {
 	if cap := int64(32) << 30; sharedBuffers > cap {
 		sharedBuffers = cap
 	}
-	params["shared_buffers"] = mb(sharedBuffers)
+	params[ParamSharedBuffers] = mb(sharedBuffers)
 	params["effective_cache_size"] = mb(memBytes * 70 / 100)
 	maintenance := memBytes / 16
 	if cap := int64(2) << 30; maintenance > cap {
@@ -133,11 +144,11 @@ func Render(in Inputs) (Rendered, error) {
 	if floor := int64(4) << 20; workMem < floor {
 		workMem = floor
 	}
-	params["work_mem"] = mb(workMem)
+	params[ParamWorkMem] = mb(workMem)
 	params["max_connections"] = fmt.Sprintf("%d", profile.maxConnections)
 	params["max_wal_size"] = profile.maxWalSize
 	params["checkpoint_completion_target"] = "0.9"
-	params["random_page_cost"] = "1.1"
+	params[ParamRandomPageCost] = ssdRandomPageCost
 	params["effective_io_concurrency"] = "256"
 	params["wal_compression"] = "zstd"
 	params["max_worker_processes"] = fmt.Sprintf("%d", cpuCores)
@@ -170,11 +181,7 @@ func mb(bytes int64) string {
 }
 
 func hashConfig(params map[string]string, cpu, memory string) string {
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(params))
 	var b strings.Builder
 	fmt.Fprintf(&b, "cpu=%s\nmemory=%s\n", cpu, memory)
 	for _, k := range keys {
@@ -187,10 +194,10 @@ func hashConfig(params map[string]string, cpu, memory string) string {
 // restartParameters mirrors pg_settings.context == 'postmaster' for every
 // parameter Render can emit; anything else we set is reloadable.
 var restartParameters = map[string]bool{
-	"shared_buffers":        true,
+	ParamSharedBuffers:      true,
 	"max_connections":       true,
 	"max_worker_processes":  true,
-	"wal_level":             true,
+	ParamWalLevel:           true,
 	"archive_mode":          true,
 	"max_wal_senders":       true,
 	"max_replication_slots": true,
@@ -208,11 +215,7 @@ func ClassifyDiff(old, new map[string]string) (reload, restart []string) {
 	for k := range new {
 		seen[k] = true
 	}
-	keys := make([]string, 0, len(seen))
-	for k := range seen {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(seen))
 	for _, k := range keys {
 		if old[k] == new[k] {
 			continue
