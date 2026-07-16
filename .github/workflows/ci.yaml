@@ -19,6 +19,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
+      # pg_query's bindgen needs libclang; pin the dependency explicitly
+      # instead of relying on the runner image happening to ship it.
+      - name: Install libclang for bindgen
+        run: sudo apt-get update -q && sudo apt-get install -y -q libclang-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
