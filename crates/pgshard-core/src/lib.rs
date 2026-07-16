@@ -1,14 +1,12 @@
 //! Core domain types for pgshard: keyspace ids, key ranges, shard functions,
-//! and the topology model shared by the router, agent, and CLI.
+//! LSNs, and the sharding schema shared by the router, agent, and CLI.
 
-pub const KEYSPACE_ID_BITS: u32 = 64;
+pub mod keyspace;
+pub mod lsn;
+pub mod shardfn;
+pub mod vschema;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn keyspace_id_width_is_64() {
-        assert_eq!(KEYSPACE_ID_BITS, 64);
-    }
-}
+pub use keyspace::{KeyRange, KeyspaceId, PartitionError, validate_partition};
+pub use lsn::Lsn;
+pub use shardfn::{ScalarValue, ShardFnError, ShardFunction, shard_function};
+pub use vschema::{SequenceBinding, TableDef, TableName, VSchema, VSchemaError};
