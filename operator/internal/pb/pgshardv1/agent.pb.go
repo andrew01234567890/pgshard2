@@ -460,9 +460,12 @@ type PromoteRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Operator's decision record; agent refuses if it is not the target.
 	TargetPrimary string `protobuf:"bytes,1,opt,name=target_primary,json=targetPrimary,proto3" json:"target_primary,omitempty"`
-	// Monotonic failover-decision epoch. The agent persists the highest epoch
-	// it has seen and rejects requests with a lower one, so a delayed message
-	// from an older failover cannot reverse a newer decision.
+	// Monotonic failover-decision epoch; must be > 0 (zero is rejected).
+	// The agent persists the highest applied epoch together with the request
+	// it carried: lower epochs are rejected, and an equal epoch is accepted
+	// only when the request is identical to the one already applied
+	// (idempotent retry). A delayed message from an older failover can
+	// therefore never reverse a newer decision.
 	DecisionEpoch uint64 `protobuf:"varint,2,opt,name=decision_epoch,json=decisionEpoch,proto3" json:"decision_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2180,8 +2183,11 @@ func (*DropSlotResponse) Descriptor() ([]byte, []int) {
 type ExecSchemaRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Sql   string                 `protobuf:"bytes,1,opt,name=sql,proto3" json:"sql,omitempty"`
-	// Idempotency key: the agent records completed operation ids and returns
-	// success without re-executing on retry (DDL is not generally idempotent).
+	// Idempotency key; required, nonempty. The agent atomically claims the id
+	// before executing (a concurrent duplicate call fails with ALREADY_EXISTS
+	// while the first is in flight), binds it to a hash of sql (the same id
+	// with different sql is INVALID_ARGUMENT), and persists completed ids so
+	// a retry after success returns success without re-executing.
 	OperationId   string `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

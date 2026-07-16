@@ -40,7 +40,12 @@ jobs:
       - run: make -C operator test
       - run: make -C operator lint
       - name: Generated code and formatting are committed
-        run: git diff --exit-code
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::generated code is stale or untracked — run 'make -C operator manifests generate fmt' and commit"
+            exit 1
+          fi
 
   proto:
     runs-on: ubuntu-latest

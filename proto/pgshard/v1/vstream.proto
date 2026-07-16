@@ -20,21 +20,26 @@ message VGtid {
 message ShardGtid {
   string shard = 1;
   Lsn lsn = 2;
-  // Tables whose snapshot copy already completed (SNAPSHOT_AND_FOLLOW resume).
+  // Tables whose snapshot copy already completed (snapshot_and_follow resume).
   repeated TableRef tables_copied = 3;
 }
+
+// Start at the current end of each shard's stream.
+message LatestStart {}
+
+// Stream a consistent snapshot of the tables first, then follow.
+message SnapshotAndFollowStart {}
 
 message StreamRequest {
   string subscription_id = 1;
   // Empty means all sharded tables.
   repeated TableRef tables = 2;
+  // An unset start is INVALID_ARGUMENT.
   oneof start {
     // Resume strictly after this position (see VGtid).
     VGtid position = 3;
-    // Start at the current end of each shard's stream.
-    bool latest = 4;
-    // Stream a consistent snapshot of the tables first, then follow.
-    bool snapshot_and_follow = 5;
+    LatestStart latest = 4;
+    SnapshotAndFollowStart snapshot_and_follow = 5;
   }
 }
 

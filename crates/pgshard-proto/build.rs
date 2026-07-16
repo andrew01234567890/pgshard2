@@ -1,18 +1,29 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn collect_protos(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_protos(&path, out)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "proto") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = "../../proto";
-    // Discover entrypoints so a new .proto cannot be silently left out of the
-    // Rust build while the Go side picks it up.
-    let mut files: Vec<PathBuf> = std::fs::read_dir("../../proto/pgshard/v1")?
-        .map(|entry| Ok(entry?.path()))
-        .collect::<Result<Vec<_>, std::io::Error>>()?
-        .into_iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "proto"))
-        .collect();
+    // Recursively discover entrypoints, mirroring buf's module glob, so a new
+    // .proto anywhere under proto/ cannot be silently left out of the Rust
+    // build while the Go side picks it up.
+    let mut files = Vec::new();
+    collect_protos(Path::new(proto_root), &mut files)?;
     files.sort();
     if files.is_empty() {
-        return Err("no .proto files found under proto/pgshard/v1".into());
+        return Err("no .proto files found under proto/".into());
     }
     let fds = protox::compile(&files, [proto_root])?;
     tonic_prost_build::configure()

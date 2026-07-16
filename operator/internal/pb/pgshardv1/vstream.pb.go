@@ -128,7 +128,7 @@ type ShardGtid struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Shard string                 `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
 	Lsn   *Lsn                   `protobuf:"bytes,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	// Tables whose snapshot copy already completed (SNAPSHOT_AND_FOLLOW resume).
+	// Tables whose snapshot copy already completed (snapshot_and_follow resume).
 	TablesCopied  []*TableRef `protobuf:"bytes,3,rep,name=tables_copied,json=tablesCopied,proto3" json:"tables_copied,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -185,11 +185,87 @@ func (x *ShardGtid) GetTablesCopied() []*TableRef {
 	return nil
 }
 
+// Start at the current end of each shard's stream.
+type LatestStart struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LatestStart) Reset() {
+	*x = LatestStart{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LatestStart) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LatestStart) ProtoMessage() {}
+
+func (x *LatestStart) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LatestStart.ProtoReflect.Descriptor instead.
+func (*LatestStart) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{2}
+}
+
+// Stream a consistent snapshot of the tables first, then follow.
+type SnapshotAndFollowStart struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotAndFollowStart) Reset() {
+	*x = SnapshotAndFollowStart{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotAndFollowStart) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotAndFollowStart) ProtoMessage() {}
+
+func (x *SnapshotAndFollowStart) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotAndFollowStart.ProtoReflect.Descriptor instead.
+func (*SnapshotAndFollowStart) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{3}
+}
+
 type StreamRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SubscriptionId string                 `protobuf:"bytes,1,opt,name=subscription_id,json=subscriptionId,proto3" json:"subscription_id,omitempty"`
 	// Empty means all sharded tables.
 	Tables []*TableRef `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	// An unset start is INVALID_ARGUMENT.
+	//
 	// Types that are valid to be assigned to Start:
 	//
 	//	*StreamRequest_Position
@@ -202,7 +278,7 @@ type StreamRequest struct {
 
 func (x *StreamRequest) Reset() {
 	*x = StreamRequest{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -214,7 +290,7 @@ func (x *StreamRequest) String() string {
 func (*StreamRequest) ProtoMessage() {}
 
 func (x *StreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -227,7 +303,7 @@ func (x *StreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamRequest.ProtoReflect.Descriptor instead.
 func (*StreamRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{2}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *StreamRequest) GetSubscriptionId() string {
@@ -260,22 +336,22 @@ func (x *StreamRequest) GetPosition() *VGtid {
 	return nil
 }
 
-func (x *StreamRequest) GetLatest() bool {
+func (x *StreamRequest) GetLatest() *LatestStart {
 	if x != nil {
 		if x, ok := x.Start.(*StreamRequest_Latest); ok {
 			return x.Latest
 		}
 	}
-	return false
+	return nil
 }
 
-func (x *StreamRequest) GetSnapshotAndFollow() bool {
+func (x *StreamRequest) GetSnapshotAndFollow() *SnapshotAndFollowStart {
 	if x != nil {
 		if x, ok := x.Start.(*StreamRequest_SnapshotAndFollow); ok {
 			return x.SnapshotAndFollow
 		}
 	}
-	return false
+	return nil
 }
 
 type isStreamRequest_Start interface {
@@ -288,13 +364,11 @@ type StreamRequest_Position struct {
 }
 
 type StreamRequest_Latest struct {
-	// Start at the current end of each shard's stream.
-	Latest bool `protobuf:"varint,4,opt,name=latest,proto3,oneof"`
+	Latest *LatestStart `protobuf:"bytes,4,opt,name=latest,proto3,oneof"`
 }
 
 type StreamRequest_SnapshotAndFollow struct {
-	// Stream a consistent snapshot of the tables first, then follow.
-	SnapshotAndFollow bool `protobuf:"varint,5,opt,name=snapshot_and_follow,json=snapshotAndFollow,proto3,oneof"`
+	SnapshotAndFollow *SnapshotAndFollowStart `protobuf:"bytes,5,opt,name=snapshot_and_follow,json=snapshotAndFollow,proto3,oneof"`
 }
 
 func (*StreamRequest_Position) isStreamRequest_Start() {}
@@ -312,7 +386,7 @@ type StreamResponse struct {
 
 func (x *StreamResponse) Reset() {
 	*x = StreamResponse{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -324,7 +398,7 @@ func (x *StreamResponse) String() string {
 func (*StreamResponse) ProtoMessage() {}
 
 func (x *StreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -337,7 +411,7 @@ func (x *StreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamResponse.ProtoReflect.Descriptor instead.
 func (*StreamResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{3}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *StreamResponse) GetEvent() *VEvent {
@@ -357,7 +431,7 @@ type Field struct {
 
 func (x *Field) Reset() {
 	*x = Field{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -369,7 +443,7 @@ func (x *Field) String() string {
 func (*Field) ProtoMessage() {}
 
 func (x *Field) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -382,7 +456,7 @@ func (x *Field) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Field.ProtoReflect.Descriptor instead.
 func (*Field) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{4}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Field) GetName() string {
@@ -409,7 +483,7 @@ type FieldEvent struct {
 
 func (x *FieldEvent) Reset() {
 	*x = FieldEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -421,7 +495,7 @@ func (x *FieldEvent) String() string {
 func (*FieldEvent) ProtoMessage() {}
 
 func (x *FieldEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -434,7 +508,7 @@ func (x *FieldEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FieldEvent.ProtoReflect.Descriptor instead.
 func (*FieldEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *FieldEvent) GetTable() *TableRef {
@@ -462,7 +536,7 @@ type CellValue struct {
 
 func (x *CellValue) Reset() {
 	*x = CellValue{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -474,7 +548,7 @@ func (x *CellValue) String() string {
 func (*CellValue) ProtoMessage() {}
 
 func (x *CellValue) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -487,7 +561,7 @@ func (x *CellValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellValue.ProtoReflect.Descriptor instead.
 func (*CellValue) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{6}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *CellValue) GetNull() bool {
@@ -516,7 +590,7 @@ type RowEvent struct {
 
 func (x *RowEvent) Reset() {
 	*x = RowEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -528,7 +602,7 @@ func (x *RowEvent) String() string {
 func (*RowEvent) ProtoMessage() {}
 
 func (x *RowEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -541,7 +615,7 @@ func (x *RowEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RowEvent.ProtoReflect.Descriptor instead.
 func (*RowEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{7}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RowEvent) GetTable() *TableRef {
@@ -581,7 +655,7 @@ type BeginEvent struct {
 
 func (x *BeginEvent) Reset() {
 	*x = BeginEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -593,7 +667,7 @@ func (x *BeginEvent) String() string {
 func (*BeginEvent) ProtoMessage() {}
 
 func (x *BeginEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -606,7 +680,7 @@ func (x *BeginEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginEvent.ProtoReflect.Descriptor instead.
 func (*BeginEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{8}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *BeginEvent) GetLsn() *Lsn {
@@ -627,7 +701,7 @@ type CommitEvent struct {
 
 func (x *CommitEvent) Reset() {
 	*x = CommitEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -639,7 +713,7 @@ func (x *CommitEvent) String() string {
 func (*CommitEvent) ProtoMessage() {}
 
 func (x *CommitEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -652,7 +726,7 @@ func (x *CommitEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitEvent.ProtoReflect.Descriptor instead.
 func (*CommitEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{9}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *CommitEvent) GetLsn() *Lsn {
@@ -670,7 +744,7 @@ type HeartbeatEvent struct {
 
 func (x *HeartbeatEvent) Reset() {
 	*x = HeartbeatEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -682,7 +756,7 @@ func (x *HeartbeatEvent) String() string {
 func (*HeartbeatEvent) ProtoMessage() {}
 
 func (x *HeartbeatEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -695,7 +769,7 @@ func (x *HeartbeatEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatEvent.ProtoReflect.Descriptor instead.
 func (*HeartbeatEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{10}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{12}
 }
 
 type DdlEvent struct {
@@ -708,7 +782,7 @@ type DdlEvent struct {
 
 func (x *DdlEvent) Reset() {
 	*x = DdlEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -720,7 +794,7 @@ func (x *DdlEvent) String() string {
 func (*DdlEvent) ProtoMessage() {}
 
 func (x *DdlEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -733,7 +807,7 @@ func (x *DdlEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DdlEvent.ProtoReflect.Descriptor instead.
 func (*DdlEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{11}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *DdlEvent) GetSql() string {
@@ -763,7 +837,7 @@ type JournalEvent struct {
 
 func (x *JournalEvent) Reset() {
 	*x = JournalEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -775,7 +849,7 @@ func (x *JournalEvent) String() string {
 func (*JournalEvent) ProtoMessage() {}
 
 func (x *JournalEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -788,7 +862,7 @@ func (x *JournalEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JournalEvent.ProtoReflect.Descriptor instead.
 func (*JournalEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{12}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *JournalEvent) GetSourceShard() string {
@@ -823,7 +897,7 @@ type JournalSuccessor struct {
 
 func (x *JournalSuccessor) Reset() {
 	*x = JournalSuccessor{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -835,7 +909,7 @@ func (x *JournalSuccessor) String() string {
 func (*JournalSuccessor) ProtoMessage() {}
 
 func (x *JournalSuccessor) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -848,7 +922,7 @@ func (x *JournalSuccessor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JournalSuccessor.ProtoReflect.Descriptor instead.
 func (*JournalSuccessor) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{13}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *JournalSuccessor) GetShard() string {
@@ -881,7 +955,7 @@ type CopyCompletedEvent struct {
 
 func (x *CopyCompletedEvent) Reset() {
 	*x = CopyCompletedEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -893,7 +967,7 @@ func (x *CopyCompletedEvent) String() string {
 func (*CopyCompletedEvent) ProtoMessage() {}
 
 func (x *CopyCompletedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -906,7 +980,7 @@ func (x *CopyCompletedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyCompletedEvent.ProtoReflect.Descriptor instead.
 func (*CopyCompletedEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{14}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CopyCompletedEvent) GetTable() *TableRef {
@@ -938,7 +1012,7 @@ type VEvent struct {
 
 func (x *VEvent) Reset() {
 	*x = VEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -950,7 +1024,7 @@ func (x *VEvent) String() string {
 func (*VEvent) ProtoMessage() {}
 
 func (x *VEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -963,7 +1037,7 @@ func (x *VEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent.ProtoReflect.Descriptor instead.
 func (*VEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *VEvent) GetShard() string {
@@ -1138,13 +1212,15 @@ const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\tShardGtid\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12!\n" +
 	"\x03lsn\x18\x02 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\x129\n" +
-	"\rtables_copied\x18\x03 \x03(\v2\x14.pgshard.v1.TableRefR\ftablesCopied\"\xec\x01\n" +
+	"\rtables_copied\x18\x03 \x03(\v2\x14.pgshard.v1.TableRefR\ftablesCopied\"\r\n" +
+	"\vLatestStart\"\x18\n" +
+	"\x16SnapshotAndFollowStart\"\xa9\x02\n" +
 	"\rStreamRequest\x12'\n" +
 	"\x0fsubscription_id\x18\x01 \x01(\tR\x0esubscriptionId\x12,\n" +
 	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\x12/\n" +
-	"\bposition\x18\x03 \x01(\v2\x11.pgshard.v1.VGtidH\x00R\bposition\x12\x18\n" +
-	"\x06latest\x18\x04 \x01(\bH\x00R\x06latest\x120\n" +
-	"\x13snapshot_and_follow\x18\x05 \x01(\bH\x00R\x11snapshotAndFollowB\a\n" +
+	"\bposition\x18\x03 \x01(\v2\x11.pgshard.v1.VGtidH\x00R\bposition\x121\n" +
+	"\x06latest\x18\x04 \x01(\v2\x17.pgshard.v1.LatestStartH\x00R\x06latest\x12T\n" +
+	"\x13snapshot_and_follow\x18\x05 \x01(\v2\".pgshard.v1.SnapshotAndFollowStartH\x00R\x11snapshotAndFollowB\a\n" +
 	"\x05start\":\n" +
 	"\x0eStreamResponse\x12(\n" +
 	"\x05event\x18\x01 \x01(\v2\x12.pgshard.v1.VEventR\x05event\"6\n" +
@@ -1221,67 +1297,71 @@ func file_pgshard_v1_vstream_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_vstream_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pgshard_v1_vstream_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_pgshard_v1_vstream_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_pgshard_v1_vstream_proto_goTypes = []any{
-	(RowOp)(0),                    // 0: pgshard.v1.RowOp
-	(*VGtid)(nil),                 // 1: pgshard.v1.VGtid
-	(*ShardGtid)(nil),             // 2: pgshard.v1.ShardGtid
-	(*StreamRequest)(nil),         // 3: pgshard.v1.StreamRequest
-	(*StreamResponse)(nil),        // 4: pgshard.v1.StreamResponse
-	(*Field)(nil),                 // 5: pgshard.v1.Field
-	(*FieldEvent)(nil),            // 6: pgshard.v1.FieldEvent
-	(*CellValue)(nil),             // 7: pgshard.v1.CellValue
-	(*RowEvent)(nil),              // 8: pgshard.v1.RowEvent
-	(*BeginEvent)(nil),            // 9: pgshard.v1.BeginEvent
-	(*CommitEvent)(nil),           // 10: pgshard.v1.CommitEvent
-	(*HeartbeatEvent)(nil),        // 11: pgshard.v1.HeartbeatEvent
-	(*DdlEvent)(nil),              // 12: pgshard.v1.DdlEvent
-	(*JournalEvent)(nil),          // 13: pgshard.v1.JournalEvent
-	(*JournalSuccessor)(nil),      // 14: pgshard.v1.JournalSuccessor
-	(*CopyCompletedEvent)(nil),    // 15: pgshard.v1.CopyCompletedEvent
-	(*VEvent)(nil),                // 16: pgshard.v1.VEvent
-	(*Lsn)(nil),                   // 17: pgshard.v1.Lsn
-	(*TableRef)(nil),              // 18: pgshard.v1.TableRef
-	(*KeyRange)(nil),              // 19: pgshard.v1.KeyRange
-	(*timestamppb.Timestamp)(nil), // 20: google.protobuf.Timestamp
+	(RowOp)(0),                     // 0: pgshard.v1.RowOp
+	(*VGtid)(nil),                  // 1: pgshard.v1.VGtid
+	(*ShardGtid)(nil),              // 2: pgshard.v1.ShardGtid
+	(*LatestStart)(nil),            // 3: pgshard.v1.LatestStart
+	(*SnapshotAndFollowStart)(nil), // 4: pgshard.v1.SnapshotAndFollowStart
+	(*StreamRequest)(nil),          // 5: pgshard.v1.StreamRequest
+	(*StreamResponse)(nil),         // 6: pgshard.v1.StreamResponse
+	(*Field)(nil),                  // 7: pgshard.v1.Field
+	(*FieldEvent)(nil),             // 8: pgshard.v1.FieldEvent
+	(*CellValue)(nil),              // 9: pgshard.v1.CellValue
+	(*RowEvent)(nil),               // 10: pgshard.v1.RowEvent
+	(*BeginEvent)(nil),             // 11: pgshard.v1.BeginEvent
+	(*CommitEvent)(nil),            // 12: pgshard.v1.CommitEvent
+	(*HeartbeatEvent)(nil),         // 13: pgshard.v1.HeartbeatEvent
+	(*DdlEvent)(nil),               // 14: pgshard.v1.DdlEvent
+	(*JournalEvent)(nil),           // 15: pgshard.v1.JournalEvent
+	(*JournalSuccessor)(nil),       // 16: pgshard.v1.JournalSuccessor
+	(*CopyCompletedEvent)(nil),     // 17: pgshard.v1.CopyCompletedEvent
+	(*VEvent)(nil),                 // 18: pgshard.v1.VEvent
+	(*Lsn)(nil),                    // 19: pgshard.v1.Lsn
+	(*TableRef)(nil),               // 20: pgshard.v1.TableRef
+	(*KeyRange)(nil),               // 21: pgshard.v1.KeyRange
+	(*timestamppb.Timestamp)(nil),  // 22: google.protobuf.Timestamp
 }
 var file_pgshard_v1_vstream_proto_depIdxs = []int32{
 	2,  // 0: pgshard.v1.VGtid.shard_gtids:type_name -> pgshard.v1.ShardGtid
-	17, // 1: pgshard.v1.ShardGtid.lsn:type_name -> pgshard.v1.Lsn
-	18, // 2: pgshard.v1.ShardGtid.tables_copied:type_name -> pgshard.v1.TableRef
-	18, // 3: pgshard.v1.StreamRequest.tables:type_name -> pgshard.v1.TableRef
+	19, // 1: pgshard.v1.ShardGtid.lsn:type_name -> pgshard.v1.Lsn
+	20, // 2: pgshard.v1.ShardGtid.tables_copied:type_name -> pgshard.v1.TableRef
+	20, // 3: pgshard.v1.StreamRequest.tables:type_name -> pgshard.v1.TableRef
 	1,  // 4: pgshard.v1.StreamRequest.position:type_name -> pgshard.v1.VGtid
-	16, // 5: pgshard.v1.StreamResponse.event:type_name -> pgshard.v1.VEvent
-	18, // 6: pgshard.v1.FieldEvent.table:type_name -> pgshard.v1.TableRef
-	5,  // 7: pgshard.v1.FieldEvent.fields:type_name -> pgshard.v1.Field
-	18, // 8: pgshard.v1.RowEvent.table:type_name -> pgshard.v1.TableRef
-	0,  // 9: pgshard.v1.RowEvent.op:type_name -> pgshard.v1.RowOp
-	7,  // 10: pgshard.v1.RowEvent.before:type_name -> pgshard.v1.CellValue
-	7,  // 11: pgshard.v1.RowEvent.after:type_name -> pgshard.v1.CellValue
-	17, // 12: pgshard.v1.BeginEvent.lsn:type_name -> pgshard.v1.Lsn
-	17, // 13: pgshard.v1.CommitEvent.lsn:type_name -> pgshard.v1.Lsn
-	17, // 14: pgshard.v1.JournalEvent.source_lsn:type_name -> pgshard.v1.Lsn
-	14, // 15: pgshard.v1.JournalEvent.successors:type_name -> pgshard.v1.JournalSuccessor
-	19, // 16: pgshard.v1.JournalSuccessor.key_range:type_name -> pgshard.v1.KeyRange
-	17, // 17: pgshard.v1.JournalSuccessor.start_lsn:type_name -> pgshard.v1.Lsn
-	18, // 18: pgshard.v1.CopyCompletedEvent.table:type_name -> pgshard.v1.TableRef
-	20, // 19: pgshard.v1.VEvent.commit_time:type_name -> google.protobuf.Timestamp
-	9,  // 20: pgshard.v1.VEvent.begin:type_name -> pgshard.v1.BeginEvent
-	6,  // 21: pgshard.v1.VEvent.field:type_name -> pgshard.v1.FieldEvent
-	8,  // 22: pgshard.v1.VEvent.row:type_name -> pgshard.v1.RowEvent
-	10, // 23: pgshard.v1.VEvent.commit:type_name -> pgshard.v1.CommitEvent
-	12, // 24: pgshard.v1.VEvent.ddl:type_name -> pgshard.v1.DdlEvent
-	13, // 25: pgshard.v1.VEvent.journal:type_name -> pgshard.v1.JournalEvent
-	1,  // 26: pgshard.v1.VEvent.vgtid:type_name -> pgshard.v1.VGtid
-	11, // 27: pgshard.v1.VEvent.heartbeat:type_name -> pgshard.v1.HeartbeatEvent
-	15, // 28: pgshard.v1.VEvent.copy_completed:type_name -> pgshard.v1.CopyCompletedEvent
-	3,  // 29: pgshard.v1.VStreamService.Stream:input_type -> pgshard.v1.StreamRequest
-	4,  // 30: pgshard.v1.VStreamService.Stream:output_type -> pgshard.v1.StreamResponse
-	30, // [30:31] is the sub-list for method output_type
-	29, // [29:30] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	3,  // 5: pgshard.v1.StreamRequest.latest:type_name -> pgshard.v1.LatestStart
+	4,  // 6: pgshard.v1.StreamRequest.snapshot_and_follow:type_name -> pgshard.v1.SnapshotAndFollowStart
+	18, // 7: pgshard.v1.StreamResponse.event:type_name -> pgshard.v1.VEvent
+	20, // 8: pgshard.v1.FieldEvent.table:type_name -> pgshard.v1.TableRef
+	7,  // 9: pgshard.v1.FieldEvent.fields:type_name -> pgshard.v1.Field
+	20, // 10: pgshard.v1.RowEvent.table:type_name -> pgshard.v1.TableRef
+	0,  // 11: pgshard.v1.RowEvent.op:type_name -> pgshard.v1.RowOp
+	9,  // 12: pgshard.v1.RowEvent.before:type_name -> pgshard.v1.CellValue
+	9,  // 13: pgshard.v1.RowEvent.after:type_name -> pgshard.v1.CellValue
+	19, // 14: pgshard.v1.BeginEvent.lsn:type_name -> pgshard.v1.Lsn
+	19, // 15: pgshard.v1.CommitEvent.lsn:type_name -> pgshard.v1.Lsn
+	19, // 16: pgshard.v1.JournalEvent.source_lsn:type_name -> pgshard.v1.Lsn
+	16, // 17: pgshard.v1.JournalEvent.successors:type_name -> pgshard.v1.JournalSuccessor
+	21, // 18: pgshard.v1.JournalSuccessor.key_range:type_name -> pgshard.v1.KeyRange
+	19, // 19: pgshard.v1.JournalSuccessor.start_lsn:type_name -> pgshard.v1.Lsn
+	20, // 20: pgshard.v1.CopyCompletedEvent.table:type_name -> pgshard.v1.TableRef
+	22, // 21: pgshard.v1.VEvent.commit_time:type_name -> google.protobuf.Timestamp
+	11, // 22: pgshard.v1.VEvent.begin:type_name -> pgshard.v1.BeginEvent
+	8,  // 23: pgshard.v1.VEvent.field:type_name -> pgshard.v1.FieldEvent
+	10, // 24: pgshard.v1.VEvent.row:type_name -> pgshard.v1.RowEvent
+	12, // 25: pgshard.v1.VEvent.commit:type_name -> pgshard.v1.CommitEvent
+	14, // 26: pgshard.v1.VEvent.ddl:type_name -> pgshard.v1.DdlEvent
+	15, // 27: pgshard.v1.VEvent.journal:type_name -> pgshard.v1.JournalEvent
+	1,  // 28: pgshard.v1.VEvent.vgtid:type_name -> pgshard.v1.VGtid
+	13, // 29: pgshard.v1.VEvent.heartbeat:type_name -> pgshard.v1.HeartbeatEvent
+	17, // 30: pgshard.v1.VEvent.copy_completed:type_name -> pgshard.v1.CopyCompletedEvent
+	5,  // 31: pgshard.v1.VStreamService.Stream:input_type -> pgshard.v1.StreamRequest
+	6,  // 32: pgshard.v1.VStreamService.Stream:output_type -> pgshard.v1.StreamResponse
+	32, // [32:33] is the sub-list for method output_type
+	31, // [31:32] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_vstream_proto_init() }
@@ -1290,12 +1370,12 @@ func file_pgshard_v1_vstream_proto_init() {
 		return
 	}
 	file_pgshard_v1_common_proto_init()
-	file_pgshard_v1_vstream_proto_msgTypes[2].OneofWrappers = []any{
+	file_pgshard_v1_vstream_proto_msgTypes[4].OneofWrappers = []any{
 		(*StreamRequest_Position)(nil),
 		(*StreamRequest_Latest)(nil),
 		(*StreamRequest_SnapshotAndFollow)(nil),
 	}
-	file_pgshard_v1_vstream_proto_msgTypes[15].OneofWrappers = []any{
+	file_pgshard_v1_vstream_proto_msgTypes[17].OneofWrappers = []any{
 		(*VEvent_Begin)(nil),
 		(*VEvent_Field)(nil),
 		(*VEvent_Row)(nil),
@@ -1312,7 +1392,7 @@ func file_pgshard_v1_vstream_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_vstream_proto_rawDesc), len(file_pgshard_v1_vstream_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
