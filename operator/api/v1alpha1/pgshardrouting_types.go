@@ -39,9 +39,12 @@ const (
 type RoutingEndpoint struct {
 	Pod string `json:"pod"`
 
+	// +kubebuilder:validation:MaxLength=253
 	Host string `json:"host"`
 
 	// +kubebuilder:default=5432
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
@@ -64,14 +67,14 @@ type RoutingShard struct {
 	Replicas []RoutingEndpoint `json:"replicas,omitempty"`
 }
 
-// RoutingTableType mirrors the vschema table classification.
-// +kubebuilder:validation:Enum=sharded;global
-type RoutingTableType string
-
 // RoutingSequence binds a column to a global sequence.
 type RoutingSequence struct {
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Column string `json:"column"`
 
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Sequence string `json:"sequence"`
 }
 
@@ -81,7 +84,9 @@ type RoutingTable struct {
 
 	Name string `json:"name"`
 
-	Type RoutingTableType `json:"type"`
+	// Reuses the vschema TableType (sharded;global); the routing compiler
+	// projects TableEntry.Type here, so the two must stay one enum.
+	Type TableType `json:"type"`
 
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
@@ -127,6 +132,12 @@ type RoutingGate struct {
 // the single object routers and agents watch. Only the leader-elected
 // operator writes it; every change is one write with a strictly monotonic
 // epoch, and consumers apply an update iff epoch > lastApplied.
+//
+// The epoch and topology generation are enforced monotonic non-decreasing
+// across updates: a router that saw a higher epoch must never observe the
+// object regress to a lower one (which it would silently discard as stale).
+// +kubebuilder:validation:XValidation:rule="self.epoch >= oldSelf.epoch",message="epoch must not decrease"
+// +kubebuilder:validation:XValidation:rule="self.topologyGeneration >= oldSelf.topologyGeneration",message="topologyGeneration must not decrease"
 type PgShardRoutingSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Epoch int64 `json:"epoch"`
@@ -179,7 +190,7 @@ type PgShardRouting struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   PgShardRoutingSpec   `json:"spec,omitempty"`
+	Spec   PgShardRoutingSpec   `json:"spec"`
 	Status PgShardRoutingStatus `json:"status,omitempty"`
 }
 

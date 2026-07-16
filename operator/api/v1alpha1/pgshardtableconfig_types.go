@@ -30,13 +30,19 @@ const (
 	TableGlobal  TableType = "global"
 )
 
-// TableEntry declares one table's sharding configuration.
+// TableEntry declares one table's sharding configuration. Identifier fields
+// flow into PostgreSQL DDL, so they are constrained at admission to
+// unquoted-identifier syntax (letters/digits/underscore/$, not starting with
+// a digit, ≤63 bytes) to keep untrusted app-team input from injecting DDL.
 type TableEntry struct {
 	// +kubebuilder:default=public
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	Schema string `json:"schema,omitempty"`
 
-	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
 	// +kubebuilder:default=sharded
@@ -45,6 +51,8 @@ type TableEntry struct {
 
 	// Column hashed to the keyspace id. Required for sharded tables and
 	// must be part of the primary key (enforced by the schema apply flow).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
 
@@ -54,12 +62,14 @@ type TableEntry struct {
 
 // SequenceEntry declares a global sequence hosted on the system shard.
 type SequenceEntry struct {
-	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
 	// Ids handed to a router per block grab.
 	// +kubebuilder:default=1000
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000000
 	// +optional
 	BlockSize int64 `json:"blockSize,omitempty"`
 }
@@ -68,7 +78,7 @@ type SequenceEntry struct {
 // Multiple PgShardTableConfig objects union together (app teams own their
 // tables independently); the routing compiler validates that no table is
 // declared twice across the union.
-// +kubebuilder:validation:XValidation:rule="self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn) && size(t.shardKeyColumn) > 0))",message="sharded tables must declare shardKeyColumn"
+// +kubebuilder:validation:XValidation:rule="!has(self.tables) || self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn) && size(t.shardKeyColumn) > 0))",message="sharded tables must declare shardKeyColumn"
 type PgShardTableConfigSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterRef is immutable"
 	ClusterRef string `json:"clusterRef"`
@@ -107,7 +117,7 @@ type PgShardTableConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   PgShardTableConfigSpec   `json:"spec,omitempty"`
+	Spec   PgShardTableConfigSpec   `json:"spec"`
 	Status PgShardTableConfigStatus `json:"status,omitempty"`
 }
 

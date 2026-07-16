@@ -69,10 +69,12 @@ spec:
                       default: 1000
                       description: Ids handed to a router per block grab.
                       format: int64
+                      maximum: 1000000
                       minimum: 1
                       type: integer
                     name:
-                      minLength: 1
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                   required:
                   - name
@@ -81,21 +83,32 @@ spec:
                 type: array
               tables:
                 items:
-                  description: TableEntry declares one table's sharding configuration.
+                  description: |-
+                    TableEntry declares one table's sharding configuration. Identifier fields
+                    flow into PostgreSQL DDL, so they are constrained at admission to
+                    unquoted-identifier syntax (letters/digits/underscore/$, not starting with
+                    a digit, ≤63 bytes) to keep untrusted app-team input from injecting DDL.
                   properties:
                     name:
-                      minLength: 1
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     schema:
                       default: public
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     sequences:
                       items:
                         description: RoutingSequence binds a column to a global sequence.
                         properties:
                           column:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                             type: string
                           sequence:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                             type: string
                         required:
                         - column
@@ -106,6 +119,8 @@ spec:
                       description: |-
                         Column hashed to the keyspace id. Required for sharded tables and
                         must be part of the primary key (enforced by the schema apply flow).
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     type:
                       default: sharded
@@ -124,8 +139,9 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: sharded tables must declare shardKeyColumn
-              rule: self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn)
-                && size(t.shardKeyColumn) > 0))
+              rule: '!has(self.tables) || self.tables.all(t, !has(t.type) || t.type
+                != ''sharded'' || (has(t.shardKeyColumn) && size(t.shardKeyColumn)
+                > 0))'
           status:
             description: PgShardTableConfigStatus reports compilation results.
             properties:
@@ -192,6 +208,8 @@ spec:
                   type: object
                 type: array
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true

@@ -126,4 +126,61 @@ var _ = Describe("API validation", func() {
 		Expect(k8sClient.Create(ctx, one)).To(Succeed())
 		_ = k8sClient.Delete(ctx, one)
 	})
+
+	It("validates table config identifiers and required fields", func() {
+		tc := func(name string, tables []pgshardv1alpha1.TableEntry) *pgshardv1alpha1.PgShardTableConfig {
+			return &pgshardv1alpha1.PgShardTableConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: valNamespace},
+				Spec:       pgshardv1alpha1.PgShardTableConfigSpec{ClusterRef: "c", Tables: tables},
+			}
+		}
+		// Sharded table without a shard key is rejected.
+		Expect(k8sClient.Create(ctx, tc("tc-nokey", []pgshardv1alpha1.TableEntry{
+			{Name: "orders", Type: pgshardv1alpha1.TableSharded},
+		}))).NotTo(Succeed())
+		// Identifier with a SQL metacharacter is rejected.
+		Expect(k8sClient.Create(ctx, tc("tc-inject", []pgshardv1alpha1.TableEntry{
+			{Name: "orders", Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: `id"); DROP TABLE x; --`},
+		}))).NotTo(Succeed())
+		// A sequence-only config (no tables) is admitted — the CEL rule must
+		// not dereference an absent tables list.
+		seqOnly := &pgshardv1alpha1.PgShardTableConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "tc-seq", Namespace: valNamespace},
+			Spec: pgshardv1alpha1.PgShardTableConfigSpec{
+				ClusterRef: "c",
+				Sequences:  []pgshardv1alpha1.SequenceEntry{{Name: "orders_id", BlockSize: 1000}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, seqOnly)).To(Succeed())
+		_ = k8sClient.Delete(ctx, seqOnly)
+		// A valid sharded table is admitted.
+		ok := tc("tc-ok", []pgshardv1alpha1.TableEntry{
+			{Name: "orders", Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id"},
+		})
+		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
+		_ = k8sClient.Delete(ctx, ok)
+	})
+
+	It("enforces monotonic epoch on routing updates", func() {
+		r := &pgshardv1alpha1.PgShardRouting{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: valNamespace},
+			Spec:       pgshardv1alpha1.PgShardRoutingSpec{Epoch: 5, TopologyGeneration: 2},
+		}
+		Expect(k8sClient.Create(ctx, r)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, r) }()
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
+		r.Spec.Epoch = 4 // regression
+		Expect(k8sClient.Update(ctx, r)).NotTo(Succeed())
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
+		r.Spec.Epoch = 6
+		r.Spec.TopologyGeneration = 1 // generation regression
+		Expect(k8sClient.Update(ctx, r)).NotTo(Succeed())
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
+		r.Spec.Epoch = 6
+		r.Spec.TopologyGeneration = 3
+		Expect(k8sClient.Update(ctx, r)).To(Succeed())
+	})
 })

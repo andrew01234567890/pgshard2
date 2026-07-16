@@ -50,6 +50,10 @@ spec:
               the single object routers and agents watch. Only the leader-elected
               operator writes it; every change is one write with a strictly monotonic
               epoch, and consumers apply an update iff epoch > lastApplied.
+
+              The epoch and topology generation are enforced monotonic non-decreasing
+              across updates: a router that saw a higher epoch must never observe the
+              object regress to a lower one (which it would silently discard as stale).
             properties:
               epoch:
                 format: int64
@@ -130,12 +134,15 @@ spec:
                   canRead:
                     type: boolean
                   host:
+                    maxLength: 253
                     type: string
                   pod:
                     type: string
                   port:
                     default: 5432
                     format: int32
+                    maximum: 65535
+                    minimum: 1
                     type: integer
                 required:
                 - host
@@ -179,12 +186,15 @@ spec:
                         canRead:
                           type: boolean
                         host:
+                          maxLength: 253
                           type: string
                         pod:
                           type: string
                         port:
                           default: 5432
                           format: int32
+                          maximum: 65535
+                          minimum: 1
                           type: integer
                       required:
                       - host
@@ -200,12 +210,15 @@ spec:
                           canRead:
                             type: boolean
                           host:
+                            maxLength: 253
                             type: string
                           pod:
                             type: string
                           port:
                             default: 5432
                             format: int32
+                            maximum: 65535
+                            minimum: 1
                             type: integer
                         required:
                         - host
@@ -242,8 +255,12 @@ spec:
                         description: RoutingSequence binds a column to a global sequence.
                         properties:
                           column:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                             type: string
                           sequence:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                             type: string
                         required:
                         - column
@@ -253,7 +270,9 @@ spec:
                     shardKeyColumn:
                       type: string
                     type:
-                      description: RoutingTableType mirrors the vschema table classification.
+                      description: |-
+                        Reuses the vschema TableType (sharded;global); the routing compiler
+                        projects TableEntry.Type here, so the two must stay one enum.
                       enum:
                       - sharded
                       - global
@@ -278,6 +297,11 @@ spec:
             - epoch
             - topologyGeneration
             type: object
+            x-kubernetes-validations:
+            - message: epoch must not decrease
+              rule: self.epoch >= oldSelf.epoch
+            - message: topologyGeneration must not decrease
+              rule: self.topologyGeneration >= oldSelf.topologyGeneration
           status:
             description: PgShardRoutingStatus records compilation provenance.
             properties:
@@ -288,6 +312,8 @@ spec:
                 format: int64
                 type: integer
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true
