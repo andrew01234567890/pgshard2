@@ -26,3 +26,17 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(deps)"
+
+  - package-ecosystem: docker
+    directory: /operator
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker
+    directory: /images/postgres
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
