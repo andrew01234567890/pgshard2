@@ -89,19 +89,31 @@ type Rendered struct {
 
 var gucNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_.]*$`)
 
-// rejectedParameters are execution- or library-loading GUCs a user must never
-// set through spec.parameters: PostgreSQL runs them as shell commands or loads
-// them as native code under the postgres OS user (archive_command RCE, a
-// malicious shared_preload_libraries, etc.). Platform-fixed GUCs are enforced
-// separately by re-asserting them last.
+// rejectedParameters are execution- or library-loading settings a user must
+// never set through spec.parameters: PostgreSQL runs them as shell commands or
+// loads them as native code under the postgres OS user, and the `include*`
+// directives would pull in an unsanitized file that could set any of the
+// others. Platform-fixed GUCs are enforced separately by re-asserting them
+// last.
 var rejectedParameters = map[string]bool{
-	"archive_command":           true,
-	"restore_command":           true,
-	"archive_cleanup_command":   true,
-	"recovery_end_command":      true,
+	// Shell-command execution.
+	"archive_command":         true,
+	"restore_command":         true,
+	"archive_cleanup_command": true,
+	"recovery_end_command":    true,
+	"ssl_passphrase_command":  true,
+	// Native-library loading.
 	"shared_preload_libraries":  true,
 	"session_preload_libraries": true,
 	"local_preload_libraries":   true,
+	"archive_library":           true,
+	"oauth_validator_libraries": true,
+	"jit_provider":              true,
+	// Configuration-file inclusion (not GUCs, but valid postgresql.conf
+	// directives that would load an unsanitized file).
+	"include":           true,
+	"include_if_exists": true,
+	"include_dir":       true,
 }
 
 // sanitizeUserParameters normalizes keys (trim + lowercase, since PostgreSQL
@@ -206,7 +218,7 @@ func Render(in Inputs) (Rendered, error) {
 	// memory is under-divided and the aggregate blows past the memory limit.
 	maxConn := profile.maxConnections
 	if v, ok := userParams[ParamMaxConnections]; ok {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.Trim(strings.TrimSpace(v), `'"`)); err == nil && n > 0 {
 			maxConn = n
 		}
 	}
@@ -303,7 +315,9 @@ func ClassifyDiff(old, new map[string]string) (reload, restart []string) {
 	}
 	keys := slices.Sorted(maps.Keys(seen))
 	for _, k := range keys {
-		if old[k] == new[k] {
+		ov, oin := old[k]
+		nv, nin := new[k]
+		if oin == nin && ov == nv {
 			continue
 		}
 		if reloadableParameters[k] {
