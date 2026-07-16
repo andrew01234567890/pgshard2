@@ -44,7 +44,7 @@ var _ = Describe("PgShardCluster expansion", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardClusterSpec{
 				Postgres: pgshardv1alpha1.PostgresSpec{Version: "18"},
-				Size:     pgshardv1alpha1.SizeSpec{Class: "S"},
+				Size:     &pgshardv1alpha1.SizeSpec{Class: "S"},
 				Shards:   pgshardv1alpha1.ShardsSpec{InitialCount: count},
 			},
 		}

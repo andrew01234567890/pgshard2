@@ -61,12 +61,15 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	rendered, err := pgconfig.Render(pgconfig.Inputs{
-		Class:          cluster.Spec.Size.Class,
-		Overrides:      cluster.Spec.Size.Overrides,
+	inputs := pgconfig.Inputs{
 		UserParameters: cluster.Spec.Postgres.Parameters,
 		SlotHeadroom:   16,
-	})
+	}
+	if cluster.Spec.Size != nil {
+		inputs.Class = cluster.Spec.Size.Class
+		inputs.Overrides = cluster.Spec.Size.Overrides
+	}
+	rendered, err := pgconfig.Render(inputs)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("rendering configuration: %w", err)
 	}
