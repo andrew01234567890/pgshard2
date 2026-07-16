@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -86,6 +87,46 @@ func (f *FakeAgent) SetRole(role pgshardv1.InstanceRole) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Status.Role = role
+}
+
+// SetReady scripts the ready flag.
+func (f *FakeAgent) SetReady(ready bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.Ready = ready
+}
+
+// SetReceivedLSN scripts the received WAL position (failover election input).
+func (f *FakeAgent) SetReceivedLSN(value uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.WalReceiveLsn = &pgshardv1.Lsn{Value: value}
+}
+
+// Role reads the current instance role.
+func (f *FakeAgent) Role() pgshardv1.InstanceRole {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Status.Role
+}
+
+// AppliedEpoch reads the highest decision epoch applied.
+func (f *FakeAgent) AppliedEpoch() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.DecisionEpoch
+}
+
+// Client dials this fake over its own listener and returns an insecure
+// in-process AgentService client.
+func (f *FakeAgent) Client() (pgshardv1.AgentServiceClient, error) {
+	host, port := f.Addr()
+	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", host, port),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	return pgshardv1.NewAgentServiceClient(conn), nil
 }
 
 func (f *FakeAgent) GetStatus(

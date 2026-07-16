@@ -74,6 +74,16 @@ type PgShardShardReconciler struct {
 	Images ShardImages
 	// StatusPollInterval is the requeue cadence for status aggregation.
 	StatusPollInterval time.Duration
+	// dialAgent resolves a pod address to an AgentService client. Defaults
+	// to the connection pool; tests inject per-pod fakes.
+	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
+}
+
+func (r *PgShardShardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+	if r.dialAgent != nil {
+		return r.dialAgent(host, port)
+	}
+	return r.Agents.Get(host, port)
 }
 
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
@@ -343,19 +353,25 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	}
 
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
+	views := make([]instanceView, 0, len(pods.Items))
 	currentPrimary := ""
 	ready := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: "replica"}
+		view := instanceView{pod: pod.Name, host: pod.Status.PodIP}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			status, err := r.pollAgent(pollCtx, pod.Status.PodIP)
 			cancel()
 			if err == nil {
 				state.Ready = status.Ready
+				view.ready = status.Ready
+				view.receivedLSN = lsnValue(status.WalReceiveLsn)
+				view.walReceiver = status.WalReceiverActive
 				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
 					state.Role = "primary"
+					view.isPrimary = true
 					currentPrimary = pod.Name
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
@@ -366,6 +382,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			ready++
 		}
 		instances = append(instances, state)
+		views = append(views, view)
 	}
 
 	shard.Status.Instances = instances
@@ -380,13 +397,28 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	default:
 		shard.Status.Phase = pgshardv1alpha1.ShardDegraded
 	}
+
+	// A healthy primary clears any prior failover marker.
+	if currentPrimary != "" && shard.Status.TargetPrimary == PendingFailoverMarker {
+		shard.Status.TargetPrimary = currentPrimary
+	}
+	if err := r.reconcileFailover(ctx, shard, views); err != nil {
+		return err
+	}
 	return client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+func lsnValue(lsn *pgshardv1.Lsn) uint64 {
+	if lsn == nil {
+		return 0
+	}
+	return lsn.Value
 }
 
 func (r *PgShardShardReconciler) pollAgent(
 	ctx context.Context, host string,
 ) (*pgshardv1.InstanceStatus, error) {
-	agent, err := r.Agents.Get(host, agentPort)
+	agent, err := r.agentClient(host, agentPort)
 	if err != nil {
 		return nil, err
 	}
