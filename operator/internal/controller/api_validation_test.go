@@ -81,6 +81,9 @@ var _ = Describe("API validation", func() {
 		Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed())
 		bad.Spec.KeyRange.Start = "GG"
 		Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed())
+		// Non-canonical bound (trailing zero byte aliases a shorter bound).
+		bad.Spec.KeyRange = pgshardv1alpha1.KeyRange{Start: "4000"}
+		Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed())
 
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, s) }()
@@ -90,5 +93,35 @@ var _ = Describe("API validation", func() {
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
 		s.Spec.ClusterRef = "other"
 		Expect(k8sClient.Update(ctx, s)).NotTo(Succeed())
+	})
+
+	It("requires exactly one of a replication link's source/target shard", func() {
+		base := func(name string, link pgshardv1alpha1.ReplicationLink) *pgshardv1alpha1.PgShardShard {
+			return &pgshardv1alpha1.PgShardShard{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: pgshardv1alpha1.PgShardShardSpec{
+					ClusterRef:       "c",
+					KeyRange:         pgshardv1alpha1.KeyRange{End: "80"},
+					Replicas:         1,
+					ReplicationLinks: []pgshardv1alpha1.ReplicationLink{link},
+				},
+			}
+		}
+		neither := base("val-link-neither", pgshardv1alpha1.ReplicationLink{
+			Name: "l", Slot: "s", Publication: "p",
+		})
+		Expect(k8sClient.Create(ctx, neither)).NotTo(Succeed())
+
+		both := base("val-link-both", pgshardv1alpha1.ReplicationLink{
+			Name: "l", Slot: "s", Publication: "p",
+			SourceShard: "a", TargetShard: "b",
+		})
+		Expect(k8sClient.Create(ctx, both)).NotTo(Succeed())
+
+		one := base("val-link-one", pgshardv1alpha1.ReplicationLink{
+			Name: "l", Slot: "s", Publication: "p", SourceShard: "a",
+		})
+		Expect(k8sClient.Create(ctx, one)).To(Succeed())
+		_ = k8sClient.Delete(ctx, one)
 	})
 })

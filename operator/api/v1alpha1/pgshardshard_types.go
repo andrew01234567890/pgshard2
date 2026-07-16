@@ -27,13 +27,19 @@ import (
 // 0x4000000000000000; an empty start is 0 and an empty end is the top of
 // the keyspace. A shard's identity IS its range: reshards never mutate it,
 // they create new shards and retire old ones.
+//
+// Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+// bound never ends in "00" (which would alias a shorter bound to the same
+// value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+// The pattern enforces this directly — even-length lowercase hex, up to 8
+// bytes, whose last byte is non-zero — so no CEL rule is needed.
 type KeyRange struct {
-	// +kubebuilder:validation:Pattern=`^([0-9a-f]{2}){0,8}$`
+	// +kubebuilder:validation:Pattern=`^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$`
 	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Start string `json:"start,omitempty"`
 
-	// +kubebuilder:validation:Pattern=`^([0-9a-f]{2}){0,8}$`
+	// +kubebuilder:validation:Pattern=`^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$`
 	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	End string `json:"end,omitempty"`
@@ -53,6 +59,7 @@ type ReplicationLinkPhase string
 
 // ReplicationLink directs the agents to run a logical-replication workflow
 // (reshard seeding forward or reverse); the data-plane engine executes it.
+// +kubebuilder:validation:XValidation:rule="(has(self.sourceShard) && size(self.sourceShard) > 0) != (has(self.targetShard) && size(self.targetShard) > 0)",message="exactly one of sourceShard or targetShard must be set"
 type ReplicationLink struct {
 	Name string `json:"name"`
 
@@ -248,7 +255,7 @@ type PgShardShard struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   PgShardShardSpec   `json:"spec,omitempty"`
+	Spec   PgShardShardSpec   `json:"spec"`
 	Status PgShardShardStatus `json:"status,omitempty"`
 }
 

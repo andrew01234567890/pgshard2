@@ -238,25 +238,30 @@ type RestoredFrom struct {
 }
 
 // PgShardClusterSpec defines the desired state of PgShardCluster.
+//
+// Optional nested structs are pointers, not value types: a value-typed
+// struct with omitempty still serializes as {} (Go omits only empty basic
+// types), so a GET→Update round-trip would materialize the absent block and
+// trigger its defaults, silently mutating the spec.
 type PgShardClusterSpec struct {
 	Postgres PostgresSpec `json:"postgres"`
 
 	// +optional
-	Size SizeSpec `json:"size,omitempty"`
+	Size *SizeSpec `json:"size,omitempty"`
 
 	Shards ShardsSpec `json:"shards"`
 
 	// +optional
-	Router RouterSpec `json:"router,omitempty"`
+	Router *RouterSpec `json:"router,omitempty"`
 
 	// +optional
-	System SystemSpec `json:"system,omitempty"`
+	System *SystemSpec `json:"system,omitempty"`
 
 	// +optional
 	Backup *BackupSpec `json:"backup,omitempty"`
 
 	// +optional
-	TLS TLSSpec `json:"tls,omitempty"`
+	TLS *TLSSpec `json:"tls,omitempty"`
 
 	// Pause suspends reconciliation (hibernation).
 	// +optional
@@ -347,7 +352,7 @@ type PgShardCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   PgShardClusterSpec   `json:"spec,omitempty"`
+	Spec   PgShardClusterSpec   `json:"spec"`
 	Status PgShardClusterStatus `json:"status,omitempty"`
 }
 
