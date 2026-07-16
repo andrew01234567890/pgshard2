@@ -80,14 +80,20 @@ spec:
                               0x4000000000000000; an empty start is 0 and an empty end is the top of
                               the keyspace. A shard's identity IS its range: reshards never mutate it,
                               they create new shards and retire old ones.
+
+                              Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+                              bound never ends in "00" (which would alias a shorter bound to the same
+                              value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+                              The pattern enforces this directly — even-length lowercase hex, up to 8
+                              bytes, whose last byte is non-zero — so no CEL rule is needed.
                             properties:
                               end:
                                 maxLength: 16
-                                pattern: ^([0-9a-f]{2}){0,8}$
+                                pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
                                 type: string
                               start:
                                 maxLength: 16
-                                pattern: ^([0-9a-f]{2}){0,8}$
+                                pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
                                 type: string
                             type: object
                           type: array
@@ -146,14 +152,20 @@ spec:
                         0x4000000000000000; an empty start is 0 and an empty end is the top of
                         the keyspace. A shard's identity IS its range: reshards never mutate it,
                         they create new shards and retire old ones.
+
+                        Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+                        bound never ends in "00" (which would alias a shorter bound to the same
+                        value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+                        The pattern enforces this directly — even-length lowercase hex, up to 8
+                        bytes, whose last byte is non-zero — so no CEL rule is needed.
                       properties:
                         end:
                           maxLength: 16
-                          pattern: ^([0-9a-f]{2}){0,8}$
+                          pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
                           type: string
                         start:
                           maxLength: 16
-                          pattern: ^([0-9a-f]{2}){0,8}$
+                          pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
                           type: string
                       type: object
                     name:
