@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -112,10 +113,7 @@ func Render(in Inputs) (Rendered, error) {
 	}
 
 	memBytes := memory.Value()
-	cpuCores := cpu.MilliValue() / 1000
-	if cpuCores < 1 {
-		cpuCores = 1
-	}
+	cpuCores := max(cpu.MilliValue()/1000, 1)
 
 	params := map[string]string{}
 
@@ -147,18 +145,11 @@ func Render(in Inputs) (Rendered, error) {
 
 	// PostgreSQL 18 asynchronous I/O.
 	params["io_method"] = "worker"
-	ioWorkers := cpuCores / 2
-	if ioWorkers < 3 {
-		ioWorkers = 3
-	}
+	ioWorkers := max(cpuCores/2, 3)
 	params["io_workers"] = fmt.Sprintf("%d", ioWorkers)
 
-	for k, v := range in.UserParameters {
-		params[k] = v
-	}
-	for k, v := range platformFixed(replicas, in.SlotHeadroom) {
-		params[k] = v
-	}
+	maps.Copy(params, in.UserParameters)
+	maps.Copy(params, platformFixed(replicas, in.SlotHeadroom))
 
 	resources := corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
