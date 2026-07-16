@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,6 +75,16 @@ type PgShardShardReconciler struct {
 	Images ShardImages
 	// StatusPollInterval is the requeue cadence for status aggregation.
 	StatusPollInterval time.Duration
+	// dialAgent resolves a pod address to an AgentService client. Defaults
+	// to the connection pool; tests inject fakes.
+	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
+}
+
+func (r *PgShardShardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+	if r.dialAgent != nil {
+		return r.dialAgent(host, port)
+	}
+	return r.Agents.Get(host, port)
 }
 
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
@@ -342,6 +353,8 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		return err
 	}
 
+	before := shard.Status.DeepCopy()
+
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
 	currentPrimary := ""
 	ready := 0
@@ -372,13 +385,25 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	if currentPrimary != "" {
 		shard.Status.CurrentPrimary = currentPrimary
 	}
+	// A shard that once served (has a recorded primary) and now has no ready
+	// instances is Degraded, not Provisioning — provisioning is the initial
+	// bring-up state only.
+	hadPrimary := before.CurrentPrimary != ""
 	switch {
 	case ready == int(shard.Spec.Replicas) && currentPrimary != "":
 		shard.Status.Phase = pgshardv1alpha1.ShardReady
-	case ready == 0:
+	case ready == 0 && !hadPrimary:
 		shard.Status.Phase = pgshardv1alpha1.ShardProvisioning
 	default:
 		shard.Status.Phase = pgshardv1alpha1.ShardDegraded
+	}
+
+	// Only write when the status actually changed. The controller watches its
+	// own resource, so an unconditional write on every poll (WAL LSNs advance
+	// with every commit) would re-enqueue immediately and spin a hot loop
+	// under write traffic.
+	if apiequality.Semantic.DeepEqual(before, &shard.Status) {
+		return nil
 	}
 	return client.IgnoreNotFound(r.Status().Update(ctx, shard))
 }
@@ -386,7 +411,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 func (r *PgShardShardReconciler) pollAgent(
 	ctx context.Context, host string,
 ) (*pgshardv1.InstanceStatus, error) {
-	agent, err := r.Agents.Get(host, agentPort)
+	agent, err := r.agentClient(host, agentPort)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +419,10 @@ func (r *PgShardShardReconciler) pollAgent(
 	if err != nil {
 		return nil, err
 	}
-	return resp.Status, nil
+	if resp.GetStatus() == nil {
+		return nil, fmt.Errorf("agent %s returned an empty status", host)
+	}
+	return resp.GetStatus(), nil
 }
 
 func lsnString(lsn *pgshardv1.Lsn) string {
