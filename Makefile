@@ -1,6 +1,15 @@
-.PHONY: all build test lint fmt clean
+.PHONY: all build test lint fmt clean proto
+
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
 
 all: build
+
+proto:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	buf lint
+	buf generate
 
 build:
 	cargo build --workspace

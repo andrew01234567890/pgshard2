@@ -1,0 +1,8 @@
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: operator/internal/pb
+    opt: module=github.com/andrew01234567890/pgshard2/operator/internal/pb
+  - local: protoc-gen-go-grpc
+    out: operator/internal/pb
+    opt: module=github.com/andrew01234567890/pgshard2/operator/internal/pb

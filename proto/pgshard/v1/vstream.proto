@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+// Position in the unified stream: one entry per serving shard.
+//
+// Resume semantics: each lsn is the commit LSN of the last transaction that
+// was fully delivered for that shard. Resuming from a VGtid delivers
+// transactions whose commit LSN is strictly greater — never a duplicate of
+// the recorded transaction, never a skip.
+message VGtid {
+  repeated ShardGtid shard_gtids = 1;
+}
+
+message ShardGtid {
+  string shard = 1;
+  Lsn lsn = 2;
+  // Tables whose snapshot copy already completed (snapshot_and_follow resume).
+  repeated TableRef tables_copied = 3;
+}
+
+// Start at the current end of each shard's stream.
+message LatestStart {}
+
+// Stream a consistent snapshot of the tables first, then follow.
+message SnapshotAndFollowStart {}
+
+message StreamRequest {
+  string subscription_id = 1;
+  // Empty means all sharded tables.
+  repeated TableRef tables = 2;
+  // An unset start is INVALID_ARGUMENT.
+  oneof start {
+    // Resume strictly after this position (see VGtid).
+    VGtid position = 3;
+    LatestStart latest = 4;
+    SnapshotAndFollowStart snapshot_and_follow = 5;
+  }
+}
+
+message StreamResponse {
+  VEvent event = 1;
+}
+
+message Field {
+  string name = 1;
+  uint32 type_oid = 2;
+}
+
+message FieldEvent {
+  TableRef table = 1;
+  repeated Field fields = 2;
+}
+
+message CellValue {
+  bool null = 1;
+  // Postgres text-format encoding.
+  bytes value = 2;
+}
+
+enum RowOp {
+  ROW_OP_UNSPECIFIED = 0;
+  ROW_OP_INSERT = 1;
+  ROW_OP_UPDATE = 2;
+  ROW_OP_DELETE = 3;
+}
+
+message RowEvent {
+  TableRef table = 1;
+  RowOp op = 2;
+  repeated CellValue before = 3;
+  repeated CellValue after = 4;
+}
+
+message BeginEvent {
+  Lsn lsn = 1;
+}
+
+message CommitEvent {
+  // Commit LSN of the transaction; after delivering the matching VGtid this
+  // becomes the shard's resume position.
+  Lsn lsn = 1;
+}
+
+message HeartbeatEvent {}
+
+message DdlEvent {
+  string sql = 1;
+  string migration_id = 2;
+}
+
+// Emitted at reshard cutover: the source shard's stream ends and continues
+// on the successors at the recorded start LSNs.
+message JournalEvent {
+  string source_shard = 1;
+  Lsn source_lsn = 2;
+  repeated JournalSuccessor successors = 3;
+}
+
+message JournalSuccessor {
+  string shard = 1;
+  KeyRange key_range = 2;
+  Lsn start_lsn = 3;
+}
+
+message CopyCompletedEvent {
+  TableRef table = 1;
+}
+
+message VEvent {
+  string shard = 1;
+  google.protobuf.Timestamp commit_time = 2;
+  oneof event {
+    BeginEvent begin = 3;
+    FieldEvent field = 4;
+    RowEvent row = 5;
+    CommitEvent commit = 6;
+    DdlEvent ddl = 7;
+    JournalEvent journal = 8;
+    VGtid vgtid = 9;
+    HeartbeatEvent heartbeat = 10;
+    CopyCompletedEvent copy_completed = 11;
+  }
+}
+
+// Served by routers: the merged, reshard-transparent cross-shard stream.
+service VStreamService {
+  rpc Stream(StreamRequest) returns (stream StreamResponse);
+}

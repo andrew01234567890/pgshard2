@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/topology.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+message GetStateRequest {}
+
+message GetStateResponse {
+  RouterState state = 1;
+}
+
+message GateState {
+  Gate gate = 1;
+  uint32 buffered_sessions = 2;
+  uint64 buffered_bytes = 3;
+  bool expired = 4;
+}
+
+message RouterState {
+  uint64 acked_epoch = 1;
+  // No in-flight writes predate this epoch's gates.
+  uint64 quiesced_epoch = 2;
+  uint64 topology_generation = 3;
+  repeated GateState gates = 4;
+  uint32 active_sessions = 5;
+}
+
+message WaitEpochRequest {
+  uint64 epoch = 1;
+  uint32 timeout_ms = 2;
+}
+
+message WaitEpochResponse {
+  uint64 acked_epoch = 1;
+}
+
+message WaitQuiescedRequest {
+  uint64 epoch = 1;
+  uint32 timeout_ms = 2;
+}
+
+message WaitQuiescedResponse {
+  uint64 quiesced_epoch = 1;
+}
+
+message GateCloseRequest {
+  Gate gate = 1;
+}
+
+message GateCloseResponse {}
+
+// Opening uses the min_topology_generation stored on the closed gate itself
+// (topology.proto Gate); the request cannot lower it.
+message GateOpenRequest {
+  string gate_id = 1;
+}
+
+message GateOpenResponse {}
+
+message FlushPlanCacheRequest {}
+
+message FlushPlanCacheResponse {
+  uint64 evicted = 1;
+}
+
+// Served by every router; called by the operator during failover, rollouts,
+// reshard/DDL cutovers, and backup barriers.
+service RouterAdminService {
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+  rpc WaitEpoch(WaitEpochRequest) returns (WaitEpochResponse);
+  rpc WaitQuiesced(WaitQuiescedRequest) returns (WaitQuiescedResponse);
+  rpc GateClose(GateCloseRequest) returns (GateCloseResponse);
+  rpc GateOpen(GateOpenRequest) returns (GateOpenResponse);
+  rpc FlushPlanCache(FlushPlanCacheRequest) returns (FlushPlanCacheResponse);
+}

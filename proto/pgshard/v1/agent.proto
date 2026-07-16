@@ -1,0 +1,285 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pgshard/v1/common.proto";
+import "pgshard/v1/vstream.proto";
+import "pgshard/v1/workflow.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+enum InstanceRole {
+  INSTANCE_ROLE_UNSPECIFIED = 0;
+  INSTANCE_ROLE_PRIMARY = 1;
+  INSTANCE_ROLE_STANDBY = 2;
+}
+
+enum SyncState {
+  SYNC_STATE_UNSPECIFIED = 0;
+  SYNC_STATE_ASYNC = 1;
+  SYNC_STATE_SYNC = 2;
+  SYNC_STATE_QUORUM = 3;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  InstanceStatus status = 1;
+}
+
+message InstanceStatus {
+  InstanceRole role = 1;
+  bool ready = 2;
+  uint32 timeline = 3;
+  Lsn wal_write_lsn = 4;
+  Lsn wal_receive_lsn = 5;
+  Lsn wal_replay_lsn = 6;
+  double replay_lag_seconds = 7;
+  SyncState sync_state = 8;
+  bool wal_receiver_active = 9;
+  bool archiving_healthy = 10;
+  string postgres_version = 11;
+  uint64 system_id = 12;
+  bool fenced = 13;
+}
+
+message PromoteRequest {
+  // Operator's decision record; agent refuses if it is not the target.
+  string target_primary = 1;
+  // Monotonic failover-decision epoch; must be > 0 (zero is rejected).
+  // The agent persists the highest applied epoch together with the request
+  // it carried: lower epochs are rejected, and an equal epoch is accepted
+  // only when the request is identical to the one already applied
+  // (idempotent retry). A delayed message from an older failover can
+  // therefore never reverse a newer decision.
+  uint64 decision_epoch = 2;
+}
+
+message PromoteResponse {
+  uint32 new_timeline = 1;
+  Lsn promote_lsn = 2;
+}
+
+message RejoinAsStandbyRequest {
+  PgEndpoint upstream = 1;
+  // Run pg_rewind first if the timeline diverged.
+  bool allow_rewind = 2;
+  // See PromoteRequest.decision_epoch: stale requests are rejected.
+  uint64 decision_epoch = 3;
+}
+
+message RejoinAsStandbyResponse {
+  bool rewound = 1;
+}
+
+message FenceRequest {
+  bool fenced = 1;
+  // See PromoteRequest.decision_epoch: stale requests are rejected.
+  uint64 decision_epoch = 2;
+}
+
+message FenceResponse {}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {}
+
+message CreateRestorePointRequest {
+  string name = 1;
+}
+
+message CreateRestorePointResponse {
+  Lsn lsn = 1;
+  uint32 timeline = 2;
+}
+
+message SwitchWalRequest {
+  // Wait until the switched segment is confirmed archived.
+  bool wait_archived = 1;
+}
+
+message SwitchWalResponse {
+  Lsn lsn = 1;
+}
+
+enum BackupType {
+  BACKUP_TYPE_UNSPECIFIED = 0;
+  BACKUP_TYPE_FULL = 1;
+  BACKUP_TYPE_DIFF = 2;
+  BACKUP_TYPE_INCR = 3;
+}
+
+message RunBackupRequest {
+  string stanza = 1;
+  BackupType type = 2;
+}
+
+message RunBackupResponse {
+  string label = 1;
+  Lsn start_lsn = 2;
+  Lsn stop_lsn = 3;
+  uint32 timeline = 4;
+  google.protobuf.Timestamp stop_time = 5;
+}
+
+message RunRestoreRequest {
+  string stanza = 1;
+  // pgBackRest backup set label; empty lets pgBackRest select.
+  string set = 2;
+  // pgBackRest --type: name | time | lsn | none | immediate.
+  string target_type = 3;
+  string target = 4;
+  string target_timeline = 5;
+}
+
+message RunRestoreResponse {
+  uint32 timeline = 1;
+  Lsn reached_lsn = 2;
+}
+
+message StanzaCreateRequest {
+  string stanza = 1;
+}
+
+message StanzaCreateResponse {}
+
+message StanzaCheckRequest {
+  string stanza = 1;
+}
+
+message StanzaCheckResponse {
+  bool healthy = 1;
+  string detail = 2;
+}
+
+message PrepareSourceRequest {
+  string publication = 1;
+  repeated TableRef tables = 2;
+}
+
+message PrepareSourceResponse {
+  // Free WAL headroom for slot retention, from max_slot_wal_keep_size.
+  // Absent means unlimited (max_slot_wal_keep_size = -1).
+  optional uint64 wal_headroom_bytes = 1;
+}
+
+message StartWorkflowRequest {
+  WorkflowSpec spec = 1;
+}
+
+message StartWorkflowResponse {}
+
+message StopWorkflowRequest {
+  string id = 1;
+  bool drop_slot = 2;
+}
+
+message StopWorkflowResponse {}
+
+message WatchWorkflowsRequest {
+  // Empty means all workflows on this agent.
+  repeated string ids = 1;
+}
+
+message WatchWorkflowsResponse {
+  WorkflowStatus status = 1;
+}
+
+// Quiesce marker for cutover: returns the current flush LSN after which no
+// further writes will be produced for the gated scope.
+message CheckpointRequest {}
+
+message CheckpointResponse {
+  Lsn lsn = 1;
+}
+
+message EmitJournalRequest {
+  JournalEvent journal = 1;
+}
+
+message EmitJournalResponse {
+  Lsn lsn = 1;
+}
+
+message ShardStreamRequest {
+  string subscription_id = 1;
+  string shard = 2;
+  // Position of the last fully delivered commit: the stream resumes with
+  // transactions whose commit LSN is strictly greater than this.
+  Lsn from_lsn = 3;
+  repeated TableRef tables = 4;
+  SourcePolicy source_policy = 5;
+}
+
+message ShardStreamResponse {
+  repeated VEvent events = 1;
+}
+
+message DropSlotRequest {
+  string slot = 1;
+}
+
+message DropSlotResponse {}
+
+message ExecSchemaRequest {
+  string sql = 1;
+  // Idempotency key; required, nonempty. The agent atomically claims the id
+  // before executing (a concurrent duplicate call fails with ALREADY_EXISTS
+  // while the first is in flight), binds it to a hash of sql (the same id
+  // with different sql is INVALID_ARGUMENT), and persists completed ids for
+  // a retention window of at least 7 days so a retry after success returns
+  // success without re-executing. After the retention window an unknown id
+  // is FAILED_PRECONDITION — never silently re-executed.
+  string operation_id = 2;
+}
+
+message ExecSchemaResponse {}
+
+enum MigrationStepKind {
+  MIGRATION_STEP_KIND_UNSPECIFIED = 0;
+  MIGRATION_STEP_KIND_CREATE_SHADOW = 1;
+  MIGRATION_STEP_KIND_EXECUTE_DIRECT = 2;
+  MIGRATION_STEP_KIND_CREATE_INDEX = 3;
+  MIGRATION_STEP_KIND_CUTOVER_RENAME = 4;
+  MIGRATION_STEP_KIND_REVERT_RENAME = 5;
+  MIGRATION_STEP_KIND_DROP_ARTIFACT = 6;
+}
+
+message MigrationStepRequest {
+  string migration_id = 1;
+  MigrationStepKind kind = 2;
+  TableRef table = 3;
+  string ddl_sql = 4;
+  string artifact_name = 5;
+}
+
+message MigrationStepResponse {
+  bool done = 1;
+  string detail = 2;
+}
+
+// Runs inside every Postgres pod (PID 1). mTLS; called by operator and router.
+service AgentService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  rpc RejoinAsStandby(RejoinAsStandbyRequest) returns (RejoinAsStandbyResponse);
+  rpc Fence(FenceRequest) returns (FenceResponse);
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+  rpc CreateRestorePoint(CreateRestorePointRequest) returns (CreateRestorePointResponse);
+  rpc SwitchWal(SwitchWalRequest) returns (SwitchWalResponse);
+  rpc RunBackup(RunBackupRequest) returns (RunBackupResponse);
+  rpc RunRestore(RunRestoreRequest) returns (RunRestoreResponse);
+  rpc StanzaCreate(StanzaCreateRequest) returns (StanzaCreateResponse);
+  rpc StanzaCheck(StanzaCheckRequest) returns (StanzaCheckResponse);
+  rpc PrepareSource(PrepareSourceRequest) returns (PrepareSourceResponse);
+  rpc StartWorkflow(StartWorkflowRequest) returns (StartWorkflowResponse);
+  rpc StopWorkflow(StopWorkflowRequest) returns (StopWorkflowResponse);
+  rpc WatchWorkflows(WatchWorkflowsRequest) returns (stream WatchWorkflowsResponse);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc EmitJournal(EmitJournalRequest) returns (EmitJournalResponse);
+  rpc ShardStream(ShardStreamRequest) returns (stream ShardStreamResponse);
+  rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
+  rpc ExecSchema(ExecSchemaRequest) returns (ExecSchemaResponse);
+  rpc MigrationStep(MigrationStepRequest) returns (MigrationStepResponse);
+}
