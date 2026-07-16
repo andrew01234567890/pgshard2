@@ -1,0 +1,68 @@
+name: Images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "images/**"
+      - "operator/**"
+      - ".github/workflows/images.yaml"
+  # Release-please creates tags with GITHUB_TOKEN, which never triggers
+  # tag-push workflows — so the release workflow calls this one instead,
+  # passing the released version explicitly.
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.2.0) to tag images with"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: pgshard-postgres
+            context: images/postgres
+            file: images/postgres/Dockerfile
+          - image: pgshard-operator
+            context: operator
+            file: operator/Dockerfile
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=semver,pattern={{version}},value=${{ inputs.version || '' }},enable=${{ inputs.version != '' && inputs.version != null }}
+            type=raw,value=latest,enable=${{ inputs.version != '' && inputs.version != null }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
