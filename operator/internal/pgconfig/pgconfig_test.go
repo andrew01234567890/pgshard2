@@ -255,6 +255,14 @@ func TestWorkMemUsesOverriddenMaxConnections(t *testing.T) {
 	if r.Parameters[ParamMaxConnections] != "1000" {
 		t.Errorf("max_connections override lost: %s", r.Parameters[ParamMaxConnections])
 	}
+	// A quoted, internally-spaced value still drives sizing.
+	rq, err := Render(Inputs{Class: "M", UserParameters: map[string]string{ParamMaxConnections: "' 1000 '"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rq.Parameters[ParamWorkMem] != "4MB" {
+		t.Errorf("quoted max_connections should drive work_mem: %s", rq.Parameters[ParamWorkMem])
+	}
 }
 
 func TestRequestsOnlyOverrideApplies(t *testing.T) {

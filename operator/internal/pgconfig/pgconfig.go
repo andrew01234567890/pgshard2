@@ -218,7 +218,7 @@ func Render(in Inputs) (Rendered, error) {
 	// memory is under-divided and the aggregate blows past the memory limit.
 	maxConn := profile.maxConnections
 	if v, ok := userParams[ParamMaxConnections]; ok {
-		if n, err := strconv.Atoi(strings.Trim(strings.TrimSpace(v), `'"`)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.Trim(strings.TrimSpace(v), `'"`))); err == nil && n > 0 {
 			maxConn = n
 		}
 	}
