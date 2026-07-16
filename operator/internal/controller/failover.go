@@ -17,8 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
+	"strings"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -81,11 +83,12 @@ func evaluateFailover(instances []instanceView) failoverDecision {
 	if hasReadyPrimary || len(candidates) == 0 {
 		return failoverDecision{}
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].receivedLSN != candidates[j].receivedLSN {
-			return candidates[i].receivedLSN > candidates[j].receivedLSN
+	slices.SortFunc(candidates, func(a, b instanceView) int {
+		// Most advanced first; ties broken by pod name for determinism.
+		if a.receivedLSN != b.receivedLSN {
+			return cmp.Compare(b.receivedLSN, a.receivedLSN)
 		}
-		return candidates[i].pod < candidates[j].pod
+		return strings.Compare(a.pod, b.pod)
 	})
 
 	// Don't elect while any candidate's WAL receiver is still running.
