@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- pgshard_v1alpha1_pgshardcluster.yaml
+- pgshard_v1alpha1_pgshardshard.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
