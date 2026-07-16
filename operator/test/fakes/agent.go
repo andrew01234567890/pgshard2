@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -42,8 +43,59 @@ type FakeAgent struct {
 
 	executedSchemaOps map[string]string
 
+	// emptyStatus makes GetStatus return a response with a nil Status, to
+	// exercise the operator's empty-status handling.
+	emptyStatus bool
+
 	server   *grpc.Server
 	listener net.Listener
+}
+
+// SetEmptyStatus makes GetStatus return a nil Status message.
+func (f *FakeAgent) SetEmptyStatus(empty bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.emptyStatus = empty
+}
+
+// SetReady scripts the ready flag.
+func (f *FakeAgent) SetReady(ready bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.Ready = ready
+}
+
+// SetReceivedLSN scripts the received WAL position (failover election input).
+func (f *FakeAgent) SetReceivedLSN(value uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.WalReceiveLsn = &pgshardv1.Lsn{Value: value}
+}
+
+// Role reads the current instance role.
+func (f *FakeAgent) Role() pgshardv1.InstanceRole {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Status.Role
+}
+
+// AppliedEpoch reads the highest decision epoch applied.
+func (f *FakeAgent) AppliedEpoch() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.DecisionEpoch
+}
+
+// Client dials this fake over its own listener and returns an insecure
+// in-process AgentService client.
+func (f *FakeAgent) Client() (pgshardv1.AgentServiceClient, error) {
+	host, port := f.Addr()
+	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", host, port),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	return pgshardv1.NewAgentServiceClient(conn), nil
 }
 
 // NewFakeAgent starts a fake agent on an ephemeral localhost port.
@@ -94,6 +146,9 @@ func (f *FakeAgent) GetStatus(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("GetStatus")
+	if f.emptyStatus {
+		return &pgshardv1.GetStatusResponse{}, nil
+	}
 	clone, ok := proto.Clone(f.Status).(*pgshardv1.InstanceStatus)
 	if !ok {
 		return nil, status.Error(codes.Internal, "clone failed")
