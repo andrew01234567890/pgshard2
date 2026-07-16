@@ -136,9 +136,14 @@ spec:
                   canRead:
                     type: boolean
                   host:
+                    description: |-
+                      Host is dialed directly by routers; the pattern keeps connection-string
+                      metacharacters out of an operator-compiled value agents trust.
                     maxLength: 253
+                    pattern: ^[A-Za-z0-9._:-]+$
                     type: string
                   pod:
+                    maxLength: 253
                     type: string
                   port:
                     default: 5432
@@ -188,9 +193,14 @@ spec:
                         canRead:
                           type: boolean
                         host:
+                          description: |-
+                            Host is dialed directly by routers; the pattern keeps connection-string
+                            metacharacters out of an operator-compiled value agents trust.
                           maxLength: 253
+                          pattern: ^[A-Za-z0-9._:-]+$
                           type: string
                         pod:
+                          maxLength: 253
                           type: string
                         port:
                           default: 5432
@@ -212,9 +222,14 @@ spec:
                           canRead:
                             type: boolean
                           host:
+                            description: |-
+                              Host is dialed directly by routers; the pattern keeps connection-string
+                              metacharacters out of an operator-compiled value agents trust.
                             maxLength: 253
+                            pattern: ^[A-Za-z0-9._:-]+$
                             type: string
                           pod:
+                            maxLength: 253
                             type: string
                           port:
                             default: 5432
@@ -246,11 +261,19 @@ spec:
                 type: array
               tables:
                 items:
-                  description: RoutingTable is one table's compiled routing entry.
+                  description: |-
+                    RoutingTable is one table's compiled routing entry. Agents build DDL from
+                    these identifiers, so they carry the same unquoted-identifier validation as
+                    the untrusted TableConfig they are projected from — the schema is the
+                    backstop if the compiler ever forgets to re-validate.
                   properties:
                     name:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     schema:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     sequences:
                       items:
@@ -270,6 +293,8 @@ spec:
                         type: object
                       type: array
                     shardKeyColumn:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
                     type:
                       description: |-

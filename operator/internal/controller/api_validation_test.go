@@ -195,4 +195,44 @@ var _ = Describe("API validation", func() {
 		r.Spec.TopologyGeneration = 3
 		Expect(k8sClient.Update(ctx, r)).To(Succeed())
 	})
+
+	It("validates identifiers and host in the compiled routing view", func() {
+		route := func(name string, spec pgshardv1alpha1.PgShardRoutingSpec) *pgshardv1alpha1.PgShardRouting {
+			spec.Epoch, spec.TopologyGeneration = 1, 1
+			return &pgshardv1alpha1.PgShardRouting{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: valNamespace},
+				Spec:       spec,
+			}
+		}
+		// A DDL-bound identifier with a SQL metacharacter is rejected even on
+		// the operator-compiled object agents trust.
+		Expect(k8sClient.Create(ctx, route("rt-inject", pgshardv1alpha1.PgShardRoutingSpec{
+			Tables: []pgshardv1alpha1.RoutingTable{{
+				Schema: "public", Name: `orders"; DROP TABLE x; --`,
+				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id",
+			}},
+		}))).NotTo(Succeed())
+		// A host carrying connection-string metacharacters is rejected.
+		Expect(k8sClient.Create(ctx, route("rt-badhost", pgshardv1alpha1.PgShardRoutingSpec{
+			Shards: []pgshardv1alpha1.RoutingShard{{
+				Name: "s0", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				State:   pgshardv1alpha1.RoutingServing,
+				Primary: &pgshardv1alpha1.RoutingEndpoint{Pod: "p0", Host: "evil host' sslmode=disable"},
+			}},
+		}))).NotTo(Succeed())
+		// A valid compiled view is admitted.
+		ok := route("rt-ok", pgshardv1alpha1.PgShardRoutingSpec{
+			Shards: []pgshardv1alpha1.RoutingShard{{
+				Name: "s0", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				State:   pgshardv1alpha1.RoutingServing,
+				Primary: &pgshardv1alpha1.RoutingEndpoint{Pod: "p0", Host: "10.0.0.1"},
+			}},
+			Tables: []pgshardv1alpha1.RoutingTable{{
+				Schema: "public", Name: "orders",
+				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "customer_id",
+			}},
+		})
+		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
+		_ = k8sClient.Delete(ctx, ok)
+	})
 })

@@ -37,8 +37,12 @@ const (
 // connect to pod IPs published here (epoch-ordered) rather than Services,
 // so routing changes never wait on kube-proxy propagation.
 type RoutingEndpoint struct {
+	// +kubebuilder:validation:MaxLength=253
 	Pod string `json:"pod"`
 
+	// Host is dialed directly by routers; the pattern keeps connection-string
+	// metacharacters out of an operator-compiled value agents trust.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._:-]+$`
 	// +kubebuilder:validation:MaxLength=253
 	Host string `json:"host"`
 
@@ -78,16 +82,25 @@ type RoutingSequence struct {
 	Sequence string `json:"sequence"`
 }
 
-// RoutingTable is one table's compiled routing entry.
+// RoutingTable is one table's compiled routing entry. Agents build DDL from
+// these identifiers, so they carry the same unquoted-identifier validation as
+// the untrusted TableConfig they are projected from — the schema is the
+// backstop if the compiler ever forgets to re-validate.
 type RoutingTable struct {
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Schema string `json:"schema"`
 
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
 	// Reuses the vschema TableType (sharded;global); the routing compiler
 	// projects TableEntry.Type here, so the two must stay one enum.
 	Type TableType `json:"type"`
 
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
 
