@@ -8,6 +8,9 @@ rules:
   - ""
   resources:
   - configmaps
+  - persistentvolumeclaims
+  - pods
+  - services
   verbs:
   - create
   - delete

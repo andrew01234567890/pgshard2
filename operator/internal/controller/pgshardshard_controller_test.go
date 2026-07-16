@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
 )
 
 var _ = Describe("PgShardShard Controller", func() {
@@ -78,14 +79,14 @@ var _ = Describe("PgShardShard Controller", func() {
 			controllerReconciler := &PgShardShardReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+				Agents: agentclient.NewInsecurePool(),
+				Images: ShardImages{Postgres: "pg:test", Agent: "agent:test"},
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
 		})
 	})
 })
