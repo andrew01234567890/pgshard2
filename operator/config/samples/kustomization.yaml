@@ -2,4 +2,6 @@
 resources:
 - pgshard_v1alpha1_pgshardcluster.yaml
 - pgshard_v1alpha1_pgshardshard.yaml
+- pgshard_v1alpha1_pgshardrouting.yaml
+- pgshard_v1alpha1_pgshardtableconfig.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples
