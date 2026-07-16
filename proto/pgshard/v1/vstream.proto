@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+// Position in the unified stream: one LSN per serving shard.
+message VGtid {
+  repeated ShardGtid shard_gtids = 1;
+}
+
+message ShardGtid {
+  string shard = 1;
+  Lsn lsn = 2;
+  // Tables whose snapshot copy already completed (SNAPSHOT_AND_FOLLOW resume).
+  repeated string tables_copied = 3;
+}
+
+enum StartMode {
+  START_MODE_UNSPECIFIED = 0;
+  START_MODE_POSITION = 1;
+  START_MODE_LATEST = 2;
+  START_MODE_SNAPSHOT_AND_FOLLOW = 3;
+}
+
+message StreamRequest {
+  string subscription_id = 1;
+  StartMode mode = 2;
+  VGtid position = 3;
+  // Empty means all sharded tables.
+  repeated TableRef tables = 4;
+}
+
+message StreamResponse {
+  VEvent event = 1;
+}
+
+enum VEventType {
+  V_EVENT_TYPE_UNSPECIFIED = 0;
+  V_EVENT_TYPE_BEGIN = 1;
+  V_EVENT_TYPE_FIELD = 2;
+  V_EVENT_TYPE_ROW = 3;
+  V_EVENT_TYPE_COMMIT = 4;
+  V_EVENT_TYPE_DDL = 5;
+  V_EVENT_TYPE_JOURNAL = 6;
+  V_EVENT_TYPE_VGTID = 7;
+  V_EVENT_TYPE_HEARTBEAT = 8;
+  V_EVENT_TYPE_COPY_COMPLETED = 9;
+}
+
+message Field {
+  string name = 1;
+  uint32 type_oid = 2;
+}
+
+message FieldEvent {
+  TableRef table = 1;
+  repeated Field fields = 2;
+}
+
+message CellValue {
+  bool null = 1;
+  // Postgres text-format encoding.
+  bytes value = 2;
+}
+
+enum RowOp {
+  ROW_OP_UNSPECIFIED = 0;
+  ROW_OP_INSERT = 1;
+  ROW_OP_UPDATE = 2;
+  ROW_OP_DELETE = 3;
+}
+
+message RowEvent {
+  TableRef table = 1;
+  RowOp op = 2;
+  repeated CellValue before = 3;
+  repeated CellValue after = 4;
+}
+
+message DdlEvent {
+  string sql = 1;
+  string migration_id = 2;
+}
+
+// Emitted at reshard cutover: the source shard's stream ends and continues
+// on the successors at the recorded start LSNs.
+message JournalEvent {
+  string source_shard = 1;
+  Lsn source_lsn = 2;
+  repeated JournalSuccessor successors = 3;
+}
+
+message JournalSuccessor {
+  string shard = 1;
+  KeyRange key_range = 2;
+  Lsn start_lsn = 3;
+}
+
+message CopyCompletedEvent {
+  TableRef table = 1;
+}
+
+message VEvent {
+  VEventType type = 1;
+  string shard = 2;
+  google.protobuf.Timestamp commit_time = 3;
+  oneof payload {
+    FieldEvent field = 4;
+    RowEvent row = 5;
+    DdlEvent ddl = 6;
+    JournalEvent journal = 7;
+    VGtid vgtid = 8;
+    CopyCompletedEvent copy_completed = 9;
+  }
+}
+
+// Served by routers: the merged, reshard-transparent cross-shard stream.
+service VStreamService {
+  rpc Stream(StreamRequest) returns (stream StreamResponse);
+}

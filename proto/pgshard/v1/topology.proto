@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+// Compiled routing view. In Kubernetes this mirrors the PgShardRouting CRD;
+// in tests it is served from a static file. Routers and agents apply an
+// update iff epoch > last applied epoch.
+message Topology {
+  uint64 epoch = 1;
+  // Bumps only on structural change (shard set or table catalog).
+  uint64 topology_generation = 2;
+  uint32 write_lease_seconds = 3;
+  string hash_function = 4;
+  repeated ShardEntry shards = 5;
+  repeated TableEntry tables = 6;
+  repeated Gate gates = 7;
+  PgEndpoint sequence_endpoint = 8;
+}
+
+enum ShardState {
+  SHARD_STATE_UNSPECIFIED = 0;
+  SHARD_STATE_SERVING = 1;
+  SHARD_STATE_SEEDING = 2;
+  SHARD_STATE_READ_ONLY = 3;
+  SHARD_STATE_DRAINING = 4;
+  SHARD_STATE_HIDDEN = 5;
+}
+
+message Instance {
+  string pod = 1;
+  PgEndpoint endpoint = 2;
+  bool can_read = 3;
+}
+
+message ShardEntry {
+  string name = 1;
+  KeyRange key_range = 2;
+  ShardState state = 3;
+  Instance primary = 4;
+  repeated Instance replicas = 5;
+}
+
+enum TableType {
+  TABLE_TYPE_UNSPECIFIED = 0;
+  TABLE_TYPE_SHARDED = 1;
+  // Lives in the system (unsharded) database.
+  TABLE_TYPE_GLOBAL = 2;
+}
+
+message SequenceBinding {
+  string column = 1;
+  string sequence = 2;
+}
+
+message TableEntry {
+  TableRef table = 1;
+  TableType type = 2;
+  repeated string shard_key_columns = 3;
+  repeated SequenceBinding sequences = 4;
+}
+
+enum GateMode {
+  GATE_MODE_UNSPECIFIED = 0;
+  GATE_MODE_WRITES_ONLY = 1;
+  GATE_MODE_ALL = 2;
+}
+
+message GateScope {
+  oneof scope {
+    bool all = 1;
+    TableRef table = 2;
+    KeyRange key_range = 3;
+  }
+}
+
+// Buffering directive. The deadline is absolute: when it passes without an
+// explicit open, routers fail-safe UNGATE and resume prior routing —
+// coordinators must treat an expired gate as an aborted cutover.
+message Gate {
+  string id = 1;
+  GateScope scope = 2;
+  GateMode mode = 3;
+  uint64 epoch = 4;
+  google.protobuf.Timestamp deadline = 5;
+  // On open, sessions replay only after the watched topology reaches this.
+  uint64 min_topology_generation = 6;
+}

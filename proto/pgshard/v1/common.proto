@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+// Half-open range [start, end) over the 64-bit keyspace-id space.
+// An absent end means +infinity.
+message KeyRange {
+  fixed64 start = 1;
+  optional fixed64 end = 2;
+}
+
+message Lsn {
+  uint64 value = 1;
+}
+
+message ShardRef {
+  string cluster = 1;
+  string shard = 2;
+}
+
+message TableRef {
+  string schema = 1;
+  string name = 2;
+}
+
+message PgEndpoint {
+  string host = 1;
+  uint32 port = 2;
+  string database = 3;
+}
+
+// Which instance a logical-replication consumer attaches to.
+enum SourcePolicy {
+  SOURCE_POLICY_UNSPECIFIED = 0;
+  SOURCE_POLICY_PRIMARY = 1;
+  SOURCE_POLICY_PREFER_STANDBY = 2;
+  SOURCE_POLICY_REQUIRE_STANDBY = 3;
+}

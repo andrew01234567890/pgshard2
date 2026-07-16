@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1";
+
+enum WorkflowKind {
+  WORKFLOW_KIND_UNSPECIFIED = 0;
+  // Keyrange-filtered copy + streaming apply for resharding (forward or reverse).
+  WORKFLOW_KIND_RESHARD = 1;
+  // Same-instance shadow-table backfill for online DDL.
+  WORKFLOW_KIND_DDL_SHADOW = 2;
+}
+
+message TableMapping {
+  TableRef source = 1;
+  TableRef target = 2;
+  // Source column -> target column. Empty means identity mapping.
+  map<string, string> column_map = 3;
+}
+
+message KeyRangeFilter {
+  KeyRange range = 1;
+  string hash_function = 2;
+}
+
+message RowFilter {
+  oneof filter {
+    bool all = 1;
+    KeyRangeFilter key_range = 2;
+  }
+}
+
+// A replication worker runs on the TARGET agent and pulls from the source.
+message WorkflowSpec {
+  string id = 1;
+  WorkflowKind kind = 2;
+  string source_shard = 3;
+  PgEndpoint source_primary = 4;
+  repeated PgEndpoint source_standbys = 5;
+  SourcePolicy source_policy = 6;
+  string slot = 7;
+  string publication = 8;
+  repeated TableMapping tables = 9;
+  RowFilter filter = 10;
+}
+
+enum WorkflowPhase {
+  WORKFLOW_PHASE_UNSPECIFIED = 0;
+  WORKFLOW_PHASE_INIT = 1;
+  WORKFLOW_PHASE_COPY = 2;
+  WORKFLOW_PHASE_STREAMING = 3;
+  WORKFLOW_PHASE_STOPPED = 4;
+  WORKFLOW_PHASE_ERROR = 5;
+}
+
+message CopyProgress {
+  uint32 tables_total = 1;
+  uint32 tables_done = 2;
+  uint64 rows_copied = 3;
+}
+
+message WorkflowStatus {
+  string id = 1;
+  WorkflowPhase phase = 2;
+  CopyProgress copy = 3;
+  Lsn applied_lsn = 4;
+  uint64 lag_bytes = 5;
+  double lag_seconds = 6;
+  string error = 7;
+}
