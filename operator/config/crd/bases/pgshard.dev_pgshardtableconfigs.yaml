@@ -125,7 +125,7 @@ spec:
             x-kubernetes-validations:
             - message: sharded tables must declare shardKeyColumn
               rule: self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn)
-                && t.shardKeyColumn != ''))
+                && size(t.shardKeyColumn) > 0))
           status:
             description: PgShardTableConfigStatus reports compilation results.
             properties:

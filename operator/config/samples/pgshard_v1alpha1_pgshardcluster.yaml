@@ -6,4 +6,9 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: pgshardcluster-sample
 spec:
-  # TODO(user): Add fields here
+  postgres:
+    version: "18"
+  size:
+    class: S
+  shards:
+    initialCount: 2

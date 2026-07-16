@@ -6,4 +6,14 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: pgshardrouting-sample
 spec:
-  # TODO(user): Add fields here
+  epoch: 1
+  topologyGeneration: 1
+  shards:
+    - name: pgshardcluster-sample-min-80
+      keyRange:
+        end: "80"
+      state: serving
+    - name: pgshardcluster-sample-80-max
+      keyRange:
+        start: "80"
+      state: serving

@@ -6,4 +6,12 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: pgshardtableconfig-sample
 spec:
-  # TODO(user): Add fields here
+  clusterRef: pgshardcluster-sample
+  tables:
+    - name: orders
+      shardKeyColumn: customer_id
+      sequences:
+        - column: id
+          sequence: orders_id
+  sequences:
+    - name: orders_id
