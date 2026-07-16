@@ -2186,8 +2186,10 @@ type ExecSchemaRequest struct {
 	// Idempotency key; required, nonempty. The agent atomically claims the id
 	// before executing (a concurrent duplicate call fails with ALREADY_EXISTS
 	// while the first is in flight), binds it to a hash of sql (the same id
-	// with different sql is INVALID_ARGUMENT), and persists completed ids so
-	// a retry after success returns success without re-executing.
+	// with different sql is INVALID_ARGUMENT), and persists completed ids for
+	// a retention window of at least 7 days so a retry after success returns
+	// success without re-executing. After the retention window an unknown id
+	// is FAILED_PRECONDITION — never silently re-executed.
 	OperationId   string `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
