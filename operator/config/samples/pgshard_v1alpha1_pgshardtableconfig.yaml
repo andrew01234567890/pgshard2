@@ -1,0 +1,17 @@
+apiVersion: pgshard.dev/v1alpha1
+kind: PgShardTableConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: pgshard
+    app.kubernetes.io/managed-by: kustomize
+  name: pgshardtableconfig-sample
+spec:
+  clusterRef: pgshardcluster-sample
+  tables:
+    - name: orders
+      shardKeyColumn: customer_id
+      sequences:
+        - column: id
+          sequence: orders_id
+  sequences:
+    - name: orders_id

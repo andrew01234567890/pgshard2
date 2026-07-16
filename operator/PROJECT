@@ -27,4 +27,20 @@ resources:
   kind: PgShardShard
   path: github.com/andrew01234567890/pgshard2/operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: dev
+  group: pgshard
+  kind: PgShardRouting
+  path: github.com/andrew01234567890/pgshard2/operator/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: dev
+  group: pgshard
+  kind: PgShardTableConfig
+  path: github.com/andrew01234567890/pgshard2/operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

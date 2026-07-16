@@ -1,0 +1,348 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardroutings.pgshard.dev
+spec:
+  group: pgshard.dev
+  names:
+    kind: PgShardRouting
+    listKind: PgShardRoutingList
+    plural: pgshardroutings
+    singular: pgshardrouting
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.epoch
+      name: Epoch
+      type: integer
+    - jsonPath: .spec.topologyGeneration
+      name: Generation
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PgShardRouting is the operator-compiled routing view (one per
+          cluster).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardRoutingSpec is the compiled, atomically versioned routing view —
+              the single object routers and agents watch. Only the leader-elected
+              operator writes it; every change is one write with a strictly monotonic
+              epoch, and consumers apply an update iff epoch > lastApplied.
+
+              Every spec change must strictly increase the epoch: consumers apply an
+              update iff epoch > lastApplied, so a change that reused the current epoch
+              would be silently ignored. An equal epoch is therefore allowed only for an
+              identical (idempotent) re-apply. The topology generation may stay equal
+              across non-structural epoch bumps but must never decrease.
+            properties:
+              epoch:
+                format: int64
+                minimum: 1
+                type: integer
+              gates:
+                items:
+                  description: |-
+                    RoutingGate is a buffering directive. The deadline is absolute: when it
+                    passes without an explicit open, routers fail-safe UNGATE and resume the
+                    prior routing — coordinators treat an expired gate as an aborted cutover.
+                  properties:
+                    deadline:
+                      format: date-time
+                      type: string
+                    id:
+                      type: string
+                    match:
+                      description: GateMatch selects the traffic a gate buffers.
+                      properties:
+                        all:
+                          type: boolean
+                        keyRanges:
+                          items:
+                            description: |-
+                              KeyRange is a half-open range [start, end) over the 64-bit keyspace in
+                              the canonical trimmed big-endian hex syntax: "40" means
+                              0x4000000000000000; an empty start is 0 and an empty end is the top of
+                              the keyspace. A shard's identity IS its range: reshards never mutate it,
+                              they create new shards and retire old ones.
+
+                              Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+                              bound never ends in "00" (which would alias a shorter bound to the same
+                              value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+                              The pattern enforces this directly — even-length lowercase hex, up to 8
+                              bytes, whose last byte is non-zero — so no CEL rule is needed.
+                            properties:
+                              end:
+                                maxLength: 16
+                                pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                                type: string
+                              start:
+                                maxLength: 16
+                                pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                                type: string
+                            type: object
+                          type: array
+                        tables:
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    minTopologyGeneration:
+                      description: |-
+                        On open, buffered sessions replay only once the router has applied a
+                        topology at or beyond this generation.
+                      format: int64
+                      type: integer
+                    mode:
+                      default: bufferWrites
+                      enum:
+                      - bufferWrites
+                      - bufferAll
+                      type: string
+                  required:
+                  - deadline
+                  - id
+                  - match
+                  type: object
+                maxItems: 64
+                type: array
+              hashFunction:
+                default: xxhash64_v1
+                type: string
+              sequenceEndpoint:
+                description: System-shard primary that serves sequence blocks.
+                properties:
+                  canRead:
+                    type: boolean
+                  host:
+                    description: |-
+                      Host is dialed directly by routers; the pattern keeps connection-string
+                      metacharacters out of an operator-compiled value agents trust.
+                    maxLength: 253
+                    pattern: ^[A-Za-z0-9._:-]+$
+                    type: string
+                  pod:
+                    maxLength: 253
+                    type: string
+                  port:
+                    default: 5432
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                required:
+                - host
+                - pod
+                type: object
+              shards:
+                items:
+                  description: RoutingShard is one shard's compiled routing entry.
+                  properties:
+                    keyRange:
+                      description: |-
+                        KeyRange is a half-open range [start, end) over the 64-bit keyspace in
+                        the canonical trimmed big-endian hex syntax: "40" means
+                        0x4000000000000000; an empty start is 0 and an empty end is the top of
+                        the keyspace. A shard's identity IS its range: reshards never mutate it,
+                        they create new shards and retire old ones.
+
+                        Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+                        bound never ends in "00" (which would alias a shorter bound to the same
+                        value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+                        The pattern enforces this directly — even-length lowercase hex, up to 8
+                        bytes, whose last byte is non-zero — so no CEL rule is needed.
+                      properties:
+                        end:
+                          maxLength: 16
+                          pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                          type: string
+                        start:
+                          maxLength: 16
+                          pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                          type: string
+                      type: object
+                    name:
+                      type: string
+                    primary:
+                      description: |-
+                        RoutingEndpoint is a directly addressable PostgreSQL instance. Routers
+                        connect to pod IPs published here (epoch-ordered) rather than Services,
+                        so routing changes never wait on kube-proxy propagation.
+                      properties:
+                        canRead:
+                          type: boolean
+                        host:
+                          description: |-
+                            Host is dialed directly by routers; the pattern keeps connection-string
+                            metacharacters out of an operator-compiled value agents trust.
+                          maxLength: 253
+                          pattern: ^[A-Za-z0-9._:-]+$
+                          type: string
+                        pod:
+                          maxLength: 253
+                          type: string
+                        port:
+                          default: 5432
+                          format: int32
+                          maximum: 65535
+                          minimum: 1
+                          type: integer
+                      required:
+                      - host
+                      - pod
+                      type: object
+                    replicas:
+                      items:
+                        description: |-
+                          RoutingEndpoint is a directly addressable PostgreSQL instance. Routers
+                          connect to pod IPs published here (epoch-ordered) rather than Services,
+                          so routing changes never wait on kube-proxy propagation.
+                        properties:
+                          canRead:
+                            type: boolean
+                          host:
+                            description: |-
+                              Host is dialed directly by routers; the pattern keeps connection-string
+                              metacharacters out of an operator-compiled value agents trust.
+                            maxLength: 253
+                            pattern: ^[A-Za-z0-9._:-]+$
+                            type: string
+                          pod:
+                            maxLength: 253
+                            type: string
+                          port:
+                            default: 5432
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                        required:
+                        - host
+                        - pod
+                        type: object
+                      type: array
+                    state:
+                      description: RoutingShardState gates what traffic a shard entry
+                        accepts.
+                      enum:
+                      - serving
+                      - buffered
+                      - readOnly
+                      - draining
+                      - hidden
+                      type: string
+                  required:
+                  - keyRange
+                  - name
+                  - state
+                  type: object
+                maxItems: 256
+                type: array
+              tables:
+                items:
+                  description: |-
+                    RoutingTable is one table's compiled routing entry. Agents build DDL from
+                    these identifiers, so they carry the same unquoted-identifier validation as
+                    the untrusted TableConfig they are projected from — the schema is the
+                    backstop if the compiler ever forgets to re-validate.
+                  properties:
+                    name:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      type: string
+                    schema:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      type: string
+                    sequences:
+                      items:
+                        description: RoutingSequence binds a column to a global sequence.
+                        properties:
+                          column:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                            type: string
+                          sequence:
+                            maxLength: 63
+                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                            type: string
+                        required:
+                        - column
+                        - sequence
+                        type: object
+                      type: array
+                    shardKeyColumn:
+                      maxLength: 63
+                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      type: string
+                    type:
+                      description: |-
+                        Reuses the vschema TableType (sharded;global); the routing compiler
+                        projects TableEntry.Type here, so the two must stay one enum.
+                      enum:
+                      - sharded
+                      - global
+                      type: string
+                  required:
+                  - name
+                  - schema
+                  - type
+                  type: object
+                maxItems: 2000
+                type: array
+              topologyGeneration:
+                description: Bumps only on structural change (shard set or table catalog).
+                format: int64
+                minimum: 1
+                type: integer
+              writeLeaseSeconds:
+                default: 10
+                format: int32
+                type: integer
+            required:
+            - epoch
+            - topologyGeneration
+            type: object
+            x-kubernetes-validations:
+            - message: any change must strictly increase epoch
+              rule: self == oldSelf || self.epoch > oldSelf.epoch
+            - message: topologyGeneration must not decrease
+              rule: self.topologyGeneration >= oldSelf.topologyGeneration
+          status:
+            description: PgShardRoutingStatus records compilation provenance.
+            properties:
+              compiledAt:
+                format: date-time
+                type: string
+              observedClusterGeneration:
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
