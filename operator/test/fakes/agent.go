@@ -24,13 +24,15 @@ type FakeAgent struct {
 
 	mu sync.Mutex
 
-	// Status returned by GetStatus; mutate via WithStatus/SetRole.
+	// Status returned by GetStatus; script it via SetRole or by mutating
+	// under the same lock in tests.
 	Status *pgshardv1.InstanceStatus
 
 	// Highest decision epoch applied, per the contract on PromoteRequest.
 	DecisionEpoch uint64
 
-	// Calls records method names in arrival order.
+	// Calls records method names in arrival order; controller tests assert
+	// command sequences (e.g. Fence before Promote) against it.
 	Calls []string
 
 	executedSchemaOps map[string]string
