@@ -590,6 +590,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-gate"
+version = "0.0.0"
+dependencies = [
+ "pgshard-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pgshard-proto"
 version = "0.0.0"
 dependencies = [
