@@ -1,5 +1,10 @@
 name: Dependabot auto-merge
 
+# Explicit permissions below apply to dependabot-triggered runs (the
+# read-only default is only for workflows without a permissions block) —
+# this mirrors GitHub's documented automation recipe. Caveat: PRs that
+# modify .github/workflows (actions-ecosystem updates) cannot be merged by
+# GITHUB_TOKEN (workflow scope) and stay open for manual merge.
 on: pull_request
 
 permissions:
