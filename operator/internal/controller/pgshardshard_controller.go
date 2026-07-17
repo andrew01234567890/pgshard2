@@ -128,15 +128,16 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	if err := r.aggregateStatus(ctx, &shard); err != nil {
+	readyReplicas, err := r.aggregateStatus(ctx, &shard)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.syncRoleLabels(ctx, &shard); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Prune AFTER polling so it acts on this reconcile's fresh instance states —
-	// never deleting a just-promoted or temporarily-unpollable writer.
-	if err := r.pruneExcessInstances(ctx, &shard); err != nil {
+	// Prune only the pods this reconcile confirmed are ready replicas — never a
+	// just-promoted, unpollable, or foreign pod.
+	if err := r.pruneExcessInstances(ctx, &shard, readyReplicas); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -287,40 +288,26 @@ func (r *PgShardShardReconciler) ensurePVC(
 // replica count (a scale-down). Their PVCs are retained for data safety and
 // reused if the shard scales back up.
 func (r *PgShardShardReconciler) pruneExcessInstances(
-	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, candidates []corev1.Pod,
 ) error {
-	// Only prune an excess ordinal that THIS reconcile positively confirmed is a
-	// ready replica (from the just-completed poll, role replica, not the
-	// primary). A just-promoted or temporarily-unpollable excess pod is left in
-	// place so scale-down never deletes the writer.
-	confirmedReplica := map[string]bool{}
-	for _, s := range shard.Status.Instances {
-		if s.Ready && s.Role == roleLabelReplica && s.Pod != shard.Status.CurrentPrimary {
-			confirmedReplica[s.Pod] = true
-		}
-	}
-
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods,
-		client.InNamespace(shard.Namespace),
-		client.MatchingLabels(shardSelector(shard))); err != nil {
-		return err
-	}
+	// candidates are exactly the pods aggregateStatus confirmed are ready
+	// replicas this reconcile, so a just-promoted, unpollable, foreign, or
+	// same-name-replacement pod is never deleted. PVCs are retained for data
+	// safety and reused on scale-up.
 	prefix := shard.Name + "-"
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range candidates {
+		pod := &candidates[i]
 		ord, ok := ordinalOf(pod.Name, prefix)
 		if !ok || ord < shard.Spec.Replicas {
 			continue
 		}
-		// Own it AND have confirmed it a ready replica this reconcile.
-		if !metav1.IsControlledBy(pod, shard) || !confirmedReplica[pod.Name] {
-			continue
-		}
-		// UID precondition: never delete a same-name pod recreated between the
-		// list and the delete.
+		// Delete the exact pod we confirmed (UID precondition); if it was
+		// replaced or already removed since, skip it.
 		uid := pod.UID
-		if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil {
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				continue
+			}
 			return fmt.Errorf("pruning pod %s: %w", pod.Name, err)
 		}
 	}
@@ -458,21 +445,24 @@ func (r *PgShardShardReconciler) instancePod(
 	return pod
 }
 
-// aggregateStatus polls every instance's agent and writes the shard status
-// (single status writer). Unreachable agents mark the instance not ready.
+// aggregateStatus polls every controlled instance's agent, writes the shard
+// status (single status writer), and returns the controlled pods it confirmed
+// are ready replicas this reconcile — the only pods a scale-down may prune,
+// bound to their polled UID.
 func (r *PgShardShardReconciler) aggregateStatus(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
-) error {
+) ([]corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(shard.Namespace),
 		client.MatchingLabels(shardSelector(shard))); err != nil {
-		return err
+		return nil, err
 	}
 
 	before := shard.Status.DeepCopy()
 
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
+	polled := make([]corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, shard) {
@@ -495,6 +485,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			}
 		}
 		instances = append(instances, state)
+		polled = append(polled, *pod)
 	}
 
 	shard.Status.Instances = instances
@@ -504,14 +495,23 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	shard.Status.CurrentPrimary, shard.Status.Phase =
 		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "")
 
+	// Ready replicas, bound to their polled pod objects: the only pods a
+	// scale-down may prune (never the primary, never an unpollable pod).
+	var readyReplicas []corev1.Pod
+	for i := range instances {
+		if s := instances[i]; s.Ready && s.Role == roleLabelReplica && s.Pod != shard.Status.CurrentPrimary {
+			readyReplicas = append(readyReplicas, polled[i])
+		}
+	}
+
 	// Only write when the status actually changed. The controller watches its
 	// own resource, so an unconditional write on every poll (WAL LSNs advance
 	// with every commit) would re-enqueue immediately and spin a hot loop
 	// under write traffic.
 	if apiequality.Semantic.DeepEqual(before, &shard.Status) {
-		return nil
+		return readyReplicas, nil
 	}
-	return client.IgnoreNotFound(r.Status().Update(ctx, shard))
+	return readyReplicas, client.IgnoreNotFound(r.Status().Update(ctx, shard))
 }
 
 // deriveShardStatus computes the current primary and phase from polled instance
