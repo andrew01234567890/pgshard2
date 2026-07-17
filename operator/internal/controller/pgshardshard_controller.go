@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -187,6 +188,9 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 	default:
 		shard.Status.Phase = shardPhaseForNode(node.Status.Phase)
 		shard.Status.CurrentPrimary = node.Status.CurrentPrimary
+		if err := r.reconcileShardDatabase(ctx, shard, &node); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	interval := r.pollInterval()
@@ -194,6 +198,58 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 	return ctrl.Result{RequeueAfter: interval}, client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+// shardDatabaseReadyCondition marks that the shard's Postgres database exists on
+// its node.
+const shardDatabaseReadyCondition = "DatabaseReady"
+
+// shardDatabaseName is the Postgres DATABASE a placed shard lives in. Shard
+// names are namespace-unique, and a node hosts many shards' databases, so the
+// shard name is a natural per-node-unique database name.
+func shardDatabaseName(shard *pgshardv1alpha1.PgShardShard) string {
+	return shard.Name
+}
+
+// reconcileShardDatabase ensures the shard's Postgres database exists on its
+// node by asking the node's primary agent to create it. It is best-effort and
+// idempotent: it waits (without error) until the node has a ready primary with a
+// reachable address, calls the idempotent CreateDatabase, and records a
+// condition so the round trip is skipped once confirmed.
+func (r *PgShardShardReconciler) reconcileShardDatabase(
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, node *pgshardv1alpha1.PgShardNode,
+) error {
+	if apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) {
+		return nil
+	}
+	primary := node.Status.CurrentPrimary
+	if node.Status.Phase != pgshardv1alpha1.NodeReady || primary == "" {
+		return nil
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: shard.Namespace, Name: primary}, &pod); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if pod.Status.PodIP == "" {
+		return nil
+	}
+	agent, err := r.agentClient(pod.Status.PodIP, agentPort)
+	if err != nil {
+		return err
+	}
+	name := shardDatabaseName(shard)
+	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{Name: name}); err != nil {
+		return err
+	}
+	apimeta.SetStatusCondition(&shard.Status.Conditions, metav1.Condition{
+		Type:               shardDatabaseReadyCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Provisioned",
+		Message:            fmt.Sprintf("database %s created on node %s", name, node.Name),
+		ObservedGeneration: shard.Generation,
+	})
+	return nil
 }
 
 func (r *PgShardShardReconciler) pollInterval() time.Duration {
