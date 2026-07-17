@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
 	"github.com/andrew01234567890/pgshard2/operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -61,6 +62,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var postgresImage, agentImage string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +81,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&postgresImage, "postgres-image", "", "Container image for shard PostgreSQL pods.")
+	flag.StringVar(&agentImage, "agent-image", "",
+		"Container image the init container copies the pgshard agent binary from.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -188,6 +193,11 @@ func main() {
 	if err := (&controller.PgShardShardReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Images: controller.ShardImages{Postgres: postgresImage, Agent: agentImage},
+		// TODO(mTLS): dial agents over mTLS. Until agent certificates are
+		// provisioned the operator explicitly opts into an insecure pool — a
+		// conscious choice made here, never a hidden default in the controller.
+		Agents: agentclient.NewInsecurePool(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgshardshard")
 		os.Exit(1)
