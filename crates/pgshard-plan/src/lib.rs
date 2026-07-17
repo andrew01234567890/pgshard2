@@ -78,6 +78,10 @@ pub enum Plan {
 pub struct Parameterized {
     /// Shard function that maps each bound shard-key value to a keyspace id.
     pub shard_function: String,
+    /// The shard-key column's type, so a bound value is coerced the same way a
+    /// literal is before hashing (`resolve_bound`). `None` hashes the value as
+    /// delivered — matching the untyped literal path.
+    pub key_type: Option<ScalarType>,
     /// The 1-based `$n` positions that supply shard-key values.
     pub param_indices: Vec<u32>,
     /// True for INSERT/UPDATE/DELETE: at Bind every value must land on one
@@ -130,12 +134,14 @@ pub fn plan_all(parsed: &Parsed, vschema: &VSchema, shards: &ShardCatalog) -> Ve
 
 /// Complete a [`Parameterized`] plan once its bind parameters are known.
 ///
-/// `values` are the statement's bound parameters, 0-indexed (`$1` = `values[0]`),
-/// already coerced to the column's type by the wire layer. Each shard-key
-/// parameter is hashed with the plan's shard function and routed through
-/// `shards` — the same decision the planner makes for literals: one shard →
-/// [`Plan::SingleShard`]; a read spanning several → [`Plan::Scatter`]; a write
-/// spanning several → rejected as cross-shard.
+/// `values` are the statement's bound parameters, 0-indexed (`$1` = `values[0]`).
+/// Each shard-key parameter is coerced to the plan's [`Parameterized::key_type`]
+/// and hashed with the plan's shard function — the same decision the planner
+/// makes for literals, so a bound `"1"` and a bound `1` route alike for an
+/// integer key. A value that is not valid for the type is rejected rather than
+/// routed to a guessed shard. One shard → [`Plan::SingleShard`]; a read spanning
+/// several → [`Plan::Scatter`]; a write spanning several → rejected as
+/// cross-shard.
 pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &ShardCatalog) -> Plan {
     // Planner-built plans always name a vschema-validated function, but this is a
     // public entry point with public fields — reject an unknown one, never panic.
@@ -152,7 +158,18 @@ pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &Sha
                 "bind parameter ${idx} for the shard key is missing"
             ));
         };
-        hit.insert(shards.route(func.keyspace_id(value)).clone());
+        let id = match param.key_type {
+            Some(t) => match t.coerce(value) {
+                Some(canonical) => func.keyspace_id(&canonical),
+                None => {
+                    return reject(&format!(
+                        "bind parameter ${idx} is not a valid value for the shard key type"
+                    ));
+                }
+            },
+            None => func.keyspace_id(value),
+        };
+        hit.insert(shards.route(id).clone());
     }
     let hit: Vec<ShardId> = hit.into_iter().collect();
     match (param.write, hit.len()) {
@@ -220,10 +237,9 @@ fn route_values(
     let mut hit = BTreeSet::new();
     for v in values {
         if let KeyVal::Const(sv) = v {
-            // Coerce the literal to the column's declared type so that different
-            // spellings of one value (`'1'` and `1`) hash the same keyspace id.
-            // A value that is not valid for the type cannot be hashed -> the key
-            // is unroutable. An untyped column hashes the literal as written.
+            // Untyped columns hash the literal as written; typed columns coerce
+            // first, and a value invalid for the type is unroutable (see
+            // `ScalarType::coerce`).
             let id = match key_type {
                 Some(t) => match t.coerce(sv) {
                     Some(canonical) => func.keyspace_id(&canonical),
@@ -329,6 +345,7 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         }
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
+            key_type,
             param_indices,
             write: false,
         }),
@@ -378,6 +395,7 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
                 )),
                 Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
                     shard_function: shard_fn.to_owned(),
+                    key_type,
                     param_indices,
                     write: true,
                 }),
@@ -488,6 +506,7 @@ fn plan_keyed_write(
         )),
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
+            key_type,
             param_indices,
             write: true,
         }),
@@ -644,6 +663,7 @@ mod tests {
             plan1("SELECT * FROM orders WHERE customer_id = $1"),
             Plan::Parameterized(Parameterized {
                 shard_function: "xxhash64_v1".into(),
+                key_type: Some(ScalarType::Int),
                 param_indices: vec![1],
                 write: false,
             })
@@ -653,6 +673,7 @@ mod tests {
     fn param(indices: Vec<u32>, write: bool) -> Parameterized {
         Parameterized {
             shard_function: "xxhash64_v1".into(),
+            key_type: None,
             param_indices: indices,
             write,
         }
@@ -719,6 +740,7 @@ mod tests {
         // A hand-built plan (public fields) with a bad function must not panic.
         let bad = Parameterized {
             shard_function: "md5".into(),
+            key_type: None,
             param_indices: vec![1],
             write: false,
         };
@@ -726,6 +748,35 @@ mod tests {
             resolve_bound(&bad, &[ScalarValue::Int64(1)], &catalog()),
             Plan::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_bound_coerces_bound_values_to_the_key_type() {
+        let cat = catalog();
+        let typed = |write| Parameterized {
+            shard_function: "xxhash64_v1".into(),
+            key_type: Some(ScalarType::Int),
+            param_indices: vec![1],
+            write,
+        };
+        // A text-format bound value coerces to the integer, landing on the same
+        // shard as the bare integer and the integer literal — no asymmetry
+        // between the literal and bind paths.
+        assert_eq!(
+            resolve_bound(&typed(false), &[ScalarValue::Text("2".into())], &cat),
+            Plan::SingleShard(shard_of(2))
+        );
+        assert_eq!(
+            resolve_bound(&typed(false), &[ScalarValue::Int64(2)], &cat),
+            Plan::SingleShard(shard_of(2))
+        );
+        // A bound value that is not valid for the type is rejected, not routed
+        // to a guessed shard.
+        assert!(is_reject(&resolve_bound(
+            &typed(true),
+            &[ScalarValue::Text("abc".into())],
+            &cat
+        )));
     }
 
     #[test]
@@ -777,6 +828,7 @@ mod tests {
             plan1("INSERT INTO orders (customer_id) VALUES ($1)"),
             Plan::Parameterized(Parameterized {
                 shard_function: "xxhash64_v1".into(),
+                key_type: Some(ScalarType::Int),
                 param_indices: vec![1],
                 write: true,
             })

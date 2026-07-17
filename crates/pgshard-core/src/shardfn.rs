@@ -271,6 +271,12 @@ mod tests {
                 "{bad}"
             );
         }
+        // An already-canonical uuid value passes through unchanged.
+        let bytes = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            ScalarType::Uuid.coerce(&ScalarValue::Uuid(bytes)),
+            Some(ScalarValue::Uuid(bytes))
+        );
     }
 
     #[test]
@@ -287,6 +293,11 @@ mod tests {
                 "{bad}"
             );
         }
+        // An already-canonical bytea value passes through unchanged.
+        assert_eq!(
+            ScalarType::Bytea.coerce(&ScalarValue::Bytea(vec![0xde, 0xad])),
+            Some(ScalarValue::Bytea(vec![0xde, 0xad]))
+        );
     }
 
     #[test]
