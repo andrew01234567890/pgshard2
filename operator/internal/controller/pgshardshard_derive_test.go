@@ -22,6 +22,7 @@ func TestDeriveShardStatus(t *testing.T) {
 		{"split brain withholds the primary", []pgshardv1alpha1.InstanceState{inst("s-0", "primary", true), inst("s-1", "primary", true)}, 2, true, "", pgshardv1alpha1.ShardDegraded},
 		{"primary gone clears and degrades", []pgshardv1alpha1.InstanceState{inst("s-0", "replica", true), inst("s-1", "replica", true)}, 2, true, "", pgshardv1alpha1.ShardDegraded},
 		{"initial bring-up provisions", []pgshardv1alpha1.InstanceState{inst("s-0", "replica", false)}, 1, false, "", pgshardv1alpha1.ShardProvisioning},
+		{"provisioning keeps a not-ready primary", []pgshardv1alpha1.InstanceState{inst("s-0", "primary", false)}, 1, false, "s-0", pgshardv1alpha1.ShardProvisioning},
 	}
 	for _, c := range cases {
 		gotPrimary, gotPhase := deriveShardStatus(c.instances, c.replicas, c.hadPrimary)

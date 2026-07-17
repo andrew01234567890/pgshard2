@@ -225,8 +225,9 @@ func (r *PgShardShardReconciler) ensureInstance(
 		if !metav1.IsControlledBy(&pod, shard) {
 			return fmt.Errorf("pod %s exists but is not controlled by shard %s", name, shard.Name)
 		}
-		// Pods are not mutated in place here: a config/image change is rolled
-		// out separately (replicas first, primary last via switchover).
+		// Pods are not mutated in place here: a config/image/storage change
+		// (including toggling walSeparate on an existing instance) is rolled out
+		// separately — replicas first, primary last via switchover.
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -299,6 +300,16 @@ func (r *PgShardShardReconciler) pruneExcessInstances(
 		if !ok || ord < shard.Spec.Replicas {
 			continue
 		}
+		if !metav1.IsControlledBy(pod, shard) {
+			// A name/label-matching pod this shard does not own is not ours to
+			// delete.
+			continue
+		}
+		if pod.Name == shard.Status.CurrentPrimary {
+			// Deleting the primary would drop writes with no switchover; leave
+			// it until failover/rollout moves the primary onto a kept ordinal.
+			continue
+		}
 		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("pruning pod %s: %w", pod.Name, err)
 		}
@@ -310,8 +321,11 @@ func ordinalOf(podName, prefix string) (int32, bool) {
 	if !strings.HasPrefix(podName, prefix) {
 		return 0, false
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(podName, prefix))
-	if err != nil || n < 0 {
+	// ParseInt with bitSize 32 rejects values that would truncate; a canonical
+	// ordinal round-trips (no leading zeros / sign).
+	suffix := strings.TrimPrefix(podName, prefix)
+	n, err := strconv.ParseInt(suffix, 10, 32)
+	if err != nil || n < 0 || strconv.FormatInt(n, 10) != suffix {
 		return 0, false
 	}
 	return int32(n), true
@@ -509,7 +523,10 @@ func deriveShardStatus(
 	case ready == int(replicas) && currentPrimary != "":
 		return currentPrimary, pgshardv1alpha1.ShardReady
 	case ready == 0 && !hadPrimary:
-		return "", pgshardv1alpha1.ShardProvisioning
+		// Initial bring-up: keep a uniquely-confirmed (but not-yet-ready)
+		// primary so its label is set; the Service's readiness gate withholds
+		// traffic until it is actually ready.
+		return currentPrimary, pgshardv1alpha1.ShardProvisioning
 	default:
 		return currentPrimary, pgshardv1alpha1.ShardDegraded
 	}
