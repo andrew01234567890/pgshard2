@@ -142,3 +142,129 @@ async fn routes_single_shard_reads_and_writes_through_to_the_backend() {
     let err = client.simple_query("BEGIN").await.unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
 }
+
+/// A topology with two serving shards (databases `sh0`, `sh1`) on the same node,
+/// splitting the keyspace at 80, and a sharded `orders` table.
+fn two_shard_topology(host: &str, port: u16) -> Topology {
+    let shard = |name: &str, range: &str| ShardEntry {
+        name: name.to_owned(),
+        key_range: range.parse().unwrap(),
+        state: ShardState::Serving,
+        primary: Some(Instance {
+            pod: format!("{name}-0"),
+            host: host.into(),
+            port,
+            can_read: false,
+        }),
+        replicas: Vec::new(),
+    };
+    Topology {
+        epoch: 1,
+        topology_generation: 1,
+        write_lease_seconds: 10,
+        hash_function: "xxhash64_v1".into(),
+        shards: vec![shard("sh0", "-80"), shard("sh1", "80-")],
+        tables: vec![TableEntry {
+            schema: "public".into(),
+            name: "orders".into(),
+            table_type: TableType::Sharded,
+            shard_key_column: Some("customer_id".into()),
+            sequences: Vec::new(),
+        }],
+        gates: Vec::new(),
+        sequence_endpoint: None,
+    }
+}
+
+#[tokio::test]
+async fn scatter_reads_concatenate_rows_from_every_shard() {
+    let pg = Pg::start().await.expect("start postgres");
+
+    // Two shard databases on the one node, each seeded with one row.
+    let admin = pg.connect().await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh0").await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh1").await.unwrap();
+    for (db, note) in [("sh0", "from-sh0"), ("sh1", "from-sh1")] {
+        let conn = format!(
+            "host={} port={} user=postgres password=postgres dbname={db}",
+            pg.host(),
+            pg.port()
+        );
+        let (c, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        c.batch_execute("CREATE TABLE orders (customer_id int, note text)")
+            .await
+            .unwrap();
+        c.execute(
+            "INSERT INTO orders (customer_id, note) VALUES (1, $1)",
+            &[&note],
+        )
+        .await
+        .unwrap();
+    }
+
+    let router =
+        pgshard_router::shared(Router::build(&two_shard_topology(pg.host(), pg.port())).unwrap());
+    let proxy = Arc::new(Proxy::new(
+        router,
+        Backend {
+            user: "postgres".into(),
+            password: "postgres".into(),
+            system_database: "postgres".into(),
+        },
+    ));
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // A keyless read scatters to both shards and returns both rows.
+    let rows = client
+        .simple_query("SELECT note FROM orders")
+        .await
+        .unwrap();
+    let mut notes: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r.get("note").unwrap().to_owned()),
+            _ => None,
+        })
+        .collect();
+    notes.sort();
+    assert_eq!(notes, vec!["from-sh0".to_string(), "from-sh1".to_string()]);
+
+    // A scatter that needs a real merge is rejected, not mis-answered.
+    let err = client
+        .simple_query("SELECT note FROM orders ORDER BY note")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+
+    // If the shards disagree on the result shape (e.g. a broadcast DDL still
+    // rolling out), the scatter fails cleanly with an error — it must not panic
+    // the connection or encode rows under the wrong schema.
+    let sh1_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=sh1",
+        pg.host(),
+        pg.port()
+    );
+    let (sh1, connection) = tokio_postgres::connect(&sh1_conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    sh1.batch_execute("ALTER TABLE orders ADD COLUMN extra text")
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+    // The client session is still alive after the clean error (not a dropped
+    // connection): a subsequent query still works.
+    let alive = client.simple_query("SELECT 1 AS ok").await;
+    assert!(alive.is_ok(), "the connection survived the scatter error");
+}

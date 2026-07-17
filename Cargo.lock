@@ -2033,6 +2033,7 @@ dependencies = [
  "async-trait",
  "clap",
  "futures",
+ "pg_query",
  "pgshard-core",
  "pgshard-plan",
  "pgshard-sql",
