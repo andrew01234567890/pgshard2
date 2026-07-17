@@ -431,7 +431,7 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 			// into status (it could otherwise be preserved as CurrentPrimary).
 			continue
 		}
-		state := pgshardv1alpha1.InstanceState{Pod: pod.Name}
+		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
 		view := instanceView{pod: pod.Name, host: pod.Status.PodIP}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -443,15 +443,9 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)
 				view.walReceiver = status.WalReceiverActive
-				// Role is set only from an explicit report: an UNSPECIFIED or
-				// unpolled instance stays roleless, so it is never treated as a
-				// prunable replica on the strength of a missing role.
-				switch status.Role {
-				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
+				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
 					state.Role = roleLabelPrimary
 					view.isPrimary = true
-				case pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY:
-					state.Role = roleLabelReplica
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
 				state.WalReplayLSN = lsnString(status.WalReplayLsn)
