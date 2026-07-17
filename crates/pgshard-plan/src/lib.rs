@@ -36,6 +36,7 @@
 
 pub mod catalog;
 mod extract;
+pub mod sequence;
 
 use std::collections::BTreeSet;
 

@@ -29,6 +29,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{Sink, stream};
+use pgshard_seq::SequenceCache;
+use pgshard_sql::Parsed;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
@@ -39,7 +41,12 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
+use crate::sequence::PgBlockReserver;
 use crate::{Endpoint, Route, Router, SharedRouter, Target};
+
+/// The sequence-id allocator shared across a proxy's queries. Long-lived across
+/// topology swaps (unlike the [`Router`] snapshot), so it lives on the proxy.
+pub type SequenceAllocator = Arc<SequenceCache<PgBlockReserver>>;
 
 /// Credentials the router uses for its own backend connections, plus the name of
 /// the unsharded system database (not yet carried in the topology).
@@ -56,11 +63,29 @@ pub struct Backend {
 pub struct Proxy {
     router: SharedRouter,
     backend: Backend,
+    /// Allocates global-sequence ids for INSERTs that omit a sequence column.
+    /// `None` disables injection (such an INSERT then errors rather than routing
+    /// a row with a missing id).
+    seq: Option<SequenceAllocator>,
 }
 
 impl Proxy {
     pub fn new(router: SharedRouter, backend: Backend) -> Self {
-        Self { router, backend }
+        Self {
+            router,
+            backend,
+            seq: None,
+        }
+    }
+
+    /// A proxy that also fills omitted global-sequence columns, reserving blocks
+    /// through `seq`.
+    pub fn with_sequences(router: SharedRouter, backend: Backend, seq: SequenceAllocator) -> Self {
+        Self {
+            router,
+            backend,
+            seq: Some(seq),
+        }
     }
 
     /// Open a fresh backend connection, run `query`, and return its raw messages.
@@ -93,6 +118,65 @@ impl Proxy {
     ) -> PgWireResult<Vec<Response>> {
         let messages = self.connect_and_query(endpoint, database, query).await?;
         translate(query, messages)
+    }
+
+    /// Allocate ids for any sequence columns the INSERT omits and rewrite it to
+    /// include them, returning the new SQL. `None` when nothing needs injecting,
+    /// so the caller forwards the original query unchanged.
+    async fn inject_sequences(
+        &self,
+        router: &Router,
+        parsed: &Parsed,
+    ) -> PgWireResult<Option<String>> {
+        let Some(node) = parsed
+            .result()
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|n| n.node.as_ref())
+        else {
+            return Ok(None);
+        };
+        let injections = pgshard_plan::sequence::insert_sequence_injections(node, router.vschema());
+        if injections.is_empty() {
+            return Ok(None);
+        }
+        let Some(seq) = self.seq.clone() else {
+            return Err(user_error(
+                "55000",
+                "cannot allocate sequence ids: the router has no system database".to_owned(),
+            ));
+        };
+        let rows = pgshard_plan::sequence::value_row_count(node);
+        let names: Vec<(String, String)> = injections
+            .into_iter()
+            .map(|i| (i.column, i.sequence))
+            .collect();
+        // A reservation drives a blocking client that must not run on an async
+        // worker (its nested block_on would panic), so allocate on the blocking
+        // pool. One id is drawn per value row.
+        let columns = tokio::task::spawn_blocking(move || {
+            names
+                .into_iter()
+                .map(|(column, sequence)| {
+                    let ids = (0..rows)
+                        .map(|_| seq.next_id(&sequence))
+                        .collect::<Result<Vec<i64>, _>>()?;
+                    Ok::<_, pgshard_seq::SeqError>(pgshard_plan::sequence::InjectedColumn {
+                        column,
+                        ids,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| user_error("XX000", format!("sequence allocation task failed: {e}")))?
+        .map_err(|e| user_error("55000", format!("sequence allocation failed: {e}")))?;
+
+        let sql = pgshard_plan::sequence::rewrite_insert(parsed, &columns)
+            .map_err(|e| user_error("XX000", format!("could not inject sequence ids: {e}")))?;
+        Ok(Some(sql))
     }
 
     /// Fan a plain scatter read out to every shard concurrently and concatenate
@@ -162,17 +246,18 @@ impl SimpleQueryHandler for Proxy {
         C::PortalStore: PortalStore,
     {
         // Read the current routing snapshot once, so the whole query uses one
-        // consistent topology even if a swap lands mid-query.
+        // consistent topology even if a swap lands mid-query. Parse once and
+        // route from that AST, so sequence injection reuses the same parse.
         let router = self.router.load_full();
-        let routes = router
-            .route(query)
+        let parsed = pgshard_sql::parse(query)
             .map_err(|e| user_error("42601", format!("could not parse query: {e}")))?;
+        let routes = router.route_parsed(&parsed);
 
         match routes.as_slice() {
             // A submitted query with no statements (empty or comment-only) gets an
             // EmptyQueryResponse, as PostgreSQL sends.
             [] => Ok(vec![Response::EmptyQuery]),
-            [route] => self.dispatch(&router, route.clone(), query).await,
+            [route] => self.dispatch(&router, &parsed, route.clone(), query).await,
             _ => Err(user_error(
                 "0A000",
                 "multi-statement simple queries are not supported yet".to_owned(),
@@ -196,11 +281,18 @@ impl Proxy {
     async fn dispatch(
         &self,
         router: &Router,
+        parsed: &Parsed,
         route: Route,
         query: &str,
     ) -> PgWireResult<Vec<Response>> {
         match route {
-            Route::Shard(t) => self.run_on(&t.endpoint, &t.database, query).await,
+            Route::Shard(t) => {
+                // An INSERT omitting a sequence-bound column has its id(s) filled
+                // in here; every other statement forwards unchanged.
+                let injected = self.inject_sequences(router, parsed).await?;
+                let sql = injected.as_deref().unwrap_or(query);
+                self.run_on(&t.endpoint, &t.database, sql).await
+            }
             Route::System(ep) => self.run_on(&ep, &self.backend.system_database, query).await,
             // Session-local statements: reject transaction control (it would break
             // atomicity across per-query connections), and run everything else

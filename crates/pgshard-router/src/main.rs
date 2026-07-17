@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use pgshard_router::Router;
+use pgshard_router::sequence::PgBlockReserver;
 use pgshard_router::wire::{Backend, Handlers, Proxy};
+use pgshard_seq::SequenceCache;
 use pgshard_topo::{FileWatcher, TopologyWatcher};
 use tokio::net::TcpListener;
 
@@ -66,14 +68,29 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(epoch = router.load().epoch(), "loaded initial topology");
     tokio::spawn(pgshard_router::watch_topology(router.clone(), updates));
 
-    let proxy = std::sync::Arc::new(Proxy::new(
-        router,
-        Backend {
-            user: args.backend_user,
-            password: args.backend_password,
-            system_database: args.system_database,
-        },
-    ));
+    let backend = Backend {
+        user: args.backend_user,
+        password: args.backend_password,
+        system_database: args.system_database,
+    };
+    // Reserve sequence blocks from the system database, if the topology names
+    // one. Built from the initial endpoint; a system-shard endpoint change needs
+    // a router restart to pick up (a follow-up), though the reserver reconnects
+    // through transient failures on its own.
+    let system_conn = router.load().system_endpoint().map(|ep| {
+        format!(
+            "host={} port={} user={} password={} dbname={}",
+            ep.host, ep.port, backend.user, backend.password, backend.system_database
+        )
+    });
+    let proxy = std::sync::Arc::new(match system_conn {
+        Some(conn) => {
+            let seq = std::sync::Arc::new(SequenceCache::new(PgBlockReserver::new(conn)));
+            tracing::info!("sequence allocation enabled via the system database");
+            Proxy::with_sequences(router, backend, seq)
+        }
+        None => Proxy::new(router, backend),
+    });
 
     let listener = TcpListener::bind(args.listen)
         .await

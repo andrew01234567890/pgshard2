@@ -5,10 +5,12 @@
 use std::sync::Arc;
 
 use pgshard_router::Router;
+use pgshard_router::sequence::PgBlockReserver;
 use pgshard_router::wire::{Backend, Handlers, Proxy};
+use pgshard_seq::SequenceCache;
 use pgshard_testutil::Pg;
 use pgshard_topo::{
-    Instance, ShardEntry, ShardKeyType, ShardState, TableEntry, TableType, Topology,
+    Instance, Sequence, ShardEntry, ShardKeyType, ShardState, TableEntry, TableType, Topology,
 };
 use tokio::net::TcpListener;
 
@@ -333,4 +335,125 @@ async fn quoted_and_bare_integer_keys_route_to_the_same_shard() {
         Some("keyed"),
         "the quoted-int read must route to the same shard as the bare-int write"
     );
+}
+
+/// A one-shard topology whose `orders` table binds its `id` column to the
+/// `orders_id` global sequence.
+fn sequenced_topology(host: &str, port: u16) -> Topology {
+    Topology {
+        epoch: 1,
+        topology_generation: 1,
+        write_lease_seconds: 10,
+        hash_function: "xxhash64_v1".into(),
+        shards: vec![ShardEntry {
+            name: "postgres".into(),
+            key_range: "-".parse().unwrap(),
+            state: ShardState::Serving,
+            primary: Some(Instance {
+                pod: "pg-0".into(),
+                host: host.into(),
+                port,
+                can_read: false,
+            }),
+            replicas: Vec::new(),
+        }],
+        tables: vec![TableEntry {
+            schema: "public".into(),
+            name: "orders".into(),
+            table_type: TableType::Sharded,
+            shard_key_column: Some("customer_id".into()),
+            shard_key_type: Some(ShardKeyType::Int),
+            sequences: vec![Sequence {
+                column: "id".into(),
+                sequence: "orders_id".into(),
+            }],
+        }],
+        gates: Vec::new(),
+        sequence_endpoint: None,
+    }
+}
+
+#[tokio::test]
+async fn an_omitted_sequence_column_is_filled_from_the_system_database() {
+    let pg = Pg::start().await.expect("start postgres");
+
+    // Shard database: `id` is NOT NULL with no default, so an INSERT that omits
+    // it only succeeds if the router fills it.
+    let backend = pg.connect().await.unwrap();
+    backend
+        .batch_execute("CREATE TABLE orders (id bigint PRIMARY KEY, customer_id int, note text)")
+        .await
+        .unwrap();
+
+    // System database holds the sequence catalog.
+    backend
+        .batch_execute("CREATE DATABASE pgshard_system")
+        .await
+        .unwrap();
+    let sys_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=pgshard_system",
+        pg.host(),
+        pg.port()
+    );
+    let (sys, connection) = tokio_postgres::connect(&sys_conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    sys.batch_execute(
+        "CREATE SCHEMA pgshard; \
+         CREATE TABLE pgshard.sequences ( \
+             name text PRIMARY KEY, next_id bigint NOT NULL, block_size bigint NOT NULL); \
+         INSERT INTO pgshard.sequences VALUES ('orders_id', 1, 100);",
+    )
+    .await
+    .unwrap();
+
+    let router =
+        pgshard_router::shared(Router::build(&sequenced_topology(pg.host(), pg.port())).unwrap());
+    let seq = Arc::new(SequenceCache::new(PgBlockReserver::new(sys_conn)));
+    let proxy = Arc::new(Proxy::with_sequences(
+        router,
+        Backend {
+            user: "postgres".into(),
+            password: "postgres".into(),
+            system_database: "pgshard_system".into(),
+        },
+        seq,
+    ));
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // A single-row INSERT that omits `id` succeeds — the id is filled in.
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'x')")
+        .await
+        .expect("insert with an injected id");
+
+    // A multi-row INSERT gets a distinct id per row (a duplicate would violate
+    // the primary key).
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (2, 'a'), (2, 'b')")
+        .await
+        .expect("multi-row insert with injected ids");
+
+    // Every row now carries a positive id, and all three are distinct. A plain
+    // keyless read concatenates (no ORDER BY, which a scatter cannot merge yet).
+    let rows = client.simple_query("SELECT id FROM orders").await.unwrap();
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some(r.get("id").unwrap().parse::<i64>().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3, "all three rows were stored with an id");
+    assert!(ids.iter().all(|&id| id >= 1), "ids come from the sequence");
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "each row got a distinct id");
 }
