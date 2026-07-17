@@ -105,14 +105,26 @@ impl Proxy {
             .map(|t| self.connect_and_query(&t.endpoint, &t.database, query));
         let results = futures::future::join_all(fetches).await;
 
-        let mut schema = None;
+        let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         for result in results {
             // First shard error fails the whole scatter — a partial result set
             // would be silently wrong.
             let (shard_schema, shard_rows, _) = extract(result?);
-            if schema.is_none() {
-                schema = shard_schema;
+            match (&schema, shard_schema) {
+                (None, s) => schema = s,
+                // Shards must agree on the result shape. A column-count/name
+                // mismatch (e.g. a non-atomic broadcast DDL still rolling out)
+                // would otherwise encode rows under the wrong schema or panic the
+                // encoder — fail the scatter instead.
+                (Some(first), Some(this)) if !schemas_match(first, &this) => {
+                    return Err(user_error(
+                        "0A000",
+                        "shards returned different result schemas; a schema change may be mid-rollout"
+                            .to_owned(),
+                    ));
+                }
+                _ => {}
             }
             rows.extend(shard_rows);
         }
@@ -266,6 +278,11 @@ fn extract(messages: Vec<SimpleQueryMessage>) -> Extracted {
     (schema, rows, affected)
 }
 
+/// Whether two result schemas describe the same columns (count and names).
+fn schemas_match(a: &[FieldInfo], b: &[FieldInfo]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name() == y.name())
+}
+
 /// A row-returning response from a schema plus already-collected text rows.
 fn rows_response(
     schema: Arc<Vec<FieldInfo>>,
@@ -322,10 +339,19 @@ fn is_concatenable_scatter(query: &str) -> bool {
     else {
         return false;
     };
-    // A set operation (UNION/INTERSECT/EXCEPT) keeps its operands in larg/rarg
-    // and leaves target_list empty (which would vacuously pass the check below),
-    // and its cross-shard semantics need real merging — exclude it.
+    // These checks make the guard self-sufficient rather than trusting the
+    // planner to have filtered every unsafe shape upstream:
+    // - a set operation (UNION/…) keeps its operands in larg/rarg with an empty
+    //   target_list and needs real merging;
+    // - a WITH clause can shadow a sharded table name, so each shard would
+    //   re-evaluate the CTE and the rows would be duplicated on concatenation;
+    // - a locking clause (FOR UPDATE/SHARE) cannot be honored across ephemeral
+    //   per-shard connections;
+    // - SELECT ... INTO is a write.
     select.op == pg_query::protobuf::SetOperation::SetopNone as i32
+        && select.with_clause.is_none()
+        && select.into_clause.is_none()
+        && select.locking_clause.is_empty()
         && select.sort_clause.is_empty()
         && select.group_clause.is_empty()
         && select.distinct_clause.is_empty()
@@ -433,6 +459,15 @@ mod tests {
             "SELECT note FROM orders GROUP BY note"
         ));
         assert!(!is_concatenable_scatter("SELECT lower(note) FROM orders"));
+        // A WITH clause can shadow a table name (each shard re-evaluates the CTE),
+        // and FOR UPDATE/SHARE cannot be honored across per-shard connections.
+        assert!(!is_concatenable_scatter(
+            "WITH orders AS (VALUES (1)) SELECT * FROM orders"
+        ));
+        assert!(!is_concatenable_scatter("SELECT * FROM orders FOR UPDATE"));
+        assert!(!is_concatenable_scatter(
+            "SELECT * FROM orders UNION SELECT * FROM orders"
+        ));
         // Not a single plain SELECT at all.
         assert!(!is_concatenable_scatter("UPDATE orders SET note = 'x'"));
     }

@@ -242,4 +242,29 @@ async fn scatter_reads_concatenate_rows_from_every_shard() {
         .await
         .unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+
+    // If the shards disagree on the result shape (e.g. a broadcast DDL still
+    // rolling out), the scatter fails cleanly with an error — it must not panic
+    // the connection or encode rows under the wrong schema.
+    let sh1_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=sh1",
+        pg.host(),
+        pg.port()
+    );
+    let (sh1, connection) = tokio_postgres::connect(&sh1_conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    sh1.batch_execute("ALTER TABLE orders ADD COLUMN extra text")
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+    // The client session is still alive after the clean error (not a dropped
+    // connection): a subsequent query still works.
+    let alive = client.simple_query("SELECT 1 AS ok").await;
+    assert!(alive.is_ok(), "the connection survived the scatter error");
 }
