@@ -1589,6 +1589,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-seq"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "pgshard-sql"
 version = "0.0.0"
 dependencies = [
