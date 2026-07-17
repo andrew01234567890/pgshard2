@@ -42,6 +42,9 @@ pub trait Instance: Send + Sync + 'static {
     /// Rejoin as a standby of `upstream`, optionally running pg_rewind first;
     /// returns whether a rewind was performed.
     async fn rejoin(&self, upstream: &str, allow_rewind: bool) -> anyhow::Result<bool>;
+
+    /// Execute a schema/DDL statement (idempotency is handled by the caller).
+    async fn exec_sql(&self, sql: &str) -> anyhow::Result<()>;
 }
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
@@ -55,6 +58,8 @@ pub mod fake {
     pub struct FakeInstance {
         state: Mutex<Snapshot>,
         promote_fails: std::sync::atomic::AtomicBool,
+        exec_fails: std::sync::atomic::AtomicBool,
+        executed: Mutex<Vec<String>>,
     }
 
     impl FakeInstance {
@@ -88,6 +93,13 @@ pub mod fake {
             self.promote_fails
                 .store(fails, std::sync::atomic::Ordering::SeqCst);
         }
+        pub fn set_exec_fails(&self, fails: bool) {
+            self.exec_fails
+                .store(fails, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub fn executed(&self) -> Vec<String> {
+            self.executed.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -114,6 +126,13 @@ pub mod fake {
             s.in_recovery = true;
             s.receiver_active = true;
             Ok(allow_rewind)
+        }
+        async fn exec_sql(&self, sql: &str) -> anyhow::Result<()> {
+            if self.exec_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("exec failed");
+            }
+            self.executed.lock().unwrap().push(sql.to_owned());
+            Ok(())
         }
     }
 }
