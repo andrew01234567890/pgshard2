@@ -160,9 +160,12 @@ fn merge_sort(
                 SortColumn::Name(name) => schema.iter().position(|f| f.name() == name),
             }
             .ok_or_else(|| {
+                // Valid SQL (Postgres allows ORDER BY on a non-selected column),
+                // but scatter merge only has the output columns' values, so it
+                // cannot sort by one that was not selected.
                 user_error(
-                    "42703",
-                    "ORDER BY refers to a column not in the output".to_owned(),
+                    "0A000",
+                    "scatter ORDER BY must reference a selected column".to_owned(),
                 )
             })?;
             Ok((index, k.descending, k.nulls_first))
