@@ -17,15 +17,20 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
+	"github.com/andrew01234567890/pgshard2/operator/test/fakes"
 )
 
 var _ = Describe("PgShardShard placed on a node", func() {
@@ -83,5 +88,114 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardNm, Namespace: ns}, &got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady), "a fenced placed shard still mirrors its node")
+	})
+
+	It("provisions its Postgres database on the node's primary once ready", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "dbnode", Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		node.Status.Phase = pgshardv1alpha1.NodeReady
+		node.Status.CurrentPrimary = "dbnode-0"
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+		// The primary pod must have an address for the controller to dial.
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "dbnode-0", Namespace: ns},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "postgres", Image: "pg"},
+			}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.PodIP = "10.0.0.9"
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		const dbShard = "dbshard"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: dbShard, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				Replicas: 1, NodeRef: "dbnode",
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+
+		r := &PgShardShardReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(agent.Databases()).To(HaveKey(dbShard), "the shard's database was created on the node")
+
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, shardDatabaseReadyCondition)).
+			To(BeTrue(), "the DatabaseReady condition is set")
+
+		// A second reconcile is a no-op: the recorded node identity short-circuits
+		// the call.
+		callsBefore := len(agent.Calls)
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(agent.Calls).To(HaveLen(callsBefore), "no further CreateDatabase once provisioned")
+
+		var provisioned pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &provisioned)).To(Succeed())
+		Expect(provisioned.Status.DatabaseNode).To(Equal("dbnode"))
+	})
+
+	It("marks an overlong database name terminal without calling the agent or wedging the mirror", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "bignode", Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		node.Status.Phase = pgshardv1alpha1.NodeReady
+		node.Status.CurrentPrimary = "bignode-0"
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+		// A shard name over PostgreSQL's 63-byte identifier limit.
+		longName := strings.Repeat("a", 64)
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: longName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				Replicas: 1, NodeRef: "bignode",
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+
+		r := &PgShardShardReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: longName, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred(), "a bad name is terminal, not a hard error")
+
+		Expect(agent.Calls).To(BeEmpty(), "the agent is never called for a too-long name")
+
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: longName, Namespace: ns}, &got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, shardDatabaseReadyCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("InvalidName"))
+		// The node-health mirror still ran despite the database problem.
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady))
 	})
 })

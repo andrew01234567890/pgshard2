@@ -24,9 +24,12 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -187,6 +190,9 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 	default:
 		shard.Status.Phase = shardPhaseForNode(node.Status.Phase)
 		shard.Status.CurrentPrimary = node.Status.CurrentPrimary
+		// Best-effort and never fatal: a database-provisioning problem must not
+		// stop the shard from mirroring its node's health.
+		r.reconcileShardDatabase(ctx, shard, &node)
 	}
 
 	interval := r.pollInterval()
@@ -194,6 +200,92 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 	return ctrl.Result{RequeueAfter: interval}, client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+// shardDatabaseReadyCondition marks that the shard's Postgres database exists on
+// its node.
+const shardDatabaseReadyCondition = "DatabaseReady"
+
+// maxDatabaseNameBytes mirrors PostgreSQL's NAMEDATALEN-1 (the agent rejects a
+// longer name). Validating here turns an otherwise permanent gRPC error into a
+// terminal condition instead of an endless retry.
+const maxDatabaseNameBytes = 63
+
+// shardDatabaseName is the Postgres DATABASE a placed shard lives in. Shard
+// names are namespace-unique, and a node hosts many shards' databases, so the
+// shard name is a natural per-node-unique database name.
+func shardDatabaseName(shard *pgshardv1alpha1.PgShardShard) string {
+	return shard.Name
+}
+
+func (r *PgShardShardReconciler) setDatabaseCondition(
+	shard *pgshardv1alpha1.PgShardShard, status metav1.ConditionStatus, reason, msg string,
+) {
+	apimeta.SetStatusCondition(&shard.Status.Conditions, metav1.Condition{
+		Type:               shardDatabaseReadyCondition,
+		Status:             status,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: shard.Generation,
+	})
+}
+
+// reconcileShardDatabase ensures the shard's Postgres database exists on its
+// node by asking the node's primary agent to create it. It is best-effort,
+// idempotent, and never returns an error: it waits until the node has a ready
+// primary with a reachable address, and once it has provisioned the database on
+// a given node it records both the DatabaseReady condition and the node identity
+// so the round trip is skipped until the shard moves to a different node.
+func (r *PgShardShardReconciler) reconcileShardDatabase(
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, node *pgshardv1alpha1.PgShardNode,
+) {
+	log := logf.FromContext(ctx)
+	name := shardDatabaseName(shard)
+	if len(name) > maxDatabaseNameBytes {
+		// A name PostgreSQL would truncate is terminal, not retriable.
+		r.setDatabaseCondition(shard, metav1.ConditionFalse, "InvalidName",
+			fmt.Sprintf("database name %q exceeds %d bytes", name, maxDatabaseNameBytes))
+		return
+	}
+	// Already provisioned on this node; a move to another node re-provisions.
+	if shard.Status.DatabaseNode == node.Name &&
+		apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) {
+		return
+	}
+	primary := node.Status.CurrentPrimary
+	if node.Status.Phase != pgshardv1alpha1.NodeReady || primary == "" {
+		return
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: shard.Namespace, Name: primary}, &pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "fetching primary pod for database provisioning", "pod", primary)
+		}
+		return
+	}
+	if pod.Status.PodIP == "" {
+		return
+	}
+	agent, err := r.agentClient(pod.Status.PodIP, agentPort)
+	if err != nil {
+		log.Error(err, "dialing agent for database provisioning")
+		return
+	}
+	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{Name: name}); err != nil {
+		// InvalidArgument is a permanent contract violation; record it terminally
+		// rather than retrying forever. Other errors are transient — the poll
+		// interval retries.
+		if status.Code(err) == codes.InvalidArgument {
+			r.setDatabaseCondition(shard, metav1.ConditionFalse, "Rejected", err.Error())
+		} else {
+			log.Error(err, "creating shard database", "database", name)
+		}
+		return
+	}
+	shard.Status.DatabaseNode = node.Name
+	r.setDatabaseCondition(shard, metav1.ConditionTrue, "Provisioned",
+		fmt.Sprintf("database %s created on node %s", name, node.Name))
 }
 
 func (r *PgShardShardReconciler) pollInterval() time.Duration {

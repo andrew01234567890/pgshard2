@@ -43,6 +43,10 @@ type FakeAgent struct {
 
 	executedSchemaOps map[string]string
 
+	// databases records shard databases created via CreateDatabase (name ->
+	// owner) so controller tests can assert placement provisioning.
+	databases map[string]string
+
 	// emptyStatus makes GetStatus return a response with a nil Status, to
 	// exercise the operator's empty-status handling.
 	emptyStatus bool
@@ -111,6 +115,7 @@ func NewFakeAgent() (*FakeAgent, error) {
 			Timeline: 1,
 		},
 		executedSchemaOps: map[string]string{},
+		databases:         map[string]string{},
 		server:            grpc.NewServer(),
 		listener:          listener,
 	}
@@ -290,4 +295,48 @@ func (f *FakeAgent) StanzaCreate(
 	defer f.mu.Unlock()
 	f.record(fmt.Sprintf("StanzaCreate:%s", req.Stanza))
 	return &pgshardv1.StanzaCreateResponse{}, nil
+}
+
+func (f *FakeAgent) CreateDatabase(
+	ctx context.Context, req *pgshardv1.CreateDatabaseRequest,
+) (*pgshardv1.CreateDatabaseResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("CreateDatabase:" + req.Name)
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "database name is required")
+	}
+	// Mirror the real agent's NAMEDATALEN-1 limit so tests can exercise the
+	// controller's terminal-error handling.
+	if len(req.Name) > 63 || len(req.Owner) > 63 {
+		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
+	}
+	if _, ok := f.databases[req.Name]; !ok {
+		f.databases[req.Name] = req.Owner
+	}
+	return &pgshardv1.CreateDatabaseResponse{}, nil
+}
+
+func (f *FakeAgent) DropDatabase(
+	ctx context.Context, req *pgshardv1.DropDatabaseRequest,
+) (*pgshardv1.DropDatabaseResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("DropDatabase:" + req.Name)
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "database name is required")
+	}
+	delete(f.databases, req.Name)
+	return &pgshardv1.DropDatabaseResponse{}, nil
+}
+
+// Databases returns the shard databases the fake currently holds.
+func (f *FakeAgent) Databases() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.databases))
+	for k, v := range f.databases {
+		out[k] = v
+	}
+	return out
 }
