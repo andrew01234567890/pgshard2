@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 
-use pgshard_core::{TableDef, TableName, VSchema, shard_function};
+use pgshard_core::{ScalarValue, TableDef, TableName, VSchema, shard_function};
 use pgshard_sql::{Parsed, StatementKind};
 
 pub use catalog::{ShardCatalog, ShardId};
@@ -126,6 +126,38 @@ pub fn plan_all(parsed: &Parsed, vschema: &VSchema, shards: &ShardCatalog) -> Ve
             }
         })
         .collect()
+}
+
+/// Complete a [`Parameterized`] plan once its bind parameters are known.
+///
+/// `values` are the statement's bound parameters, 0-indexed (`$1` = `values[0]`),
+/// already coerced to the column's type by the wire layer. Each shard-key
+/// parameter is hashed with the plan's shard function and routed through
+/// `shards` — the same decision the planner makes for literals: one shard →
+/// [`Plan::SingleShard`]; a read spanning several → [`Plan::Scatter`]; a write
+/// spanning several → rejected as cross-shard.
+pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &ShardCatalog) -> Plan {
+    let func = shard_function(&param.shard_function).expect("vschema validates the shard function");
+    let mut hit = BTreeSet::new();
+    for &idx in &param.param_indices {
+        let Some(value) = values.get((idx as usize).wrapping_sub(1)) else {
+            return reject(&format!(
+                "bind parameter ${idx} for the shard key is missing"
+            ));
+        };
+        hit.insert(shards.route(func.keyspace_id(value)).clone());
+    }
+    let hit: Vec<ShardId> = hit.into_iter().collect();
+    match (param.write, hit.len()) {
+        // A Parameterized plan always carries at least one shard-key param, so
+        // `hit` is never empty; guard defensively all the same.
+        (_, 0) => reject("parameterized plan named no shard-key parameters"),
+        (_, 1) => Plan::SingleShard(hit.into_iter().next().expect("len 1")),
+        (false, _) => Plan::Scatter(hit),
+        (true, n) => reject(&format!(
+            "write resolves to {n} shards; cross-shard writes are not supported"
+        )),
+    }
 }
 
 fn reject(reason: &str) -> Plan {
@@ -532,6 +564,70 @@ mod tests {
                 write: false,
             })
         );
+    }
+
+    fn param(indices: Vec<u32>, write: bool) -> Parameterized {
+        Parameterized {
+            shard_function: "xxhash64_v1".into(),
+            param_indices: indices,
+            write,
+        }
+    }
+
+    #[test]
+    fn resolve_bound_completes_a_parameterized_plan() {
+        let cat = catalog();
+        // A single shard-key param routes to its one shard, read or write.
+        assert_eq!(
+            resolve_bound(&param(vec![1], true), &[ScalarValue::Int64(1)], &cat),
+            Plan::SingleShard(shard_of(1))
+        );
+        // The value is hashed by its bound type — a text key routes by text.
+        assert_eq!(
+            resolve_bound(
+                &param(vec![1], false),
+                &[ScalarValue::Text("hello".into())],
+                &cat
+            ),
+            {
+                let f = shard_function("xxhash64_v1").unwrap();
+                Plan::SingleShard(
+                    cat.route(f.keyspace_id(&ScalarValue::Text("hello".into())))
+                        .clone(),
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_bound_reads_scatter_writes_reject_across_shards() {
+        let cat = catalog();
+        // $1=0 and $2=1 hash to different shards.
+        assert_ne!(shard_of(0), shard_of(1));
+        let vals = [ScalarValue::Int64(0), ScalarValue::Int64(1)];
+        let mut expected = vec![shard_of(0), shard_of(1)];
+        expected.sort();
+        assert_eq!(
+            resolve_bound(&param(vec![1, 2], false), &vals, &cat),
+            Plan::Scatter(expected)
+        );
+        // The same spread as a write is a cross-shard rejection.
+        assert!(matches!(
+            resolve_bound(&param(vec![1, 2], true), &vals, &cat),
+            Plan::Reject {
+                code: CROSS_SHARD,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_bound_rejects_a_missing_parameter() {
+        // $2 referenced but only one value bound.
+        assert!(matches!(
+            resolve_bound(&param(vec![2], false), &[ScalarValue::Int64(1)], &catalog()),
+            Plan::Reject { .. }
+        ));
     }
 
     #[test]
