@@ -137,7 +137,14 @@ pub fn plan_all(parsed: &Parsed, vschema: &VSchema, shards: &ShardCatalog) -> Ve
 /// [`Plan::SingleShard`]; a read spanning several → [`Plan::Scatter`]; a write
 /// spanning several → rejected as cross-shard.
 pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &ShardCatalog) -> Plan {
-    let func = shard_function(&param.shard_function).expect("vschema validates the shard function");
+    // Planner-built plans always name a vschema-validated function, but this is a
+    // public entry point with public fields — reject an unknown one, never panic.
+    let Ok(func) = shard_function(&param.shard_function) else {
+        return reject(&format!(
+            "unknown shard function {:?}",
+            param.shard_function
+        ));
+    };
     let mut hit = BTreeSet::new();
     for &idx in &param.param_indices {
         let Some(value) = values.get((idx as usize).wrapping_sub(1)) else {
@@ -626,6 +633,20 @@ mod tests {
         // $2 referenced but only one value bound.
         assert!(matches!(
             resolve_bound(&param(vec![2], false), &[ScalarValue::Int64(1)], &catalog()),
+            Plan::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_bound_rejects_an_unknown_shard_function() {
+        // A hand-built plan (public fields) with a bad function must not panic.
+        let bad = Parameterized {
+            shard_function: "md5".into(),
+            param_indices: vec![1],
+            write: false,
+        };
+        assert!(matches!(
+            resolve_bound(&bad, &[ScalarValue::Int64(1)], &catalog()),
             Plan::Reject { .. }
         ));
     }
