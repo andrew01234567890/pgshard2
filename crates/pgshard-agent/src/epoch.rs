@@ -58,7 +58,7 @@ impl EpochGuard {
         }
         // Recover a poisoned lock: the guarded state is a few plain fields, so a
         // panic in an unrelated command can never leave it inconsistent.
-        let mut a = self.applied.lock().unwrap_or_else(|e| e.into_inner());
+        let a = self.applied.lock().unwrap_or_else(|e| e.into_inner());
         if a.seen && epoch < a.epoch {
             return Err(EpochError::Stale {
                 got: epoch,
@@ -71,10 +71,22 @@ impl EpochGuard {
             }
             return Ok(Outcome::Replay);
         }
-        a.epoch = epoch;
-        a.key = key.to_owned();
-        a.seen = true;
+        // Apply is only a reservation: the epoch is not recorded until the
+        // command actually succeeds (see `commit`). Otherwise a command that
+        // failed after `check` would leave its epoch committed, and a retry would
+        // `Replay` a success that never happened.
         Ok(Outcome::Apply)
+    }
+
+    /// Record the epoch as applied after the command succeeded, so an identical
+    /// retry replays it and a stale epoch is rejected. Only ever advances.
+    pub fn commit(&self, epoch: u64, key: &str) {
+        let mut a = self.applied.lock().unwrap_or_else(|e| e.into_inner());
+        if !a.seen || epoch > a.epoch {
+            a.epoch = epoch;
+            a.key = key.to_owned();
+            a.seen = true;
+        }
     }
 
     pub fn applied_epoch(&self) -> u64 {
@@ -93,18 +105,31 @@ mod tests {
     }
 
     #[test]
-    fn higher_applies_and_advances() {
+    fn commit_advances_after_success() {
         let g = EpochGuard::new();
         assert_eq!(g.check(1, "promote:a"), Ok(Outcome::Apply));
+        // Not recorded until commit.
+        assert_eq!(g.applied_epoch(), 0);
+        g.commit(1, "promote:a");
         assert_eq!(g.applied_epoch(), 1);
         assert_eq!(g.check(5, "promote:b"), Ok(Outcome::Apply));
+        g.commit(5, "promote:b");
         assert_eq!(g.applied_epoch(), 5);
+    }
+
+    #[test]
+    fn an_uncommitted_apply_retries_instead_of_replaying() {
+        let g = EpochGuard::new();
+        // The command was reserved but failed, so it was never committed.
+        assert_eq!(g.check(1, "promote:a"), Ok(Outcome::Apply));
+        // The retry must Apply again (re-execute), not Replay a success.
+        assert_eq!(g.check(1, "promote:a"), Ok(Outcome::Apply));
     }
 
     #[test]
     fn lower_is_stale() {
         let g = EpochGuard::new();
-        g.check(5, "promote:a").unwrap();
+        g.commit(5, "promote:a");
         assert_eq!(
             g.check(3, "promote:a"),
             Err(EpochError::Stale { got: 3, applied: 5 })
@@ -114,7 +139,7 @@ mod tests {
     #[test]
     fn equal_same_key_replays_equal_other_key_conflicts() {
         let g = EpochGuard::new();
-        g.check(2, "promote:a").unwrap();
+        g.commit(2, "promote:a");
         assert_eq!(g.check(2, "promote:a"), Ok(Outcome::Replay));
         assert_eq!(
             g.check(2, "promote:b"),

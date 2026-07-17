@@ -81,6 +81,9 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         {
             Outcome::Apply => {
                 let timeline = self.instance.promote().await.map_err(internal)?;
+                // The promotion happened; record the epoch before the (read-only)
+                // status fetch so a failure there cannot cause a re-promote.
+                self.epoch.commit(req.decision_epoch, &key);
                 let snap = self.instance.snapshot().await.map_err(internal)?;
                 Ok(Response::new(v1::PromoteResponse {
                     new_timeline: timeline,
@@ -116,6 +119,7 @@ impl<I: Instance> AgentService for AgentSvc<I> {
                 .set_fenced(req.fenced)
                 .await
                 .map_err(internal)?;
+            self.epoch.commit(req.decision_epoch, &key);
         }
         Ok(Response::new(v1::FenceResponse {}))
     }
@@ -141,6 +145,7 @@ impl<I: Instance> AgentService for AgentSvc<I> {
                     .rejoin(&target, req.allow_rewind)
                     .await
                     .map_err(internal)?;
+                self.epoch.commit(req.decision_epoch, &key);
                 Ok(Response::new(v1::RejoinAsStandbyResponse { rewound }))
             }
             // The rewind is not repeated on a retry; report what the first apply
@@ -322,6 +327,28 @@ mod tests {
             st.into_inner().status.unwrap().role,
             v1::InstanceRole::Primary as i32
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_promote_retries_instead_of_replaying_success() {
+        let instance = FakeInstance::standby();
+        instance.set_promote_fails(true);
+        let s = svc(instance);
+        let req = || {
+            Request::new(v1::PromoteRequest {
+                target_primary: "pod-0".into(),
+                decision_epoch: 1,
+            })
+        };
+        // First attempt fails inside the instance.
+        assert!(s.promote(req()).await.is_err());
+        // The retry must re-execute (and fail again) — not replay a success that
+        // never happened.
+        assert!(s.promote(req()).await.is_err());
+        // Once the instance can promote, the same epoch finally applies.
+        s.instance.set_promote_fails(false);
+        let ok = s.promote(req()).await.unwrap().into_inner();
+        assert_eq!(ok.new_timeline, 2);
     }
 
     #[tokio::test]

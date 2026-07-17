@@ -54,6 +54,7 @@ pub mod fake {
     #[derive(Default)]
     pub struct FakeInstance {
         state: Mutex<Snapshot>,
+        promote_fails: std::sync::atomic::AtomicBool,
     }
 
     impl FakeInstance {
@@ -65,6 +66,7 @@ pub mod fake {
                     timeline: 1,
                     ..Default::default()
                 }),
+                ..Default::default()
             }
         }
         pub fn standby() -> Self {
@@ -76,10 +78,15 @@ pub mod fake {
                     receiver_active: true,
                     ..Default::default()
                 }),
+                ..Default::default()
             }
         }
         pub fn set<F: FnOnce(&mut Snapshot)>(&self, f: F) {
             f(&mut self.state.lock().unwrap());
+        }
+        pub fn set_promote_fails(&self, fails: bool) {
+            self.promote_fails
+                .store(fails, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -89,6 +96,9 @@ pub mod fake {
             Ok(self.state.lock().unwrap().clone())
         }
         async fn promote(&self) -> anyhow::Result<u32> {
+            if self.promote_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("promote failed");
+            }
             let mut s = self.state.lock().unwrap();
             s.in_recovery = false;
             s.receiver_active = false;
