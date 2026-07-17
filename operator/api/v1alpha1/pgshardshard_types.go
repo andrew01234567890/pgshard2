@@ -89,6 +89,12 @@ type PgShardShardSpec struct {
 
 	KeyRange KeyRange `json:"keyRange"`
 
+	// NodeRef names the PgShardNode that hosts this shard's database. The
+	// cluster controller assigns it per the cluster's placement; the shard's
+	// data lives as a Postgres database on that node.
+	// +optional
+	NodeRef string `json:"nodeRef,omitempty"`
+
 	// +kubebuilder:default=data
 	// +optional
 	Role ShardRole `json:"role,omitempty"`

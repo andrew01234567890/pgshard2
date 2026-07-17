@@ -252,6 +252,9 @@ type PgShardClusterSpec struct {
 	Shards ShardsSpec `json:"shards"`
 
 	// +optional
+	Placement *PlacementSpec `json:"placement,omitempty"`
+
+	// +optional
 	Router *RouterSpec `json:"router,omitempty"`
 
 	// +optional
@@ -266,6 +269,39 @@ type PgShardClusterSpec struct {
 	// Pause suspends reconciliation (hibernation).
 	// +optional
 	Pause bool `json:"pause,omitempty"`
+}
+
+// PlacementMode trades physical density against isolation for a cluster's
+// shard databases.
+// +kubebuilder:validation:Enum=shared;dedicatedInstance;dedicatedMachine
+type PlacementMode string
+
+const (
+	// PlacementShared packs the cluster's shard databases onto shared
+	// PgShardNodes (one Postgres instance hosts several databases' shards).
+	PlacementShared PlacementMode = "shared"
+	// PlacementDedicatedInstance gives the cluster its own PgShardNodes, which
+	// may still co-schedule on shared machines.
+	PlacementDedicatedInstance PlacementMode = "dedicatedInstance"
+	// PlacementDedicatedMachine gives the cluster its own PgShardNodes on their
+	// own machines (anti-affinity).
+	PlacementDedicatedMachine PlacementMode = "dedicatedMachine"
+)
+
+// PlacementSpec controls how a cluster's shard databases are laid out onto
+// physical PgShardNodes. Moving along the density/isolation spectrum is an
+// online operation, not a rebuild.
+// +kubebuilder:validation:XValidation:rule="self.mode == 'shared' || !has(self.colocateWith)",message="colocateWith is only valid with mode 'shared'"
+type PlacementSpec struct {
+	// +kubebuilder:default=dedicatedInstance
+	// +optional
+	Mode PlacementMode `json:"mode,omitempty"`
+
+	// ColocateWith names another cluster in the same namespace whose nodes this
+	// cluster's shard databases are packed onto (shared mode only): the two
+	// databases then share physical instances.
+	// +optional
+	ColocateWith string `json:"colocateWith,omitempty"`
 }
 
 // ShardCounts aggregates shard readiness; per-shard detail lives on
