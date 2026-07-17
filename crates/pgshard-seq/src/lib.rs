@@ -112,6 +112,36 @@ pub struct SequenceCache<R: BlockReserver> {
     reserved: Condvar,
 }
 
+/// Holds the single-flight reservation claim for one sequence and releases it
+/// on drop — INCLUDING when `BlockReserver::reserve` panics and unwinds. Without
+/// this, a panicking backend would leave `reserving = true` set with no notify,
+/// and every future caller of that sequence would block on the condvar forever.
+struct ReservationClaim<'a, R: BlockReserver> {
+    cache: &'a SequenceCache<R>,
+    sequence: &'a str,
+    armed: bool,
+}
+
+impl<R: BlockReserver> ReservationClaim<'_, R> {
+    /// The happy/error path already cleared the claim under the lock; make the
+    /// drop a no-op so it does not re-lock and re-notify.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R: BlockReserver> Drop for ReservationClaim<'_, R> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self.cache.lock();
+            if let Some(entry) = state.get_mut(self.sequence) {
+                entry.reserving = false;
+            }
+            self.cache.reserved.notify_all();
+        }
+    }
+}
+
 impl<R: BlockReserver> SequenceCache<R> {
     pub fn new(reserver: R) -> SequenceCache<R> {
         SequenceCache {
@@ -128,6 +158,11 @@ impl<R: BlockReserver> SequenceCache<R> {
     /// Returns the next id for `sequence`, reserving a new block if the current
     /// one is exhausted (or was never reserved). Concurrent callers on a drained
     /// sequence single-flight the reservation: one reserves, the rest wait.
+    ///
+    /// On a reservation FAILURE the error is not fanned out to the waiters; each
+    /// retries in turn, so a persistently failing backend serializes retries.
+    /// That is fine when `reserve` fails fast (a down system DB refuses quickly);
+    /// sharing one fast-fail across waiters is a deferred optimization.
     pub fn next_id(&self, sequence: &str) -> Result<i64, SeqError> {
         let mut state = self.lock();
         loop {
@@ -158,14 +193,21 @@ impl<R: BlockReserver> SequenceCache<R> {
                 }
             }
 
-            // We hold the single-flight claim. Reserve without the lock, then
-            // re-acquire to install the block and wake the waiters.
+            // We hold the single-flight claim. Reserve without the lock, under an
+            // RAII guard so a panic out of reserve() still clears the claim and
+            // wakes waiters (otherwise the sequence would deadlock forever).
             drop(state);
+            let mut claim = ReservationClaim {
+                cache: self,
+                sequence,
+                armed: true,
+            };
             let result = self.reserver.reserve(sequence);
             state = self.lock();
             let entry = state.get_mut(sequence).expect("reservation claim present");
             entry.reserving = false;
             self.reserved.notify_all();
+            claim.disarm();
 
             let (start, size) = result?;
             if size <= 0 {
@@ -308,13 +350,37 @@ mod tests {
         assert!(matches!(cache.next_id("s"), Err(SeqError::Exhausted(_))));
     }
 
+    /// Records the peak number of `reserve` calls in flight at once, so a test
+    /// can prove they are actually single-flighted (peak 1), not merely unique.
+    struct SingleFlightProbe {
+        size: i64,
+        next_start: AtomicI64,
+        in_flight: AtomicI64,
+        max_in_flight: AtomicI64,
+    }
+
+    impl BlockReserver for SingleFlightProbe {
+        fn reserve(&self, _: &str) -> Result<(i64, i64), SeqError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1)); // widen the window
+            let start = self.next_start.fetch_add(self.size, Ordering::SeqCst);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok((start, self.size))
+        }
+    }
+
     #[test]
     fn concurrent_drainers_single_flight_the_reservation() {
         use std::sync::Arc;
-        // Block of 1: every id past the first drains and must reserve. If N
-        // threads race the same drained sequence, single-flighting keeps the
-        // ids unique and contiguous rather than fanning out duplicate blocks.
-        let cache = Arc::new(SequenceCache::new(FakeReserver::new(1)));
+        // Block of 1: every id past the first drains and must reserve, so eight
+        // threads race the same drained sequence continuously.
+        let cache = Arc::new(SequenceCache::new(SingleFlightProbe {
+            size: 1,
+            next_start: AtomicI64::new(1),
+            in_flight: AtomicI64::new(0),
+            max_in_flight: AtomicI64::new(0),
+        }));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let c = Arc::clone(&cache);
@@ -326,13 +392,45 @@ mod tests {
             .into_iter()
             .flat_map(|h| h.join().unwrap())
             .collect();
-        all.sort_unstable();
         let n = all.len();
+        all.sort_unstable();
         all.dedup();
         assert_eq!(
             all.len(),
             n,
             "ids must be unique across concurrent drainers"
         );
+        // The point of single-flighting: never two reservations at once.
+        assert_eq!(cache.reserver.max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    struct PanicOnceReserver {
+        calls: AtomicI64,
+        next_start: AtomicI64,
+    }
+
+    impl BlockReserver for PanicOnceReserver {
+        fn reserve(&self, _: &str) -> Result<(i64, i64), SeqError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("backend panicked");
+            }
+            Ok((self.next_start.fetch_add(10, Ordering::SeqCst), 10))
+        }
+    }
+
+    #[test]
+    fn panic_in_reserve_does_not_strand_the_sequence() {
+        let cache = SequenceCache::new(PanicOnceReserver {
+            calls: AtomicI64::new(0),
+            next_start: AtomicI64::new(1),
+        });
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic quiet
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.next_id("s")));
+        std::panic::set_hook(prev);
+        assert!(first.is_err(), "the backend panic propagated");
+        // The claim guard cleared `reserving`, so the sequence recovers instead
+        // of deadlocking every future caller.
+        assert_eq!(cache.next_id("s").unwrap(), 1);
     }
 }
