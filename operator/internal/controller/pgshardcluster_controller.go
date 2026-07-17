@@ -308,7 +308,7 @@ func desiredPlacement(
 			assignment[shards[i].Name] = node
 		}
 		if colocateWith == "" {
-			n, err := nodeFor(cluster, node, rendered)
+			n, err := nodeFor(cluster, node, rendered, dataStorage(cluster))
 			if err != nil {
 				return nil, nil, "", err
 			}
@@ -322,7 +322,7 @@ func desiredPlacement(
 	// scheduling field); the fan-out is what differs today.
 	for i := range shards {
 		assignment[shards[i].Name] = shards[i].Name
-		n, err := nodeFor(cluster, shards[i].Name, rendered)
+		n, err := nodeFor(cluster, shards[i].Name, rendered, storageForShard(cluster, &shards[i]))
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -337,6 +337,7 @@ func nodeFor(
 	cluster *pgshardv1alpha1.PgShardCluster,
 	name string,
 	rendered pgconfig.Rendered,
+	storage *pgshardv1alpha1.StorageSpec,
 ) (pgshardv1alpha1.PgShardNode, error) {
 	if len(name) > nodeNameMaxLength {
 		return pgshardv1alpha1.PgShardNode{}, fmt.Errorf(
@@ -348,9 +349,36 @@ func nodeFor(
 			Replicas:           rendered.ReplicasPerShard,
 			Image:              cluster.Spec.Postgres.Image,
 			Resources:          rendered.Resources.DeepCopy(),
+			Storage:            storage.DeepCopy(),
 			PostgresConfigHash: rendered.ConfigHash,
 		},
 	}, nil
+}
+
+// dataStorage / systemStorage resolve the per-instance storage the cluster
+// requested for its data shards and its system shard; nil falls back to the
+// node controller's default.
+func dataStorage(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.StorageSpec {
+	if cluster.Spec.Size != nil && cluster.Spec.Size.Overrides != nil {
+		return cluster.Spec.Size.Overrides.Storage
+	}
+	return nil
+}
+
+func systemStorage(cluster *pgshardv1alpha1.PgShardCluster) *pgshardv1alpha1.StorageSpec {
+	if cluster.Spec.System != nil {
+		return cluster.Spec.System.Storage
+	}
+	return nil
+}
+
+func storageForShard(
+	cluster *pgshardv1alpha1.PgShardCluster, shard *pgshardv1alpha1.PgShardShard,
+) *pgshardv1alpha1.StorageSpec {
+	if shard.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
+		return systemStorage(cluster)
+	}
+	return dataStorage(cluster)
 }
 
 // placeShards creates the cluster-owned PgShardNodes and assigns each shard's
@@ -434,11 +462,15 @@ func (r *PgShardClusterReconciler) ensureNode(
 		}
 		if existing.Spec.PostgresConfigHash != node.Spec.PostgresConfigHash ||
 			existing.Spec.Replicas != node.Spec.Replicas ||
-			existing.Spec.Image != node.Spec.Image {
+			existing.Spec.Image != node.Spec.Image ||
+			!equality.Semantic.DeepEqual(existing.Spec.Storage, node.Spec.Storage) {
 			existing.Spec.PostgresConfigHash = node.Spec.PostgresConfigHash
 			existing.Spec.Replicas = node.Spec.Replicas
 			existing.Spec.Image = node.Spec.Image
 			existing.Spec.Resources = node.Spec.Resources
+			// Converge the desired storage so a scale-up gets a correctly-sized
+			// PVC; resizing an existing instance's volume is a separate concern.
+			existing.Spec.Storage = node.Spec.Storage
 			return false, r.Update(ctx, existing)
 		}
 		return false, nil
