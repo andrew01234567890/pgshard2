@@ -15,20 +15,24 @@
 //!   constraints (AND-reachable); OR/NOT subtrees are not mined, so such a read
 //!   scatters and such a write is rejected.
 //! - Literal shard keys are hashed by their SQL form — integer literals as
-//!   `Int64`, string literals as `Text`. Typed hashing (uuid/bytea columns) is
-//!   deferred; the data-plane insert path hashes the same way, so routing stays
-//!   consistent.
+//!   `Int64`, string literals as `Text`. The vschema does not yet carry the
+//!   shard-key column's type, so a quoted literal against an integer column
+//!   (`customer_id = '1'`) hashes as text and can route differently from the
+//!   `Int64` the row was stored under. Typed coercion (and uuid/bytea hashing)
+//!   is a follow-up; until then the operator must use literals in the column's
+//!   native form.
 //! - A `$n` shard key yields a [`Plan::Parameterized`]: the value is known only
-//!   at Bind, so bind-time resolution is left to the executor.
-//! - Cross-shard writes, keyless writes, and updates of the shard key are
-//!   rejected with SQLSTATE `0A000`. MERGE and COPY are not yet routed.
+//!   at Bind, so bind-time resolution is left to the executor. A predicate that
+//!   mixes a literal and a parameter (`key IN (1, $1)`) is not parameterizable
+//!   soundly — the read scatters and the write is rejected.
+//! - Cross-shard writes, keyless writes, updates of the shard key (including via
+//!   `ON CONFLICT DO UPDATE`), `UPDATE ... FROM` / `DELETE ... USING`, and
+//!   MERGE/COPY are rejected with SQLSTATE `0A000`.
 //! - `search_path` is not modeled: an unqualified relation defaults to `public`.
-//! - Joins are rejected: routing is decided from a single sharded table in the
-//!   top-level FROM. Only that clause is analyzed, so a subquery referencing a
-//!   sharded table on another shard is **not** seen here — enabling the scatter
-//!   executor's single-shard fast path for statements that contain subqueries
-//!   is gated separately (a follow-up), so this planner is never the thing that
-//!   under-routes such a query on its own.
+//! - Joins and subqueries are rejected, not routed: key-routing needs a single
+//!   plain sharded table in the FROM and no subquery in the WHERE. This keeps
+//!   the qualifier-blind extractor sound (only one table is ever in scope) and
+//!   never under-routes a query whose other relations live on other shards.
 
 pub mod catalog;
 mod extract;
@@ -36,13 +40,13 @@ mod extract;
 use std::collections::BTreeSet;
 
 use pg_query::NodeEnum;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 
 use pgshard_core::{TableDef, TableName, VSchema, shard_function};
 use pgshard_sql::{Parsed, StatementKind};
 
 pub use catalog::{ShardCatalog, ShardId};
-use extract::{KeyVal, from_tables, range_var_table, where_key_values};
+use extract::{KeyVal, analyze_from, contains_sublink, range_var_table, where_key_values};
 
 /// SQLSTATE `feature_not_supported`: what a statement the router cannot route
 /// (a cross-shard write, an unsupported form) is rejected with.
@@ -135,8 +139,13 @@ fn reject(reason: &str) -> Plan {
 enum Resolution {
     /// No usable shard-key constraint was found.
     Unkeyed,
-    /// At least one value is a bind parameter; carries every `$n` seen.
+    /// Every value is a bind parameter; carries each `$n` seen.
     Params(Vec<u32>),
+    /// A mix of literal and bind-parameter values. The literal shards cannot be
+    /// dropped (they may differ from where the params land), and bind-time
+    /// resolution sees only the params, so neither `Shards` nor `Params` is
+    /// sound: the caller must scatter (read) or reject (write).
+    Mixed,
     /// All values are literals; carries the distinct shards they hit.
     Shards(Vec<ShardId>),
 }
@@ -152,8 +161,11 @@ fn route_values(values: &[KeyVal], shard_fn: &str, shards: &ShardCatalog) -> Res
             KeyVal::Const(_) => None,
         })
         .collect();
-    if !params.is_empty() {
-        return Resolution::Params(params);
+    let has_const = values.iter().any(|v| matches!(v, KeyVal::Const(_)));
+    match (params.is_empty(), has_const) {
+        (false, true) => return Resolution::Mixed,
+        (false, false) => return Resolution::Params(params),
+        _ => {}
     }
     let func = shard_function(shard_fn).expect("vschema validates the shard function name");
     let mut hit = BTreeSet::new();
@@ -197,8 +209,9 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
 }
 
 fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
-    let tables = from_tables(&s.from_clause);
-    let sharded: Vec<(&str, &str)> = tables
+    let from = analyze_from(&s.from_clause);
+    let sharded: Vec<(&str, &str)> = from
+        .tables
         .iter()
         .filter_map(|t| match placement(vschema, t) {
             Placement::Sharded { key, shard_fn } => Some((key, shard_fn)),
@@ -207,33 +220,39 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         .collect();
 
     if sharded.is_empty() {
-        // No sharded table: a read of only global/system relations goes to the
-        // unsharded system database; a tableless read (`SELECT 1`) is handled
-        // by the router itself.
-        return if tables.is_empty() {
+        // No sharded table in a plain FROM. If every FROM item is a plain
+        // relation, this is a global/system read (or a tableless `SELECT 1`);
+        // a subquery/function in the FROM could hide a sharded table, so route
+        // it to the system database rather than the shards either way.
+        return if from.tables.is_empty() && from.all_plain {
             Plan::RouterLocal
         } else {
             Plan::Unsharded
         };
     }
 
-    // A join — more than one relation alongside the sharded table — cannot be
-    // routed by shard key without cross-table co-location analysis (which needs
-    // per-alias qualifier resolution the extractor does not do), and joins
-    // across sharded tables or to a global table are out of M1 scope. Reject
-    // rather than risk under-routing.
+    // Only a single plain sharded table can be key-routed. A join (more FROM
+    // items, or a subquery/function that hides relations) needs per-alias
+    // qualifier resolution the extractor does not do and cross-shard join
+    // semantics that are out of M1 scope — reject rather than risk
+    // under-routing.
     let [(key, shard_fn)] = sharded[..] else {
         return reject("SELECT joining multiple sharded tables is not supported in M1");
     };
-    if tables.len() > 1 {
+    if from.tables.len() > 1 || !from.all_plain {
         return reject(
             "SELECT joining a sharded table with another relation is not supported in M1",
         );
     }
+    // A subquery in the WHERE would run only on the routed shard yet could
+    // reference rows on others; refuse the shard-key fast path.
+    if contains_sublink(s.where_clause.as_deref()) {
+        return reject("SELECT with a subquery on a sharded table is not supported in M1");
+    }
 
     let values = where_key_values(s.where_clause.as_deref(), key);
     match route_values(&values, shard_fn, shards) {
-        Resolution::Unkeyed => Plan::Scatter(shards.all()),
+        Resolution::Unkeyed | Resolution::Mixed => Plan::Scatter(shards.all()),
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
             param_indices,
@@ -252,6 +271,18 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
         Placement::Sharded { key, shard_fn } => {
+            // `ON CONFLICT ... DO UPDATE` runs only on the shard the INSERT
+            // routes to, but the conflicting row (found by an arbitrary arbiter)
+            // may live on another shard, and the SET may even move the shard key.
+            // Neither is safe on a single shard, so reject any DO UPDATE (DO
+            // NOTHING is fine).
+            if let Some(oc) = s.on_conflict_clause.as_deref()
+                && oc.action == OnConflictAction::OnconflictUpdate as i32
+            {
+                return reject(&format!(
+                    "INSERT into sharded table {table} with ON CONFLICT DO UPDATE is not supported in M1"
+                ));
+            }
             let Some(values) = extract::insert_key_values(s, key) else {
                 return reject(&format!(
                     "INSERT into sharded table {table} must list column {key} with a literal or bind-parameter value"
@@ -260,6 +291,9 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             match route_values(&values, shard_fn, shards) {
                 Resolution::Unkeyed => reject(&format!(
                     "INSERT into sharded table {table} does not set shard key {key}"
+                )),
+                Resolution::Mixed => reject(&format!(
+                    "INSERT into sharded table {table} mixes literal and parameter shard keys across rows"
                 )),
                 Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
                     shard_function: shard_fn.to_owned(),
@@ -284,6 +318,19 @@ fn plan_update(s: &UpdateStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             if extract::sets_column(&s.target_list, key) {
                 return reject(&format!("shard key {key} of {table} is immutable"));
             }
+            // `UPDATE ... FROM other` joins another relation whose rows may live
+            // on other shards; running it on the target's shard alone matches the
+            // wrong set. A WHERE subquery has the same problem.
+            if !s.from_clause.is_empty() {
+                return reject(&format!(
+                    "UPDATE {table} ... FROM another relation is not supported in M1"
+                ));
+            }
+            if contains_sublink(s.where_clause.as_deref()) {
+                return reject(&format!(
+                    "UPDATE {table} with a subquery is not supported in M1"
+                ));
+            }
             plan_keyed_write(
                 where_key_values(s.where_clause.as_deref(), key),
                 shard_fn,
@@ -304,14 +351,28 @@ fn plan_delete(s: &DeleteStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     match placement(vschema, &table) {
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
-        Placement::Sharded { key, shard_fn } => plan_keyed_write(
-            where_key_values(s.where_clause.as_deref(), key),
-            shard_fn,
-            shards,
-            &table,
-            key,
-            "DELETE",
-        ),
+        Placement::Sharded { key, shard_fn } => {
+            // `DELETE ... USING other` and a WHERE subquery both bring in rows
+            // that may live on other shards; neither is routable on one shard.
+            if !s.using_clause.is_empty() {
+                return reject(&format!(
+                    "DELETE FROM {table} ... USING another relation is not supported in M1"
+                ));
+            }
+            if contains_sublink(s.where_clause.as_deref()) {
+                return reject(&format!(
+                    "DELETE FROM {table} with a subquery is not supported in M1"
+                ));
+            }
+            plan_keyed_write(
+                where_key_values(s.where_clause.as_deref(), key),
+                shard_fn,
+                shards,
+                &table,
+                key,
+                "DELETE",
+            )
+        }
     }
 }
 
@@ -326,6 +387,9 @@ fn plan_keyed_write(
     match route_values(&values, shard_fn, shards) {
         Resolution::Unkeyed => reject(&format!(
             "{verb} of sharded table {table} must constrain shard key {key}"
+        )),
+        Resolution::Mixed => reject(&format!(
+            "{verb} of sharded table {table} mixes literal and parameter shard keys"
         )),
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
@@ -543,6 +607,76 @@ mod tests {
         assert!(is_reject(&plan1(
             "INSERT INTO orders (customer_id) VALUES (DEFAULT)"
         )));
+    }
+
+    #[test]
+    fn insert_on_conflict_do_update_is_rejected_but_do_nothing_routes() {
+        // DO NOTHING only affects the routed shard, so it still routes.
+        assert_eq!(
+            plan1(
+                "INSERT INTO orders (customer_id, total) VALUES (1, 5) \
+                 ON CONFLICT (customer_id) DO NOTHING"
+            ),
+            Plan::SingleShard(shard_of(1))
+        );
+        // DO UPDATE is rejected wholesale: the conflicting row may live on
+        // another shard and the SET may move the shard key.
+        for sql in [
+            "INSERT INTO orders (customer_id) VALUES (1) ON CONFLICT (customer_id) DO UPDATE SET total = 9",
+            "INSERT INTO orders (id, customer_id) VALUES (7, 1) ON CONFLICT (id) DO UPDATE SET customer_id = 2",
+        ] {
+            assert!(is_reject(&plan1(sql)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn mixed_literal_and_parameter_keys_never_single_shard() {
+        // A read scatters (sound superset); the write is rejected.
+        assert_eq!(
+            plan1("SELECT * FROM orders WHERE customer_id IN (1, $1)"),
+            Plan::Scatter(catalog().all())
+        );
+        assert!(is_reject(&plan1(
+            "DELETE FROM orders WHERE customer_id IN (1, $1)"
+        )));
+        assert!(is_reject(&plan1(
+            "INSERT INTO orders (customer_id) VALUES (1), ($1)"
+        )));
+    }
+
+    #[test]
+    fn join_writes_and_subqueries_are_rejected() {
+        // UPDATE ... FROM / DELETE ... USING join another (sharded) relation.
+        assert!(is_reject(&plan1(
+            "UPDATE orders SET total = 1 FROM line_items \
+             WHERE orders.customer_id = 5 AND line_items.id = orders.id"
+        )));
+        assert!(is_reject(&plan1(
+            "DELETE FROM orders USING line_items \
+             WHERE orders.customer_id = 5 AND line_items.id = orders.id"
+        )));
+        // A subquery in the FROM hides a relation from the join guard.
+        assert!(is_reject(&plan1(
+            "SELECT * FROM orders o, (SELECT * FROM line_items) sub WHERE o.customer_id = 1"
+        )));
+        // A subquery in the WHERE would run only on the routed shard.
+        assert!(is_reject(&plan1(
+            "SELECT * FROM orders WHERE customer_id = 5 \
+             AND id IN (SELECT order_id FROM line_items WHERE customer_id = 9)"
+        )));
+        assert!(is_reject(&plan1(
+            "DELETE FROM orders WHERE customer_id = 5 \
+             AND EXISTS (SELECT 1 FROM line_items WHERE line_items.id = orders.id)"
+        )));
+    }
+
+    #[test]
+    fn a_plain_in_list_is_not_a_subquery() {
+        // `IN (values)` must not be mistaken for `IN (subquery)`.
+        assert_eq!(
+            plan1("SELECT * FROM orders WHERE customer_id = 5 AND status IN ('a', 'b')"),
+            Plan::SingleShard(shard_of(5))
+        );
     }
 
     #[test]

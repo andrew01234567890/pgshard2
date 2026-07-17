@@ -197,26 +197,75 @@ pub fn sets_column(target_list: &[Node], key_col: &str) -> bool {
         .any(|t| matches!(as_enum(t), Some(NodeEnum::ResTarget(rt)) if rt.name == key_col))
 }
 
-/// Every `RangeVar` relation reachable through a FROM clause, flattening joins.
-pub fn from_tables(from_clause: &[Node]) -> Vec<TableName> {
-    let mut out = Vec::new();
-    for item in from_clause {
-        collect_from(item, &mut out);
-    }
-    out
+/// The relations of a FROM clause and whether every item is a plain table
+/// reference. `all_plain` is false when any item is a subquery, function, or
+/// other non-`RangeVar` source: the planner cannot see which relations such an
+/// item hides (a subquery may scan a sharded table on another shard), so it must
+/// refuse to key-route past one.
+pub struct FromClause {
+    pub tables: Vec<TableName>,
+    pub all_plain: bool,
 }
 
-fn collect_from(node: &Node, out: &mut Vec<TableName>) {
+pub fn analyze_from(from_clause: &[Node]) -> FromClause {
+    let mut fc = FromClause {
+        tables: Vec::new(),
+        all_plain: true,
+    };
+    for item in from_clause {
+        collect_from(item, &mut fc);
+    }
+    fc
+}
+
+fn collect_from(node: &Node, fc: &mut FromClause) {
     match as_enum(node) {
-        Some(NodeEnum::RangeVar(rv)) => out.push(range_var_table(rv)),
+        Some(NodeEnum::RangeVar(rv)) => fc.tables.push(range_var_table(rv)),
         Some(NodeEnum::JoinExpr(j)) => {
             if let Some(l) = j.larg.as_deref() {
-                collect_from(l, out);
+                collect_from(l, fc);
             }
             if let Some(r) = j.rarg.as_deref() {
-                collect_from(r, out);
+                collect_from(r, fc);
             }
         }
-        _ => {}
+        // A subquery, function, or anything else in the FROM: its relations are
+        // invisible to shard-key extraction.
+        _ => fc.all_plain = false,
+    }
+}
+
+/// True when an expression subtree contains a sub-select (`SubLink`). A sharded
+/// statement whose WHERE both pins a shard key and runs a subquery is rejected:
+/// the subquery would execute only on the routed shard and could reference rows
+/// on other shards. Covers the common boolean/comparison/function containers;
+/// sub-selects buried in rarer expression nodes are conservatively not the
+/// key-routing fast path's concern (documented in the crate root).
+pub fn contains_sublink(clause: Option<&Node>) -> bool {
+    clause.is_some_and(child_has_sublink)
+}
+
+fn child_has_sublink(node: &Node) -> bool {
+    as_enum(node).is_some_and(node_has_sublink)
+}
+
+fn node_has_sublink(node: &NodeEnum) -> bool {
+    match node {
+        NodeEnum::SubLink(_) => true,
+        NodeEnum::BoolExpr(b) => b.args.iter().any(child_has_sublink),
+        NodeEnum::AExpr(e) => {
+            e.lexpr.as_deref().is_some_and(child_has_sublink)
+                || e.rexpr.as_deref().is_some_and(child_has_sublink)
+        }
+        NodeEnum::List(l) => l.items.iter().any(child_has_sublink),
+        NodeEnum::FuncCall(f) => f.args.iter().any(child_has_sublink),
+        NodeEnum::CoalesceExpr(c) => c.args.iter().any(child_has_sublink),
+        NodeEnum::MinMaxExpr(m) => m.args.iter().any(child_has_sublink),
+        NodeEnum::RowExpr(r) => r.args.iter().any(child_has_sublink),
+        NodeEnum::AArrayExpr(a) => a.elements.iter().any(child_has_sublink),
+        NodeEnum::NullTest(n) => n.arg.as_deref().is_some_and(child_has_sublink),
+        NodeEnum::BooleanTest(b) => b.arg.as_deref().is_some_and(child_has_sublink),
+        NodeEnum::TypeCast(t) => t.arg.as_deref().is_some_and(child_has_sublink),
+        _ => false,
     }
 }
