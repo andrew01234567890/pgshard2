@@ -47,6 +47,45 @@ async fn reserves_disjoint_monotonic_blocks() {
 }
 
 #[tokio::test]
+async fn misconfigured_block_size_is_rejected_without_moving_next_id() {
+    let pg = Pg::start().await.expect("start postgres");
+    let admin = pg.connect().await.unwrap();
+    admin
+        .batch_execute(
+            "CREATE SCHEMA pgshard; \
+             CREATE TABLE pgshard.sequences ( \
+                 name text PRIMARY KEY, next_id bigint NOT NULL, block_size bigint NOT NULL); \
+             INSERT INTO pgshard.sequences VALUES ('bad', 500, -100);",
+        )
+        .await
+        .unwrap();
+
+    let reserver = PgBlockReserver::new(pg.connection_string());
+    tokio::task::spawn_blocking(move || {
+        // A non-positive block_size is rejected loudly, not used.
+        assert!(matches!(reserver.reserve("bad"), Err(SeqError::Backend(_))));
+    })
+    .await
+    .unwrap();
+
+    // Crucially, the rejected reservation must NOT have advanced (here, moved
+    // backward) next_id — otherwise a later repair to a valid block_size would
+    // hand out ids overlapping ones already reserved.
+    let row = admin
+        .query_one(
+            "SELECT next_id FROM pgshard.sequences WHERE name = 'bad'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, i64>(0),
+        500,
+        "a rejected reservation must leave next_id unchanged"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_reservations_never_overlap() {
     let pg = Pg::start().await.expect("start postgres");
     pg.connect()
