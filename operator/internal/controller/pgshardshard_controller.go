@@ -290,6 +290,14 @@ func (r *PgShardShardReconciler) ensurePVC(
 func (r *PgShardShardReconciler) pruneExcessInstances(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, candidates []corev1.Pod,
 ) error {
+	// Only scale down a fully-healthy shard. A promotion always drives the shard
+	// through a non-Ready phase (Degraded/Provisioning), so gating on Ready keeps
+	// pruning out of the window in which a candidate replica could be promoted
+	// after polling. A planned switchover's coordinated decommission is the
+	// failover controller's responsibility, not raced here.
+	if shard.Status.Phase != pgshardv1alpha1.ShardReady {
+		return nil
+	}
 	// candidates are exactly the pods aggregateStatus confirmed are ready
 	// replicas this reconcile, so a just-promoted, unpollable, foreign, or
 	// same-name-replacement pod is never deleted. PVCs are retained for data
@@ -535,7 +543,10 @@ func deriveShardStatus(
 	switch {
 	case primaries > 1:
 		return "", pgshardv1alpha1.ShardDegraded
-	case ready == int(replicas) && currentPrimary != "":
+	case ready >= int(replicas) && currentPrimary != "":
+		// >= not ==: an over-provisioned shard (extra ready pods pending a
+		// scale-down prune) is still healthy, and must reach Ready for pruning
+		// to run — otherwise it would be stuck Degraded forever.
 		return currentPrimary, pgshardv1alpha1.ShardReady
 	case ready == 0 && !hadPrimary:
 		// Initial bring-up: keep a uniquely-confirmed (but not-yet-ready)
