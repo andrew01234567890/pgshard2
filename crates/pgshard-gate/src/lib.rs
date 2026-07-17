@@ -19,6 +19,15 @@
 //! and check again", not "proceed". Callers therefore loop `check` until it
 //! returns `None`, so a session transitively waits for every gate that matches
 //! it. `Rejected` is terminal.
+//!
+//! Command-ordering contract: `close` is level-triggered (the topology asserts
+//! the gate set); the router applies those snapshots in topology-epoch order, so
+//! an already-opened gate is not resurrected by a reordered snapshot. An
+//! out-of-band admin `open` must be paired with the coordinator ceasing to
+//! assert that gate; if a stale `close` re-asserts a gate that was just opened,
+//! the effect is only re-buffering, which the absolute deadline resolves
+//! (fail-safe `Expired`) — never a lost write. Making the engine itself reject a
+//! stale re-close via per-command versioning is a deferred robustness item.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
