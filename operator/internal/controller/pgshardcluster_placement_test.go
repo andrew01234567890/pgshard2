@@ -19,6 +19,7 @@ package controller
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -104,6 +105,29 @@ var _ = Describe("PgShardCluster placement", func() {
 			Mode: pgshardv1alpha1.PlacementShared, ColocateWith: "absent",
 		}))).To(Succeed())
 		Expect(reconcile("orphan")).NotTo(Succeed())
+	})
+
+	It("plumbs the cluster's requested storage into the nodes it creates", func() {
+		cluster := newCluster("stor", nil)
+		cluster.Spec.Size = &pgshardv1alpha1.SizeSpec{
+			Overrides: &pgshardv1alpha1.SizeOverrides{
+				Storage: &pgshardv1alpha1.StorageSpec{Size: resource.MustParse("50Gi")},
+			},
+		}
+		cluster.Spec.System = &pgshardv1alpha1.SystemSpec{
+			Storage: &pgshardv1alpha1.StorageSpec{Size: resource.MustParse("5Gi")},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(reconcile("stor")).To(Succeed())
+
+		data, ok := getNode("stor-min-80")
+		Expect(ok).To(BeTrue())
+		Expect(data.Spec.Storage).NotTo(BeNil())
+		Expect(data.Spec.Storage.Size.String()).To(Equal("50Gi"), "data node uses the data storage")
+		system, ok := getNode("stor-system")
+		Expect(ok).To(BeTrue())
+		Expect(system.Spec.Storage).NotTo(BeNil())
+		Expect(system.Spec.Storage.Size.String()).To(Equal("5Gi"), "system node uses the system storage")
 	})
 
 	It("rejects changing placement (an online move, not yet supported)", func() {
