@@ -39,7 +39,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-use crate::{Endpoint, Route, Router, SharedRouter};
+use crate::{Endpoint, Route, Router, SharedRouter, Target};
 
 /// Credentials the router uses for its own backend connections, plus the name of
 /// the unsharded system database (not yet carried in the topology).
@@ -63,12 +63,13 @@ impl Proxy {
         Self { router, backend }
     }
 
-    async fn run_on(
+    /// Open a fresh backend connection, run `query`, and return its raw messages.
+    async fn connect_and_query(
         &self,
         endpoint: &Endpoint,
         database: &str,
         query: &str,
-    ) -> PgWireResult<Vec<Response>> {
+    ) -> PgWireResult<Vec<SimpleQueryMessage>> {
         let conn = format!(
             "host={} port={} user={} password={} dbname={}",
             endpoint.host, endpoint.port, self.backend.user, self.backend.password, database
@@ -81,7 +82,46 @@ impl Proxy {
         let result = client.simple_query(query).await.map_err(backend_error);
         drop(client);
         let _ = driver.await;
-        translate(query, result?)
+        result
+    }
+
+    async fn run_on(
+        &self,
+        endpoint: &Endpoint,
+        database: &str,
+        query: &str,
+    ) -> PgWireResult<Vec<Response>> {
+        let messages = self.connect_and_query(endpoint, database, query).await?;
+        translate(query, messages)
+    }
+
+    /// Fan a plain scatter read out to every shard concurrently and concatenate
+    /// the rows. Only valid when the read needs no ordering, limiting, grouping,
+    /// or aggregation (checked by the caller); ordered/aggregated scatters need
+    /// the merge engine and are rejected until it lands.
+    async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
+        let fetches = targets
+            .iter()
+            .map(|t| self.connect_and_query(&t.endpoint, &t.database, query));
+        let results = futures::future::join_all(fetches).await;
+
+        let mut schema = None;
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for result in results {
+            // First shard error fails the whole scatter — a partial result set
+            // would be silently wrong.
+            let (shard_schema, shard_rows, _) = extract(result?);
+            if schema.is_none() {
+                schema = shard_schema;
+            }
+            rows.extend(shard_rows);
+        }
+        match schema {
+            Some(schema) => Ok(vec![rows_response(schema, rows)?]),
+            // A scatter only comes from a SELECT, which always describes its
+            // columns; guard defensively rather than panic.
+            None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
+        }
     }
 }
 
@@ -165,9 +205,19 @@ impl Proxy {
             },
             Route::Reject { code, reason } => Err(user_error(code, reason)),
             Route::Unavailable(reason) => Err(user_error("57P01", reason)),
-            Route::Scatter(_) | Route::Broadcast(_) => Err(user_error(
+            // A plain scatter read (no ordering/limit/grouping/aggregation) is
+            // fanned out and concatenated; anything needing a real merge waits
+            // for the merge engine.
+            Route::Scatter(targets) if is_concatenable_scatter(query) => {
+                self.run_scatter(&targets, query).await
+            }
+            Route::Scatter(_) => Err(user_error(
                 "0A000",
-                "scatter and broadcast queries are not supported yet".to_owned(),
+                "ordered or aggregated scatter reads are not supported yet".to_owned(),
+            )),
+            Route::Broadcast(_) => Err(user_error(
+                "0A000",
+                "broadcast (multi-shard DDL) is not supported yet".to_owned(),
             )),
             Route::NeedsBind(_) => Err(user_error(
                 "0A000",
@@ -177,10 +227,11 @@ impl Proxy {
     }
 }
 
-/// Turn a backend `simple_query` result into wire responses. v1 forwards a single
-/// statement, so there is one result set: rows (a `QueryResponse`) or a command
-/// tag (an `Execution`).
-fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec<Response>> {
+type Extracted = (Option<Arc<Vec<FieldInfo>>>, Vec<Vec<Option<String>>>, u64);
+
+/// Pull the (text) schema, rows, and affected-row count out of a single
+/// statement's `simple_query` messages.
+fn extract(messages: Vec<SimpleQueryMessage>) -> Extracted {
     let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     let mut affected: u64 = 0;
@@ -212,20 +263,32 @@ fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec
             _ => {}
         }
     }
+    (schema, rows, affected)
+}
 
-    if let Some(schema) = schema {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let mut encoded = Vec::with_capacity(rows.len());
-        for row in &rows {
-            for value in row {
-                encoder.encode_field(&value.as_deref())?;
-            }
-            encoded.push(encoder.take_row());
+/// A row-returning response from a schema plus already-collected text rows.
+fn rows_response(
+    schema: Arc<Vec<FieldInfo>>,
+    rows: Vec<Vec<Option<String>>>,
+) -> PgWireResult<Response> {
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let mut encoded = Vec::with_capacity(rows.len());
+    for row in &rows {
+        for value in row {
+            encoder.encode_field(&value.as_deref())?;
         }
-        let row_stream = stream::iter(encoded.into_iter().map(Ok));
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema, row_stream,
-        ))])
+        encoded.push(encoder.take_row());
+    }
+    let row_stream = stream::iter(encoded.into_iter().map(Ok));
+    Ok(Response::Query(QueryResponse::new(schema, row_stream)))
+}
+
+/// Turn a single statement's messages into a wire response: rows (a
+/// `QueryResponse`) or a command tag (an `Execution`).
+fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec<Response>> {
+    let (schema, rows, affected) = extract(messages);
+    if let Some(schema) = schema {
+        Ok(vec![rows_response(schema, rows)?])
     } else {
         let command = command_tag(query);
         // Only INSERT carries the `oid rows` tag shape (`INSERT 0 n`); UPDATE and
@@ -236,6 +299,47 @@ fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec
             tag = tag.with_oid(0);
         }
         Ok(vec![Response::Execution(tag)])
+    }
+}
+
+/// Whether a scatter read can be answered by simply concatenating each shard's
+/// rows: a single `SELECT` with no `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY`,
+/// `DISTINCT`, and only plain column/`*` output (no aggregates or expressions).
+/// Anything else needs cross-shard sorting/limiting/aggregation — the merge
+/// engine — and is rejected for now.
+///
+/// This re-parses the query (the planner already parsed it once); the plan cache
+/// that avoids the double parse is a follow-up.
+fn is_concatenable_scatter(query: &str) -> bool {
+    let Ok(parsed) = pg_query::parse(query) else {
+        return false;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_slice() else {
+        return false;
+    };
+    let Some(pg_query::NodeEnum::SelectStmt(select)) =
+        stmt.stmt.as_ref().and_then(|n| n.node.as_ref())
+    else {
+        return false;
+    };
+    select.sort_clause.is_empty()
+        && select.group_clause.is_empty()
+        && select.distinct_clause.is_empty()
+        && !select.group_distinct
+        && select.limit_count.is_none()
+        && select.limit_offset.is_none()
+        && select.target_list.iter().all(is_plain_column_target)
+}
+
+/// A `ResTarget` whose value is a bare column reference (which also covers `*`),
+/// not an aggregate or expression.
+fn is_plain_column_target(node: &pg_query::protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(pg_query::NodeEnum::ResTarget(rt)) => matches!(
+            rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(pg_query::NodeEnum::ColumnRef(_))
+        ),
+        _ => false,
     }
 }
 
@@ -296,7 +400,7 @@ impl PgWireServerHandlers for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::command_tag;
+    use super::{command_tag, is_concatenable_scatter};
 
     #[test]
     fn command_tag_uses_the_leading_keyword() {
@@ -305,5 +409,26 @@ mod tests {
         assert_eq!(command_tag("begin;"), "BEGIN");
         assert_eq!(command_tag("CREATE(x"), "CREATE");
         assert_eq!(command_tag("   "), "OK");
+    }
+
+    #[test]
+    fn only_plain_selects_are_concatenable_scatters() {
+        // Plain projections (including *) concatenate correctly across shards.
+        assert!(is_concatenable_scatter("SELECT * FROM orders"));
+        assert!(is_concatenable_scatter(
+            "SELECT id, note FROM orders WHERE note = 'x'"
+        ));
+        // Anything that needs cross-shard combining does not.
+        assert!(!is_concatenable_scatter("SELECT * FROM orders ORDER BY id"));
+        assert!(!is_concatenable_scatter("SELECT * FROM orders LIMIT 10"));
+        assert!(!is_concatenable_scatter("SELECT * FROM orders OFFSET 5"));
+        assert!(!is_concatenable_scatter("SELECT count(*) FROM orders"));
+        assert!(!is_concatenable_scatter("SELECT DISTINCT note FROM orders"));
+        assert!(!is_concatenable_scatter(
+            "SELECT note FROM orders GROUP BY note"
+        ));
+        assert!(!is_concatenable_scatter("SELECT lower(note) FROM orders"));
+        // Not a single plain SELECT at all.
+        assert!(!is_concatenable_scatter("UPDATE orders SET note = 'x'"));
     }
 }

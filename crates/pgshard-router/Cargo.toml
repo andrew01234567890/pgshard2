@@ -11,6 +11,7 @@ arc-swap = "1.9.2"
 async-trait = "0.1.89"
 clap = { version = "4.6.2", features = ["derive", "env"] }
 futures = "0.3.32"
+pg_query = "6.1.1"
 pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 pgshard-plan = { version = "0.0.0", path = "../pgshard-plan" }
 pgshard-sql = { version = "0.0.0", path = "../pgshard-sql" }
