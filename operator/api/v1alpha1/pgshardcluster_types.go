@@ -243,6 +243,7 @@ type RestoredFrom struct {
 // struct with omitempty still serializes as {} (Go omits only empty basic
 // types), so a GET→Update round-trip would materialize the absent block and
 // trigger its defaults, silently mutating the spec.
+// +kubebuilder:validation:XValidation:rule="has(self.placement) == has(oldSelf.placement) && (!has(self.placement) || self.placement == oldSelf.placement)",message="placement is immutable; moving a database along the density/isolation spectrum requires an online move"
 type PgShardClusterSpec struct {
 	Postgres PostgresSpec `json:"postgres"`
 
