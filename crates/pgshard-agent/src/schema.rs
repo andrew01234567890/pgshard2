@@ -33,10 +33,17 @@ pub enum SchemaError {
     InFlight(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    InFlight,
+    Done,
+    Failed,
+}
+
 #[derive(Clone)]
 struct Op {
     sql: String,
-    done: bool,
+    state: State,
 }
 
 #[derive(Default)]
@@ -49,29 +56,39 @@ impl SchemaLog {
         Self::default()
     }
 
-    /// Reserve `id` for `sql`. A repeat of a completed identical statement
-    /// replays; a repeat while the first is still running is rejected; the same
-    /// id with different sql is rejected.
+    /// Reserve `id` for `sql`. The `sql` binding is kept for the id's whole
+    /// lifetime, so the same id with different sql is always rejected — even
+    /// after a failure. A completed identical statement replays; a duplicate
+    /// while the first is still running is rejected; a previously-failed
+    /// identical statement re-executes.
+    ///
+    /// `sql` must be a single statement (the operator parses and guarantees
+    /// this): a failed multi-statement batch that already committed part of its
+    /// work cannot be re-executed safely, and this log cannot detect a partial
+    /// commit.
     pub fn claim(&self, id: &str, sql: &str) -> Result<Claim, SchemaError> {
         if id.is_empty() {
             return Err(SchemaError::EmptyId);
         }
         let mut ops = self.ops.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(op) = ops.get(id) {
+        if let Some(op) = ops.get_mut(id) {
             if op.sql != sql {
                 return Err(SchemaError::DifferentSql(id.to_owned()));
             }
-            return if op.done {
-                Ok(Claim::Replay)
-            } else {
-                Err(SchemaError::InFlight(id.to_owned()))
+            return match op.state {
+                State::Done => Ok(Claim::Replay),
+                State::InFlight => Err(SchemaError::InFlight(id.to_owned())),
+                State::Failed => {
+                    op.state = State::InFlight;
+                    Ok(Claim::Execute)
+                }
             };
         }
         ops.insert(
             id.to_owned(),
             Op {
                 sql: sql.to_owned(),
-                done: false,
+                state: State::InFlight,
             },
         );
         Ok(Claim::Execute)
@@ -79,22 +96,25 @@ impl SchemaLog {
 
     /// Record that the claimed statement completed.
     pub fn mark_done(&self, id: &str) {
+        self.set_state(id, State::Done);
+    }
+
+    /// Record that the claimed statement failed, keeping the id's sql binding so
+    /// a same-sql retry re-executes while a different-sql reuse is still
+    /// rejected.
+    pub fn mark_failed(&self, id: &str) {
+        self.set_state(id, State::Failed);
+    }
+
+    fn set_state(&self, id: &str, state: State) {
         if let Some(op) = self
             .ops
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(id)
         {
-            op.done = true;
+            op.state = state;
         }
-    }
-
-    /// Release a claim whose statement failed, so a retry re-executes it.
-    pub fn rollback(&self, id: &str) {
-        self.ops
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
     }
 }
 
@@ -133,11 +153,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_op_re_executes_after_rollback() {
+    fn a_failed_op_retries_same_sql_but_still_rejects_different_sql() {
         let log = SchemaLog::new();
         assert_eq!(log.claim("op3", "SELECT 1"), Ok(Claim::Execute));
-        log.rollback("op3");
+        log.mark_failed("op3");
         // The retry re-executes rather than replaying a success that never happened.
         assert_eq!(log.claim("op3", "SELECT 1"), Ok(Claim::Execute));
+        log.mark_failed("op3");
+        // Reusing the id with different sql stays rejected even after a failure.
+        assert_eq!(
+            log.claim("op3", "SELECT 2"),
+            Err(SchemaError::DifferentSql("op3".into()))
+        );
     }
 }

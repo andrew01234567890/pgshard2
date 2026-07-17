@@ -262,6 +262,11 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     ) -> Result<Response<v1::DropSlotResponse>, Status> {
         Err(Status::unimplemented("drop_slot"))
     }
+    /// `req.sql` must be a single statement. The operator parses and guarantees
+    /// this; the agent has no parser. Idempotent retry is only safe for a single
+    /// statement — a multi-statement batch that commits part of its work before
+    /// failing cannot be re-executed cleanly, and neither the agent nor its
+    /// [`SchemaLog`](crate::schema::SchemaLog) can detect a partial commit.
     async fn exec_schema(
         &self,
         request: Request<v1::ExecSchemaRequest>,
@@ -277,10 +282,12 @@ impl<I: Instance> AgentService for AgentSvc<I> {
                     self.schema.mark_done(&req.operation_id);
                     Ok(Response::new(v1::ExecSchemaResponse {}))
                 }
-                // Release the claim so the operator's retry re-executes rather
-                // than replaying a success that never happened.
+                // Mark the claim failed (keeping its sql binding) so the
+                // operator's same-sql retry re-executes rather than replaying a
+                // success that never happened, while a different-sql reuse of the
+                // id stays rejected.
                 Err(e) => {
-                    self.schema.rollback(&req.operation_id);
+                    self.schema.mark_failed(&req.operation_id);
                     Err(internal(e))
                 }
             },
