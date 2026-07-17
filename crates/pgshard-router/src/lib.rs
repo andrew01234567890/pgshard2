@@ -18,6 +18,7 @@
 //! through the router). A shard with no current primary (mid-failover) resolves
 //! to [`Route::Unavailable`] rather than a wrong endpoint.
 
+pub mod sequence;
 pub mod wire;
 
 use std::collections::BTreeMap;
