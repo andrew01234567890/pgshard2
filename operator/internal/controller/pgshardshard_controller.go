@@ -103,6 +103,7 @@ func (r *PgShardShardReconciler) agentClient(host string, port int32) (pgshardv1
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards/finalizers,verbs=update
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardnodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -114,6 +115,15 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &shard); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// A placed shard is logical: its PgShardNode owns the pods, services, status,
+	// and failover — including fencing, which is a node-level action. This
+	// controller creates no physical objects for it and only mirrors the node's
+	// health so the cluster's shard counts keep working. Checked before fencing
+	// so a (meaningless) shard-level fence flag cannot wedge the status mirror.
+	if shard.Spec.NodeRef != "" {
+		return r.reconcileLogicalShard(ctx, &shard)
+	}
+
 	if shard.Spec.Fenced {
 		// Fencing is executed by agents (they keep PostgreSQL down); the
 		// controller stops mutating pods while frozen.
@@ -150,15 +160,60 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	interval := r.StatusPollInterval
-	if interval == 0 {
-		interval = 10 * time.Second
-	}
+	interval := r.pollInterval()
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
 func instanceName(shard *pgshardv1alpha1.PgShardShard, ordinal int32) string {
 	return fmt.Sprintf("%s-%d", shard.Name, ordinal)
+}
+
+// reconcileLogicalShard mirrors the placed shard's health from its node. The
+// node is the physical unit that owns the pods and runs failover; the shard's
+// status merely reflects it so the cluster's Ready/Degraded shard counts keep
+// working. A node that does not exist yet reads as provisioning, not degraded.
+func (r *PgShardShardReconciler) reconcileLogicalShard(
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
+) (ctrl.Result, error) {
+	before := shard.Status.DeepCopy()
+	var node pgshardv1alpha1.PgShardNode
+	switch err := r.Get(ctx,
+		client.ObjectKey{Namespace: shard.Namespace, Name: shard.Spec.NodeRef}, &node); {
+	case apierrors.IsNotFound(err):
+		shard.Status.Phase = pgshardv1alpha1.ShardProvisioning
+		shard.Status.CurrentPrimary = ""
+	case err != nil:
+		return ctrl.Result{}, err
+	default:
+		shard.Status.Phase = shardPhaseForNode(node.Status.Phase)
+		shard.Status.CurrentPrimary = node.Status.CurrentPrimary
+	}
+
+	interval := r.pollInterval()
+	if apiequality.Semantic.DeepEqual(before, &shard.Status) {
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	return ctrl.Result{RequeueAfter: interval}, client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+func (r *PgShardShardReconciler) pollInterval() time.Duration {
+	if r.StatusPollInterval == 0 {
+		return 10 * time.Second
+	}
+	return r.StatusPollInterval
+}
+
+func shardPhaseForNode(phase pgshardv1alpha1.NodePhase) pgshardv1alpha1.ShardPhase {
+	switch phase {
+	case pgshardv1alpha1.NodeReady:
+		return pgshardv1alpha1.ShardReady
+	case pgshardv1alpha1.NodeFailingOver:
+		return pgshardv1alpha1.ShardFailingOver
+	case pgshardv1alpha1.NodeDegraded:
+		return pgshardv1alpha1.ShardDegraded
+	default:
+		return pgshardv1alpha1.ShardProvisioning
+	}
 }
 
 func shardSelector(shard *pgshardv1alpha1.PgShardShard) map[string]string {

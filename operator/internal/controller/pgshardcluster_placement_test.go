@@ -51,30 +51,59 @@ var _ = Describe("PgShardCluster placement", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shard, Namespace: ns}, &s)).To(Succeed())
 		return s.Spec.NodeRef
 	}
+	getNode := func(name string) (pgshardv1alpha1.PgShardNode, bool) {
+		var n pgshardv1alpha1.PgShardNode
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &n)
+		return n, err == nil
+	}
 
-	It("dedicatedInstance (default) points each shard at its own node", func() {
+	It("dedicatedInstance (default) creates a node per shard and points each shard at it", func() {
 		Expect(k8sClient.Create(ctx, newCluster("dedi", nil))).To(Succeed())
 		Expect(reconcile("dedi")).To(Succeed())
 		for _, shard := range []string{"dedi-min-80", "dedi-80-max", "dedi-system"} {
-			Expect(nodeRefOf(shard)).To(Equal(shard), "each shard is placed on its own node")
+			node, ok := getNode(shard)
+			Expect(ok).To(BeTrue(), "node "+shard)
+			Expect(node.OwnerReferences).NotTo(BeEmpty(), "node is cluster-owned")
+			Expect(nodeRefOf(shard)).To(Equal(shard))
 		}
+		_, ok := getNode("dedi-shared")
+		Expect(ok).To(BeFalse(), "dedicated mode creates no shared node")
 	})
 
-	It("shared mode points every shard at one node", func() {
+	It("shared mode creates one node hosting every shard database", func() {
 		Expect(k8sClient.Create(ctx, newCluster("shar",
 			&pgshardv1alpha1.PlacementSpec{Mode: pgshardv1alpha1.PlacementShared}))).To(Succeed())
 		Expect(reconcile("shar")).To(Succeed())
+		_, ok := getNode("shar-shared")
+		Expect(ok).To(BeTrue())
+		_, perShard := getNode("shar-min-80")
+		Expect(perShard).To(BeFalse(), "shared mode creates no per-shard node")
 		for _, shard := range []string{"shar-min-80", "shar-80-max", "shar-system"} {
 			Expect(nodeRefOf(shard)).To(Equal("shar-shared"))
 		}
 	})
 
-	It("colocateWith points shards at another cluster's shared node", func() {
+	It("colocateWith reuses another cluster's shared node and creates none of its own", func() {
+		Expect(k8sClient.Create(ctx, newCluster("host",
+			&pgshardv1alpha1.PlacementSpec{Mode: pgshardv1alpha1.PlacementShared}))).To(Succeed())
+		Expect(reconcile("host")).To(Succeed())
+		_, ok := getNode("host-shared")
+		Expect(ok).To(BeTrue())
+
 		Expect(k8sClient.Create(ctx, newCluster("guest", &pgshardv1alpha1.PlacementSpec{
 			Mode: pgshardv1alpha1.PlacementShared, ColocateWith: "host",
 		}))).To(Succeed())
 		Expect(reconcile("guest")).To(Succeed())
+		_, own := getNode("guest-shared")
+		Expect(own).To(BeFalse(), "guest owns no node; it reuses host's")
 		Expect(nodeRefOf("guest-min-80")).To(Equal("host-shared"))
+	})
+
+	It("colocateWith errors until the target's shared node exists", func() {
+		Expect(k8sClient.Create(ctx, newCluster("orphan", &pgshardv1alpha1.PlacementSpec{
+			Mode: pgshardv1alpha1.PlacementShared, ColocateWith: "absent",
+		}))).To(Succeed())
+		Expect(reconcile("orphan")).NotTo(Succeed())
 	})
 
 	It("rejects changing placement (an online move, not yet supported)", func() {
