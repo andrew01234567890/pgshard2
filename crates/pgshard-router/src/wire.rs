@@ -24,6 +24,7 @@
 //! raw-protocol backend (which also streams rather than buffering rows) is the
 //! planned replacement.
 
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -95,11 +96,15 @@ impl Proxy {
         translate(query, messages)
     }
 
-    /// Fan a plain scatter read out to every shard concurrently and concatenate
-    /// the rows. Only valid when the read needs no ordering, limiting, grouping,
-    /// or aggregation (checked by the caller); ordered/aggregated scatters need
-    /// the merge engine and are rejected until it lands.
-    async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
+    /// Fan a scatter read out to every shard concurrently, concatenate the rows,
+    /// and byte-order merge by `sort` when the read is `ORDER BY`ed. The caller
+    /// has already checked the query is a mergeable shape.
+    async fn run_scatter(
+        &self,
+        targets: &[Target],
+        query: &str,
+        sort: &[SortKey],
+    ) -> PgWireResult<Vec<Response>> {
         let fetches = targets
             .iter()
             .map(|t| self.connect_and_query(&t.endpoint, &t.database, query));
@@ -128,11 +133,82 @@ impl Proxy {
             }
             rows.extend(shard_rows);
         }
-        match schema {
-            Some(schema) => Ok(vec![rows_response(schema, rows)?]),
+        let Some(schema) = schema else {
             // A scatter only comes from a SELECT, which always describes its
             // columns; guard defensively rather than panic.
-            None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
+            return Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]);
+        };
+        if !sort.is_empty() {
+            merge_sort(&schema, &mut rows, sort)?;
+        }
+        Ok(vec![rows_response(schema, rows)?])
+    }
+}
+
+/// Byte-order merge the concatenated `rows` in place by `keys`, resolved against
+/// `schema`. An ORDER BY column that is not in the output is an error.
+fn merge_sort(
+    schema: &[FieldInfo],
+    rows: &mut [Vec<Option<String>>],
+    keys: &[SortKey],
+) -> PgWireResult<()> {
+    let resolved: Vec<(usize, bool, bool)> = keys
+        .iter()
+        .map(|k| {
+            let index = match &k.column {
+                SortColumn::Position(p) => p.checked_sub(1).filter(|&i| i < schema.len()),
+                SortColumn::Name(name) => schema.iter().position(|f| f.name() == name),
+            }
+            .ok_or_else(|| {
+                user_error(
+                    "42703",
+                    "ORDER BY refers to a column not in the output".to_owned(),
+                )
+            })?;
+            Ok((index, k.descending, k.nulls_first))
+        })
+        .collect::<PgWireResult<_>>()?;
+
+    rows.sort_by(|a, b| {
+        for &(index, descending, nulls_first) in &resolved {
+            let cell = |row: &[Option<String>]| row.get(index).and_then(|v| v.clone());
+            let ord = cmp_cells(
+                cell(a).as_deref(),
+                cell(b).as_deref(),
+                descending,
+                nulls_first,
+            );
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    Ok(())
+}
+
+/// Compare two text cells: nulls sort first or last independent of direction,
+/// present values compare by byte order, reversed when descending.
+fn cmp_cells(a: Option<&str>, b: Option<&str>, descending: bool, nulls_first: bool) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(x), Some(y)) => {
+            let ord = x.as_bytes().cmp(y.as_bytes());
+            if descending { ord.reverse() } else { ord }
         }
     }
 }
@@ -217,16 +293,18 @@ impl Proxy {
             },
             Route::Reject { code, reason } => Err(user_error(code, reason)),
             Route::Unavailable(reason) => Err(user_error("57P01", reason)),
-            // A plain scatter read (no ordering/limit/grouping/aggregation) is
-            // fanned out and concatenated; anything needing a real merge waits
+            // A scatter read is fanned out and concatenated, optionally byte-order
+            // merged for ORDER BY; anything needing limit/aggregate merging waits
             // for the merge engine.
-            Route::Scatter(targets) if is_concatenable_scatter(query) => {
-                self.run_scatter(&targets, query).await
-            }
-            Route::Scatter(_) => Err(user_error(
-                "0A000",
-                "ordered or aggregated scatter reads are not supported yet".to_owned(),
-            )),
+            Route::Scatter(targets) => match scatter_plan(query) {
+                ScatterPlan::Concat => self.run_scatter(&targets, query, &[]).await,
+                ScatterPlan::Sorted(keys) => self.run_scatter(&targets, query, &keys).await,
+                ScatterPlan::Unsupported => Err(user_error(
+                    "0A000",
+                    "this scatter read needs limit or aggregate merging, which is not supported yet"
+                        .to_owned(),
+                )),
+            },
             Route::Broadcast(_) => Err(user_error(
                 "0A000",
                 "broadcast (multi-shard DDL) is not supported yet".to_owned(),
@@ -319,47 +397,88 @@ fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec
     }
 }
 
-/// Whether a scatter read can be answered by simply concatenating each shard's
-/// rows: a single `SELECT` with no `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY`,
-/// `DISTINCT`, and only plain column/`*` output (no aggregates or expressions).
-/// Anything else needs cross-shard sorting/limiting/aggregation — the merge
-/// engine — and is rejected for now.
+/// How a scatter read is combined across shards.
+#[derive(Debug, PartialEq, Eq)]
+enum ScatterPlan {
+    /// Concatenate each shard's rows in any order.
+    Concat,
+    /// Byte-order merge each shard's rows by these keys after concatenation.
+    Sorted(Vec<SortKey>),
+    /// Needs limiting or aggregation the executor does not do yet — reject.
+    Unsupported,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SortKey {
+    column: SortColumn,
+    descending: bool,
+    nulls_first: bool,
+}
+
+/// An ORDER BY item that resolves to an output column.
+#[derive(Debug, PartialEq, Eq)]
+enum SortColumn {
+    /// By name (`ORDER BY note`).
+    Name(String),
+    /// By 1-based output position (`ORDER BY 2`).
+    Position(usize),
+}
+
+/// Classify a scatter read: concatenate, byte-order merge by ORDER BY columns,
+/// or reject as needing the (not-yet-built) limit/aggregate merge engine. Only a
+/// single plain single-table projection is mergeable — a set operation, a `WITH`
+/// (which can shadow a sharded table so each shard re-evaluates the CTE and
+/// duplicates rows), locking, `INTO`, `GROUP BY`, `DISTINCT`, `LIMIT`/`OFFSET`,
+/// or non-column output all reject.
 ///
-/// This re-parses the query (the planner already parsed it once); the plan cache
-/// that avoids the double parse is a follow-up.
-fn is_concatenable_scatter(query: &str) -> bool {
+/// Re-parses the query (a plan cache is a follow-up). M1 caveat: text ORDER BY is
+/// merged by byte order, not the column's collation, so a non-ASCII ordering may
+/// differ from a single PostgreSQL's (a documented plan limitation).
+fn scatter_plan(query: &str) -> ScatterPlan {
     let Ok(parsed) = pg_query::parse(query) else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
     let [stmt] = parsed.protobuf.stmts.as_slice() else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
     let Some(pg_query::NodeEnum::SelectStmt(select)) =
         stmt.stmt.as_ref().and_then(|n| n.node.as_ref())
     else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
-    // These checks make the guard self-sufficient rather than trusting the
-    // planner to have filtered every unsafe shape upstream:
-    // - a set operation (UNION/…) keeps its operands in larg/rarg with an empty
-    //   target_list and needs real merging;
-    // - a WITH clause can shadow a sharded table name, so each shard would
-    //   re-evaluate the CTE and the rows would be duplicated on concatenation;
-    // - a locking clause (FOR UPDATE/SHARE) cannot be honored across ephemeral
-    //   per-shard connections;
-    // - SELECT ... INTO is a write.
-    select.op == pg_query::protobuf::SetOperation::SetopNone as i32
+    let plain = select.op == pg_query::protobuf::SetOperation::SetopNone as i32
         && select.with_clause.is_none()
         && select.into_clause.is_none()
         && select.locking_clause.is_empty()
-        && select.sort_clause.is_empty()
         && select.group_clause.is_empty()
         && select.distinct_clause.is_empty()
         && !select.group_distinct
         && select.limit_count.is_none()
         && select.limit_offset.is_none()
         && !select.target_list.is_empty()
-        && select.target_list.iter().all(is_plain_column_target)
+        && select.target_list.iter().all(is_plain_column_target);
+    if !plain {
+        return ScatterPlan::Unsupported;
+    }
+    if select.sort_clause.is_empty() {
+        return ScatterPlan::Concat;
+    }
+    let mut keys = Vec::with_capacity(select.sort_clause.len());
+    for node in &select.sort_clause {
+        let Some(pg_query::NodeEnum::SortBy(sb)) = node.node.as_ref() else {
+            return ScatterPlan::Unsupported;
+        };
+        let Some(column) = sort_column(sb) else {
+            return ScatterPlan::Unsupported;
+        };
+        let descending = sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyDesc as i32;
+        keys.push(SortKey {
+            column,
+            descending,
+            nulls_first: nulls_first(sb, descending),
+        });
+    }
+    ScatterPlan::Sorted(keys)
 }
 
 /// A `ResTarget` whose value is a bare column reference (which also covers `*`),
@@ -371,6 +490,36 @@ fn is_plain_column_target(node: &pg_query::protobuf::Node) -> bool {
             Some(pg_query::NodeEnum::ColumnRef(_))
         ),
         _ => false,
+    }
+}
+
+/// The output column an ORDER BY item names, or `None` for an expression the
+/// executor cannot resolve to a single output column.
+fn sort_column(sb: &pg_query::protobuf::SortBy) -> Option<SortColumn> {
+    match sb.node.as_deref().and_then(|n| n.node.as_ref())? {
+        pg_query::NodeEnum::ColumnRef(cr) => {
+            match cr.fields.last().and_then(|f| f.node.as_ref())? {
+                pg_query::NodeEnum::String(s) => Some(SortColumn::Name(s.sval.clone())),
+                _ => None,
+            }
+        }
+        pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Ival(i) if i.ival >= 1 => {
+                Some(SortColumn::Position(i.ival as usize))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// PostgreSQL's default null ordering — NULLS LAST for ascending, NULLS FIRST for
+/// descending — unless the query states it explicitly.
+fn nulls_first(sb: &pg_query::protobuf::SortBy, descending: bool) -> bool {
+    match sb.sortby_nulls {
+        x if x == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32 => true,
+        x if x == pg_query::protobuf::SortByNulls::SortbyNullsLast as i32 => false,
+        _ => descending,
     }
 }
 
@@ -431,7 +580,8 @@ impl PgWireServerHandlers for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_tag, is_concatenable_scatter};
+    use super::{ScatterPlan, SortColumn, SortKey, cmp_cells, command_tag, scatter_plan};
+    use std::cmp::Ordering;
 
     #[test]
     fn command_tag_uses_the_leading_keyword() {
@@ -443,32 +593,66 @@ mod tests {
     }
 
     #[test]
-    fn only_plain_selects_are_concatenable_scatters() {
-        // Plain projections (including *) concatenate correctly across shards.
-        assert!(is_concatenable_scatter("SELECT * FROM orders"));
-        assert!(is_concatenable_scatter(
-            "SELECT id, note FROM orders WHERE note = 'x'"
-        ));
-        // Anything that needs cross-shard combining does not.
-        assert!(!is_concatenable_scatter("SELECT * FROM orders ORDER BY id"));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders LIMIT 10"));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders OFFSET 5"));
-        assert!(!is_concatenable_scatter("SELECT count(*) FROM orders"));
-        assert!(!is_concatenable_scatter("SELECT DISTINCT note FROM orders"));
-        assert!(!is_concatenable_scatter(
-            "SELECT note FROM orders GROUP BY note"
-        ));
-        assert!(!is_concatenable_scatter("SELECT lower(note) FROM orders"));
-        // A WITH clause can shadow a table name (each shard re-evaluates the CTE),
-        // and FOR UPDATE/SHARE cannot be honored across per-shard connections.
-        assert!(!is_concatenable_scatter(
-            "WITH orders AS (VALUES (1)) SELECT * FROM orders"
-        ));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders FOR UPDATE"));
-        assert!(!is_concatenable_scatter(
-            "SELECT * FROM orders UNION SELECT * FROM orders"
-        ));
-        // Not a single plain SELECT at all.
-        assert!(!is_concatenable_scatter("UPDATE orders SET note = 'x'"));
+    fn plain_projections_concatenate() {
+        assert_eq!(scatter_plan("SELECT * FROM orders"), ScatterPlan::Concat);
+        assert_eq!(
+            scatter_plan("SELECT id, note FROM orders WHERE note = 'x'"),
+            ScatterPlan::Concat
+        );
+    }
+
+    #[test]
+    fn order_by_columns_and_positions_become_sort_keys() {
+        assert_eq!(
+            scatter_plan("SELECT id, note FROM orders ORDER BY note DESC, 1 ASC NULLS LAST"),
+            ScatterPlan::Sorted(vec![
+                SortKey {
+                    column: SortColumn::Name("note".into()),
+                    descending: true,
+                    nulls_first: true, // DESC default is NULLS FIRST
+                },
+                SortKey {
+                    column: SortColumn::Position(1),
+                    descending: false,
+                    nulls_first: false, // explicit NULLS LAST
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn merges_that_need_more_than_sorting_are_unsupported() {
+        for sql in [
+            "SELECT * FROM orders LIMIT 10",
+            "SELECT * FROM orders OFFSET 5",
+            "SELECT * FROM orders ORDER BY id LIMIT 10",
+            "SELECT count(*) FROM orders",
+            "SELECT DISTINCT note FROM orders",
+            "SELECT note FROM orders GROUP BY note",
+            "SELECT lower(note) FROM orders",
+            "SELECT * FROM orders ORDER BY lower(note)", // expression sort key
+            "WITH orders AS (VALUES (1)) SELECT * FROM orders",
+            "SELECT * FROM orders FOR UPDATE",
+            "SELECT * FROM orders UNION SELECT * FROM orders",
+            "UPDATE orders SET note = 'x'",
+        ] {
+            assert_eq!(scatter_plan(sql), ScatterPlan::Unsupported, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cmp_cells_orders_nulls_and_direction_like_postgres() {
+        // Ascending byte order; descending reverses present values.
+        assert_eq!(
+            cmp_cells(Some("a"), Some("b"), false, false),
+            Ordering::Less
+        );
+        assert_eq!(cmp_cells(Some("b"), Some("a"), true, false), Ordering::Less);
+        // NULLS LAST (ascending default): a present value sorts before NULL.
+        assert_eq!(cmp_cells(Some("a"), None, false, false), Ordering::Less);
+        assert_eq!(cmp_cells(None, Some("a"), false, false), Ordering::Greater);
+        // NULLS FIRST: NULL sorts before a present value, regardless of direction.
+        assert_eq!(cmp_cells(None, Some("a"), true, true), Ordering::Less);
+        assert_eq!(cmp_cells(None, None, false, false), Ordering::Equal);
     }
 }

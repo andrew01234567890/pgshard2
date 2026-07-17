@@ -180,11 +180,12 @@ fn two_shard_topology(host: &str, port: u16) -> Topology {
 async fn scatter_reads_concatenate_rows_from_every_shard() {
     let pg = Pg::start().await.expect("start postgres");
 
-    // Two shard databases on the one node, each seeded with one row.
+    // Two shard databases on the one node, seeded with interleaving values so a
+    // correct ORDER BY must merge across shards, not just concatenate.
     let admin = pg.connect().await.unwrap();
     admin.batch_execute("CREATE DATABASE sh0").await.unwrap();
     admin.batch_execute("CREATE DATABASE sh1").await.unwrap();
-    for (db, note) in [("sh0", "from-sh0"), ("sh1", "from-sh1")] {
+    for (db, notes) in [("sh0", ["b", "d"]), ("sh1", ["a", "c"])] {
         let conn = format!(
             "host={} port={} user=postgres password=postgres dbname={db}",
             pg.host(),
@@ -197,12 +198,14 @@ async fn scatter_reads_concatenate_rows_from_every_shard() {
         c.batch_execute("CREATE TABLE orders (customer_id int, note text)")
             .await
             .unwrap();
-        c.execute(
-            "INSERT INTO orders (customer_id, note) VALUES (1, $1)",
-            &[&note],
-        )
-        .await
-        .unwrap();
+        for note in notes {
+            c.execute(
+                "INSERT INTO orders (customer_id, note) VALUES (1, $1)",
+                &[&note],
+            )
+            .await
+            .unwrap();
+        }
     }
 
     let router =
@@ -221,24 +224,43 @@ async fn scatter_reads_concatenate_rows_from_every_shard() {
         .unwrap();
     tokio::spawn(connection);
 
-    // A keyless read scatters to both shards and returns both rows.
+    let notes = |rows: &[tokio_postgres::SimpleQueryMessage]| -> Vec<String> {
+        rows.iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    Some(r.get("note").unwrap().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A keyless read scatters to both shards and returns all four rows.
     let rows = client
         .simple_query("SELECT note FROM orders")
         .await
         .unwrap();
-    let mut notes: Vec<String> = rows
-        .iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r.get("note").unwrap().to_owned()),
-            _ => None,
-        })
-        .collect();
-    notes.sort();
-    assert_eq!(notes, vec!["from-sh0".to_string(), "from-sh1".to_string()]);
+    let mut got = notes(&rows);
+    got.sort();
+    assert_eq!(got, vec!["a", "b", "c", "d"]);
 
-    // A scatter that needs a real merge is rejected, not mis-answered.
-    let err = client
+    // ORDER BY is merged across shards: the interleaved values come back sorted.
+    let rows = client
         .simple_query("SELECT note FROM orders ORDER BY note")
+        .await
+        .unwrap();
+    assert_eq!(notes(&rows), vec!["a", "b", "c", "d"]);
+    // Descending too.
+    let rows = client
+        .simple_query("SELECT note FROM orders ORDER BY note DESC")
+        .await
+        .unwrap();
+    assert_eq!(notes(&rows), vec!["d", "c", "b", "a"]);
+
+    // A scatter that still needs limit/aggregate merging is rejected, not
+    // mis-answered.
+    let err = client
+        .simple_query("SELECT note FROM orders ORDER BY note LIMIT 2")
         .await
         .unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
