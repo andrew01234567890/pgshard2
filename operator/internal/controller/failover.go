@@ -247,3 +247,54 @@ func hostByPod(views []instanceView, pod string) string {
 	}
 	return ""
 }
+
+// reconcileFailover runs the target/current handshake for one node. It is the
+// node counterpart of the shard handshake above and shares the same pure
+// election (evaluateFailover): a node fails over as a unit, so the same
+// commit-epoch-before-promote, sticky-target, and no-laggard guards apply.
+func (r *PgShardNodeReconciler) reconcileFailover(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, views []instanceView,
+) error {
+	log := logf.FromContext(ctx)
+	decision := evaluateFailover(views, node.Status.TargetPrimary)
+
+	if !decision.warranted || decision.wait {
+		// A confirmed ready primary means any in-flight failover completed: drop
+		// the commitment so a later failure of THIS primary elects afresh instead
+		// of parking forever on the now-stale target.
+		if !decision.warranted && node.Status.CurrentPrimary != "" && node.Status.TargetPrimary != "" {
+			node.Status.TargetPrimary = ""
+		}
+		return nil
+	}
+
+	// Commit the election durably (epoch bump = the fencing token) BEFORE
+	// instructing any agent, so a crash cannot leave the persisted epoch below
+	// one an agent already applied. The Promote is driven next reconcile.
+	if node.Status.TargetPrimary != decision.targetPrimary {
+		node.Status.DecisionEpoch++
+		node.Status.TargetPrimary = decision.targetPrimary
+		node.Status.Phase = pgshardv1alpha1.NodeFailingOver
+		log.Info("electing new primary", "node", node.Name,
+			"target", decision.targetPrimary, "epoch", node.Status.DecisionEpoch)
+		return nil
+	}
+
+	// Target and epoch are durable; drive the idempotent, epoch-guarded promote.
+	node.Status.Phase = pgshardv1alpha1.NodeFailingOver
+	host := hostByPod(views, decision.targetPrimary)
+	if host == "" {
+		return nil // target has no reachable address yet; retry next poll
+	}
+	agent, err := r.agentClient(host, agentPort)
+	if err != nil {
+		return err
+	}
+	if _, err := agent.Promote(ctx, &pgshardv1.PromoteRequest{
+		TargetPrimary: decision.targetPrimary,
+		DecisionEpoch: uint64(node.Status.DecisionEpoch),
+	}); err != nil {
+		return err
+	}
+	return nil
+}
