@@ -221,3 +221,23 @@ func TestExactlyOneSelectorRequired(t *testing.T) {
 		t.Fatal("target with two selectors must be rejected")
 	}
 }
+
+func TestSharedTopologyStanzaIsRejected(t *testing.T) {
+	catalog := driftCatalog()
+	// Two distinct shards of gen1 pointed at one stanza: restoring one physical
+	// backup as two keyranges. Keep plan<->topology stanzas consistent so only
+	// the topology's own duplicate-stanza check can catch it.
+	catalog.Topologies[0].Shards[1].Stanza = stanzaA
+	catalog.Backups[0].Shards[1].Stanza = stanzaA
+	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+		t.Fatal("topology mapping two shards to one stanza must be rejected")
+	}
+}
+
+func TestDuplicateManifestIDIsRejected(t *testing.T) {
+	catalog := driftCatalog()
+	catalog.Backups = append(catalog.Backups, catalog.Backups[0])
+	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+		t.Fatal("two backup manifests sharing an id must be rejected as ambiguous")
+	}
+}

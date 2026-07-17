@@ -30,7 +30,10 @@ type ShardPlan struct {
 	// the requested time can fall after a failover that branched a new
 	// timeline, so following the survivor lineage is the only safe choice —
 	// pinning the base backup's timeline would recover the abandoned
-	// pre-failover branch and silently under-restore.
+	// pre-failover branch and silently under-restore. "latest" == highest
+	// timeline is the survivor only because fencing stops a deposed primary
+	// from advancing an abandoned sibling timeline, and each restore lands on
+	// a fresh stanza, so a stanza's timelines form one linear failover chain.
 	TargetTimeline string
 }
 
@@ -181,21 +184,37 @@ func planFromBackup(catalog Catalog, backup BackupManifest) (RestorePlan, error)
 }
 
 func findBarrier(catalog Catalog, id string) (BarrierManifest, error) {
-	for _, barrier := range catalog.Barriers {
-		if barrier.ID == id {
-			return barrier, nil
+	var found *BarrierManifest
+	for i := range catalog.Barriers {
+		if catalog.Barriers[i].ID != id {
+			continue
 		}
+		if found != nil {
+			return BarrierManifest{}, errf("barrier %s is ambiguous: multiple manifests share the id", id)
+		}
+		found = &catalog.Barriers[i]
 	}
-	return BarrierManifest{}, errf("barrier %s not found", id)
+	if found == nil {
+		return BarrierManifest{}, errf("barrier %s not found", id)
+	}
+	return *found, nil
 }
 
 func findBackup(catalog Catalog, id string) (BackupManifest, error) {
-	for _, backup := range catalog.Backups {
-		if backup.ID == id {
-			return backup, nil
+	var found *BackupManifest
+	for i := range catalog.Backups {
+		if catalog.Backups[i].ID != id {
+			continue
 		}
+		if found != nil {
+			return BackupManifest{}, errf("backup %s is ambiguous: multiple manifests share the id", id)
+		}
+		found = &catalog.Backups[i]
 	}
-	return BackupManifest{}, errf("backup %s not found", id)
+	if found == nil {
+		return BackupManifest{}, errf("backup %s not found", id)
+	}
+	return *found, nil
 }
 
 func topologyByGeneration(catalog Catalog, generation int64) (TopologySnapshot, error) {
@@ -263,12 +282,24 @@ func sanity(plan RestorePlan) error {
 			len(plan.Shards), plan.Topology.Generation, len(plan.Topology.Shards))
 	}
 	topoStanza := make(map[string]string, len(plan.Topology.Shards))
+	stanzaOwner := make(map[string]string, len(plan.Topology.Shards))
 	for _, s := range plan.Topology.Shards {
+		if s.Stanza == "" {
+			return errf("topology generation %d shard %s has no stanza",
+				plan.Topology.Generation, s.Name)
+		}
 		if _, dup := topoStanza[s.Name]; dup {
 			return errf("topology generation %d lists shard %s twice",
 				plan.Topology.Generation, s.Name)
 		}
+		// Each shard is a distinct physical stanza; two shards sharing one
+		// would restore a single backup as two keyranges.
+		if other, dup := stanzaOwner[s.Stanza]; dup {
+			return errf("topology generation %d maps shards %s and %s to the same stanza %q",
+				plan.Topology.Generation, other, s.Name, s.Stanza)
+		}
 		topoStanza[s.Name] = s.Stanza
+		stanzaOwner[s.Stanza] = s.Name
 	}
 	planned := map[string]bool{}
 	for _, p := range plan.Shards {
@@ -284,9 +315,6 @@ func sanity(plan RestorePlan) error {
 		if p.Stanza != stanza {
 			return errf("shard %s planned from stanza %q but topology generation %d records %q",
 				p.Shard, p.Stanza, plan.Topology.Generation, stanza)
-		}
-		if p.Stanza == "" {
-			return errf("shard %s has no stanza", p.Shard)
 		}
 		if p.Set == "" {
 			return errf("shard %s has no backup set", p.Shard)
