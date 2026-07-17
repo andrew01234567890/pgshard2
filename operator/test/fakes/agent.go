@@ -306,6 +306,11 @@ func (f *FakeAgent) CreateDatabase(
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "database name is required")
 	}
+	// Mirror the real agent's NAMEDATALEN-1 limit so tests can exercise the
+	// controller's terminal-error handling.
+	if len(req.Name) > 63 || len(req.Owner) > 63 {
+		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
+	}
 	if _, ok := f.databases[req.Name]; !ok {
 		f.databases[req.Name] = req.Owner
 	}

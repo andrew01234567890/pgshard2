@@ -221,6 +221,12 @@ type PgShardShardStatus struct {
 	// +optional
 	CurrentPrimary string `json:"currentPrimary,omitempty"`
 
+	// DatabaseNode names the PgShardNode this shard's Postgres database was last
+	// provisioned on. It scopes the DatabaseReady condition to a node identity so
+	// a moved or replaced node re-provisions instead of trusting a stale latch.
+	// +optional
+	DatabaseNode string `json:"databaseNode,omitempty"`
+
 	// +optional
 	TargetPrimary string `json:"targetPrimary,omitempty"`
 
