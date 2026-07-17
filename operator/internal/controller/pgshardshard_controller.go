@@ -511,11 +511,8 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	shard.Status.CurrentPrimary, shard.Status.Phase =
 		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
 
-	// A healthy primary clears any prior failover marker; otherwise drive the
-	// target/current-primary handshake and elect+promote a replacement.
-	if shard.Status.CurrentPrimary != "" && shard.Status.TargetPrimary == PendingFailoverMarker {
-		shard.Status.TargetPrimary = shard.Status.CurrentPrimary
-	}
+	// Drive the target/current-primary handshake: track the healthy primary, or
+	// elect and promote a replacement when it is gone.
 	if err := r.reconcileFailover(ctx, shard, views); err != nil {
 		return nil, err
 	}

@@ -29,6 +29,12 @@ import (
 	"github.com/andrew01234567890/pgshard2/operator/test/fakes"
 )
 
+const (
+	testPostgresImage = "pg:test"
+	testAgentImage    = "agent:test"
+	primaryPodIP      = "127.0.0.2"
+)
+
 var _ = Describe("PgShardShard failover", func() {
 	const ns = "default"
 
@@ -53,7 +59,7 @@ var _ = Describe("PgShardShard failover", func() {
 		// synthetic addresses to the three fakes.
 		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
 			switch host {
-			case "127.0.0.2":
+			case primaryPodIP:
 				return primaryAgent.Client()
 			case "127.0.0.3":
 				return laggingAgent.Client()
@@ -64,7 +70,7 @@ var _ = Describe("PgShardShard failover", func() {
 		r := &PgShardShardReconciler{
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
-			Images:    ShardImages{Postgres: "pg:test", Agent: "agent:test"},
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
 			dialAgent: dial,
 		}
 
@@ -90,9 +96,9 @@ var _ = Describe("PgShardShard failover", func() {
 
 		// First reconcile creates the pods.
 		reconcile()
-		stampPodIP("fo-0", ns, "127.0.0.2")
-		stampPodIP("fo-1", ns, "127.0.0.3")
-		stampPodIP("fo-2", ns, "127.0.0.4")
+		stampPodIP("fo-0", primaryPodIP)
+		stampPodIP("fo-1", "127.0.0.3")
+		stampPodIP("fo-2", "127.0.0.4")
 		laggingAgent.SetReceivedLSN(300)
 		advancedAgent.SetReceivedLSN(500) // most advanced -> should be elected
 
@@ -132,9 +138,92 @@ var _ = Describe("PgShardShard failover", func() {
 
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
+
+	It("does not promote when the primary is merely unreachable, and recovers when it returns", func() {
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		replicaAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(replicaAgent.Stop)
+
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		replicaAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return primaryAgent.Client()
+			}
+			return replicaAgent.Client()
+		}
+		r := &PgShardShardReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		const shardName = "blip"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: shardName, Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardShard {
+			var got pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardName, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("blip-0", primaryPodIP)
+		stampPodIP("blip-1", "127.0.0.3")
+
+		// Healthy: primary recorded and tracked as the target.
+		reconcile()
+		Expect(get().Status.CurrentPrimary).To(Equal("blip-0"))
+		Expect(get().Status.TargetPrimary).To(Equal("blip-0"))
+
+		// The primary's agent becomes unreachable (its pod stays present) — a
+		// transient partition, NOT a demotion. No replica may be promoted.
+		primaryAgent.Stop()
+		reconcile()
+		blipped := get()
+		Expect(blipped.Status.CurrentPrimary).To(BeEmpty()) // -rw withheld (fail-safe)
+		Expect(blipped.Status.TargetPrimary).To(Equal("blip-0"))
+		Expect(blipped.Status.Phase).To(Equal(pgshardv1alpha1.ShardFailingOver))
+		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0)))
+
+		// The primary returns; the shard recovers without ever failing over.
+		recovered, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(recovered.Stop)
+		recovered.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		r.dialAgent = func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return recovered.Client()
+			}
+			return replicaAgent.Client()
+		}
+		reconcile()
+		back := get()
+		Expect(back.Status.CurrentPrimary).To(Equal("blip-0"))
+		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0)))
+
+		Expect(k8sClient.Delete(ctx, &back)).To(Succeed())
+	})
 })
 
-func stampPodIP(name, ns, ip string) {
+func stampPodIP(name, ip string) {
+	const ns = "default"
 	var pod corev1.Pod
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &pod)).To(Succeed())
 	pod.Status.PodIP = ip
