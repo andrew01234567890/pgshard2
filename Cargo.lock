@@ -2036,10 +2036,12 @@ dependencies = [
  "pg_query",
  "pgshard-core",
  "pgshard-plan",
+ "pgshard-seq",
  "pgshard-sql",
  "pgshard-testutil",
  "pgshard-topo",
  "pgwire",
+ "postgres",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -2174,6 +2176,20 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "postgres"
+version = "0.19.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ad20e0aa0b24f5a394eab4f78c781d248982b22b25cecc7e3aa46a681605bd"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "futures-util",
+ "log",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "postgres-protocol"

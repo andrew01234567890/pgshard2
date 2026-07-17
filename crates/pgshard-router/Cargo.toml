@@ -14,9 +14,11 @@ futures = "0.3.32"
 pg_query = "6.1.1"
 pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 pgshard-plan = { version = "0.0.0", path = "../pgshard-plan" }
+pgshard-seq = { version = "0.0.0", path = "../pgshard-seq" }
 pgshard-sql = { version = "0.0.0", path = "../pgshard-sql" }
 pgshard-topo = { version = "0.0.0", path = "../pgshard-topo" }
 pgwire = "0.40.4"
+postgres = "0.19.14"
 thiserror = "2.0.18"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "net", "macros", "signal", "sync"] }
 tokio-postgres = "0.7.18"
