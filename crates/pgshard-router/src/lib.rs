@@ -30,6 +30,8 @@ pub use pgshard_topo::Instance as Endpoint;
 pub enum BuildError {
     #[error("sharded table {0} has no shard key column")]
     MissingShardKey(TableName),
+    #[error("duplicate serving shard name {0:?}")]
+    DuplicateShard(String),
     #[error(transparent)]
     VSchema(#[from] VSchemaError),
     #[error("serving shards do not partition the keyspace: {0}")]
@@ -83,9 +85,20 @@ impl Router {
                 continue;
             }
             let id = ShardId::new(shard.name.clone());
-            serving.push((shard.key_range, id.clone()));
-            primaries.insert(id, shard.primary.clone());
+            // Duplicate names would collapse in `primaries` (last write wins)
+            // while both survive in the catalog, silently mis-routing one range.
+            if primaries
+                .insert(id.clone(), shard.primary.clone())
+                .is_some()
+            {
+                return Err(BuildError::DuplicateShard(shard.name.clone()));
+            }
+            serving.push((shard.key_range, id));
         }
+        // `ShardCatalog::new` checks contiguity in input order; sort first so a
+        // valid-but-unsorted shard list (which the topology layer accepts) is not
+        // spuriously rejected.
+        serving.sort_by_key(|(kr, _)| kr.start());
         let catalog = ShardCatalog::new(serving)?;
 
         Ok(Router {
@@ -382,5 +395,40 @@ mod tests {
             Router::build(&unknown),
             Err(BuildError::VSchema(_))
         ));
+
+        // Two serving shards with the same name.
+        let dup = topology(
+            vec![
+                shard("dup", "-80", Some("a")),
+                shard("dup", "80-", Some("b")),
+            ],
+            vec![orders()],
+        );
+        assert!(matches!(
+            Router::build(&dup),
+            Err(BuildError::DuplicateShard(_))
+        ));
+    }
+
+    #[test]
+    fn a_valid_but_unsorted_shard_list_still_builds_and_routes() {
+        // The topology layer accepts an unsorted-but-partitioning shard list, so
+        // the router must too (sort before validating contiguity).
+        let r = Router::build(&topology(
+            vec![
+                shard("s1", "80-", Some("s1p")),
+                shard("s0", "-80", Some("s0p")),
+            ],
+            vec![orders()],
+        ))
+        .unwrap();
+        assert_eq!(
+            r.route("SELECT * FROM orders WHERE customer_id = 0")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+            Route::Shard(instance("s0p"))
+        );
     }
 }
