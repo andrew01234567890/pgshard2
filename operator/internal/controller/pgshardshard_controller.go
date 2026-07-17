@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,9 +32,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
@@ -91,7 +95,7 @@ func (r *PgShardShardReconciler) agentClient(host string, port int32) (pgshardv1
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -108,6 +112,13 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	if r.Images.Agent == "" {
+		return ctrl.Result{}, fmt.Errorf("shard controller agent image is not configured")
+	}
+	if shard.Spec.Image == "" && r.Images.Postgres == "" {
+		return ctrl.Result{}, fmt.Errorf("no postgres image: set shard.spec.image or the controller default")
+	}
+
 	if err := r.ensureServices(ctx, &shard); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -115,6 +126,9 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.ensureInstance(ctx, &shard, ordinal); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if err := r.pruneExcessInstances(ctx, &shard); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.aggregateStatus(ctx, &shard); err != nil {
@@ -196,39 +210,26 @@ func (r *PgShardShardReconciler) ensureInstance(
 ) error {
 	name := instanceName(shard, ordinal)
 
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: name + "-data", Namespace: shard.Namespace,
-	}}
-	err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)
-	if apierrors.IsNotFound(err) {
-		size := resource.MustParse("1Gi")
-		var storageClass *string
-		if shard.Spec.Storage != nil {
-			size = shard.Spec.Storage.Size
-			if shard.Spec.Storage.StorageClass != "" {
-				storageClass = &shard.Spec.Storage.StorageClass
-			}
-		}
-		pvc.Labels = shardSelector(shard)
-		pvc.Spec = corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: size},
-			},
-			StorageClassName: storageClass,
-		}
-		// PVCs deliberately carry no owner reference: data outlives pod
-		// churn, and deletion is an explicit decommission step.
-		if err := r.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("pvc %s: %w", pvc.Name, err)
-		}
-	} else if err != nil {
+	if err := r.ensurePVC(ctx, shard, name+"-data"); err != nil {
 		return err
+	}
+	if shard.Spec.Storage != nil && shard.Spec.Storage.WalSeparate {
+		if err := r.ensurePVC(ctx, shard, name+"-wal"); err != nil {
+			return err
+		}
 	}
 
 	var pod corev1.Pod
-	err = r.Get(ctx, client.ObjectKey{Namespace: shard.Namespace, Name: name}, &pod)
-	if err == nil || !apierrors.IsNotFound(err) {
+	err := r.Get(ctx, client.ObjectKey{Namespace: shard.Namespace, Name: name}, &pod)
+	if err == nil {
+		if !metav1.IsControlledBy(&pod, shard) {
+			return fmt.Errorf("pod %s exists but is not controlled by shard %s", name, shard.Name)
+		}
+		// Pods are not mutated in place here: a config/image change is rolled
+		// out separately (replicas first, primary last via switchover).
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
 		return err
 	}
 	desired := r.instancePod(shard, ordinal)
@@ -239,6 +240,81 @@ func (r *PgShardShardReconciler) ensureInstance(
 		return fmt.Errorf("pod %s: %w", name, err)
 	}
 	return nil
+}
+
+// ensurePVC creates a shard PVC if absent. PVCs deliberately carry no owner
+// reference: data outlives pod churn, and deletion is an explicit decommission
+// step — never on scale-down or pod recreation.
+func (r *PgShardShardReconciler) ensurePVC(
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, pvcName string,
+) error {
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: pvcName, Namespace: shard.Namespace,
+	}}
+	err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	size := resource.MustParse("1Gi")
+	var storageClass *string
+	if shard.Spec.Storage != nil {
+		size = shard.Spec.Storage.Size
+		if shard.Spec.Storage.StorageClass != "" {
+			storageClass = &shard.Spec.Storage.StorageClass
+		}
+	}
+	pvc.Labels = shardSelector(shard)
+	pvc.Spec = corev1.PersistentVolumeClaimSpec{
+		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		Resources: corev1.VolumeResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+		},
+		StorageClassName: storageClass,
+	}
+	if err := r.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("pvc %s: %w", pvcName, err)
+	}
+	return nil
+}
+
+// pruneExcessInstances deletes pods for ordinals at or above the desired
+// replica count (a scale-down). Their PVCs are retained for data safety and
+// reused if the shard scales back up.
+func (r *PgShardShardReconciler) pruneExcessInstances(
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
+) error {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(shard.Namespace),
+		client.MatchingLabels(shardSelector(shard))); err != nil {
+		return err
+	}
+	prefix := shard.Name + "-"
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		ord, ok := ordinalOf(pod.Name, prefix)
+		if !ok || ord < shard.Spec.Replicas {
+			continue
+		}
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("pruning pod %s: %w", pod.Name, err)
+		}
+	}
+	return nil
+}
+
+func ordinalOf(podName, prefix string) (int32, bool) {
+	if !strings.HasPrefix(podName, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(podName, prefix))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return int32(n), true
 }
 
 func (r *PgShardShardReconciler) instancePod(
@@ -257,7 +333,7 @@ func (r *PgShardShardReconciler) instancePod(
 		resources = *shard.Spec.Resources
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: shard.Namespace,
@@ -268,7 +344,7 @@ func (r *PgShardShardReconciler) instancePod(
 		},
 		Spec: corev1.PodSpec{
 			Hostname:  name,
-			Subdomain: shard.Name + "-pods",
+			Subdomain: shard.Name + headlessSvcSuffix,
 			InitContainers: []corev1.Container{{
 				Name:    "inject-agent",
 				Image:   r.Images.Agent,
@@ -339,6 +415,23 @@ func (r *PgShardShardReconciler) instancePod(
 			},
 		},
 	}
+
+	// storage.walSeparate mounts a dedicated WAL volume so WAL I/O does not
+	// contend with the data volume.
+	if shard.Spec.Storage != nil && shard.Spec.Storage.WalSeparate {
+		c := &pod.Spec.Containers[0]
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
+			Name: "wal", MountPath: "/var/lib/postgresql/wal",
+		})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "wal", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: name + "-wal",
+				},
+			},
+		})
+	}
+	return pod
 }
 
 // aggregateStatus polls every instance's agent and writes the shard status
@@ -356,11 +449,9 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	before := shard.Status.DeepCopy()
 
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
-	currentPrimary := ""
-	ready := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: "replica"}
+		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			status, err := r.pollAgent(pollCtx, pod.Status.PodIP)
@@ -368,35 +459,21 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			if err == nil {
 				state.Ready = status.Ready
 				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
-					state.Role = "primary"
-					currentPrimary = pod.Name
+					state.Role = roleLabelPrimary
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
 				state.WalReplayLSN = lsnString(status.WalReplayLsn)
 			}
 		}
-		if state.Ready {
-			ready++
-		}
 		instances = append(instances, state)
 	}
 
 	shard.Status.Instances = instances
-	if currentPrimary != "" {
-		shard.Status.CurrentPrimary = currentPrimary
-	}
-	// A shard that once served (has a recorded primary) and now has no ready
-	// instances is Degraded, not Provisioning — provisioning is the initial
-	// bring-up state only.
-	hadPrimary := before.CurrentPrimary != ""
-	switch {
-	case ready == int(shard.Spec.Replicas) && currentPrimary != "":
-		shard.Status.Phase = pgshardv1alpha1.ShardReady
-	case ready == 0 && !hadPrimary:
-		shard.Status.Phase = pgshardv1alpha1.ShardProvisioning
-	default:
-		shard.Status.Phase = pgshardv1alpha1.ShardDegraded
-	}
+	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
+	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
+	// writes to a stale primary).
+	shard.Status.CurrentPrimary, shard.Status.Phase =
+		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "")
 
 	// Only write when the status actually changed. The controller watches its
 	// own resource, so an unconditional write on every poll (WAL LSNs advance
@@ -406,6 +483,36 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		return nil
 	}
 	return client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+// deriveShardStatus computes the current primary and phase from polled instance
+// states. More than one instance reporting primary is split-brain: no primary
+// is published (withholding -rw write routing) and the shard is Degraded. A
+// shard that had a primary and now has none is Degraded (not Provisioning,
+// which is the initial bring-up only).
+func deriveShardStatus(
+	instances []pgshardv1alpha1.InstanceState, replicas int32, hadPrimary bool,
+) (string, pgshardv1alpha1.ShardPhase) {
+	currentPrimary, primaries, ready := "", 0, 0
+	for _, s := range instances {
+		if s.Ready {
+			ready++
+		}
+		if s.Role == roleLabelPrimary {
+			currentPrimary = s.Pod
+			primaries++
+		}
+	}
+	switch {
+	case primaries > 1:
+		return "", pgshardv1alpha1.ShardDegraded
+	case ready == int(replicas) && currentPrimary != "":
+		return currentPrimary, pgshardv1alpha1.ShardReady
+	case ready == 0 && !hadPrimary:
+		return "", pgshardv1alpha1.ShardProvisioning
+	default:
+		return currentPrimary, pgshardv1alpha1.ShardDegraded
+	}
 }
 
 func (r *PgShardShardReconciler) pollAgent(
@@ -462,11 +569,19 @@ func (r *PgShardShardReconciler) syncRoleLabels(
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PgShardShardReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.Agents == nil {
-		r.Agents = agentclient.NewInsecurePool()
+	// Never silently fall back to the plaintext pool: production must wire a
+	// credentialed agentclient.Pool (tests inject dialAgent). An insecure
+	// default would poll agents unauthenticated.
+	if r.Agents == nil && r.dialAgent == nil {
+		return fmt.Errorf("shard controller requires an agent client Pool or an injected dialer")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&pgshardv1alpha1.PgShardShard{}).
+		// GenerationChangedPredicate on the shard itself: the controller writes
+		// the shard's status every poll (advancing WAL LSNs), which does not bump
+		// generation. Without this filter each self-write re-enqueues immediately
+		// and hot-loops under write traffic; periodic polling comes from
+		// RequeueAfter, pod/service reactions from the Owns watches.
+		For(&pgshardv1alpha1.PgShardShard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
 		Named("pgshardshard").
