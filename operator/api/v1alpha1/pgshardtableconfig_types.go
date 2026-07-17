@@ -71,9 +71,8 @@ type TableEntry struct {
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
 
-	// Type of the shard-key column, so the router coerces a literal to it
-	// before hashing (`id = '1'` and `id = 1` route alike). Required for
-	// sharded tables; must match the column's actual PostgreSQL type.
+	// Required for sharded tables; must match the column's actual PostgreSQL
+	// type. See ShardKeyType.
 	// +optional
 	ShardKeyType ShardKeyType `json:"shardKeyType,omitempty"`
 

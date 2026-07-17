@@ -174,6 +174,13 @@ var _ = Describe("API validation", func() {
 		})
 		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
 		_ = k8sClient.Delete(ctx, ok)
+		// A global table needs neither a shard key nor a type: the required
+		// rules must scope to sharded tables only.
+		global := tc("tc-global", []pgshardv1alpha1.TableEntry{
+			{Name: "settings", Type: pgshardv1alpha1.TableGlobal},
+		})
+		Expect(k8sClient.Create(ctx, global)).To(Succeed())
+		_ = k8sClient.Delete(ctx, global)
 	})
 
 	It("enforces monotonic epoch on routing updates", func() {
