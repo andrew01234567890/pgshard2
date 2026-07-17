@@ -67,7 +67,8 @@ pub struct Sequence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableEntry {
-    #[serde(default = "default_schema")]
+    // schema is required by the CRD (the operator always materializes it, e.g.
+    // "public"), so it is required here too rather than silently defaulted.
     pub schema: String,
     pub name: String,
     #[serde(rename = "type")]
@@ -76,10 +77,6 @@ pub struct TableEntry {
     pub shard_key_column: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sequences: Vec<Sequence>,
-}
-
-fn default_schema() -> String {
-    "public".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +114,9 @@ pub struct GateMatch {
 #[serde(rename_all = "camelCase")]
 pub struct GateSpec {
     pub id: String,
-    #[serde(rename = "match", default)]
+    // match is required by the CRD; requiring it here rejects a malformed gate
+    // that would otherwise advance the epoch while selecting no traffic.
+    #[serde(rename = "match")]
     pub match_: GateMatch,
     #[serde(default = "default_gate_mode")]
     pub mode: GateMode,
@@ -197,14 +196,28 @@ impl Bounds {
     }
 
     fn into_range<E: serde::de::Error>(self) -> Result<KeyRange, E> {
-        let start = pgshard_core::keyspace::parse_bound(&self.start).map_err(E::custom)?;
+        let start = canonical_bound(&self.start).map_err(E::custom)?;
         let end = if self.end.is_empty() {
             None
         } else {
-            Some(pgshard_core::keyspace::parse_bound(&self.end).map_err(E::custom)?)
+            Some(canonical_bound(&self.end).map_err(E::custom)?)
         };
         KeyRange::new(start, end).map_err(E::custom)
     }
+}
+
+/// Parses a trimmed-hex bound, rejecting a noncanonical spelling the CRD's
+/// pattern forbids (e.g. "4000", which aliases "40"): the input must be exactly
+/// what `format_bound` would round-trip to.
+fn canonical_bound(s: &str) -> Result<u64, String> {
+    let value = pgshard_core::keyspace::parse_bound(s).map_err(|e| e.to_string())?;
+    let canonical = pgshard_core::keyspace::format_bound(value);
+    if canonical != s {
+        return Err(format!(
+            "noncanonical key-range bound {s:?}: expected {canonical:?}"
+        ));
+    }
+    Ok(value)
 }
 
 mod keyrange_serde {

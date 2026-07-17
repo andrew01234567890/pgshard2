@@ -16,7 +16,8 @@ fn two_shard_topology(epoch: u64) -> serde_json::Value {
              "primary": {"pod": "c-80-max-0", "host": "10.0.0.2"}},
         ],
         "tables": [
-            {"name": "orders", "type": "sharded", "shardKeyColumn": "customer_id"}
+            {"schema": "public", "name": "orders", "type": "sharded",
+             "shardKeyColumn": "customer_id"}
         ]
     })
 }
@@ -176,6 +177,22 @@ fn crd_shape_round_trips() {
     let reserialized = serde_json::to_value(&topo).unwrap();
     let again: Topology = serde_json::from_value(reserialized).unwrap();
     assert_eq!(topo, again);
+}
+
+/// A noncanonical key-range bound (one the CRD's pattern rejects because it
+/// aliases a shorter bound, e.g. "4000" == "40") is rejected, not silently
+/// canonicalized.
+#[test]
+fn noncanonical_key_range_bound_is_rejected() {
+    let bad = serde_json::json!({
+        "epoch": 1,
+        "topologyGeneration": 1,
+        "shards": [
+            {"name": "s", "keyRange": {"end": "4000"}, "state": "serving",
+             "primary": {"pod": "s-0", "host": "10.0.0.1"}}
+        ]
+    });
+    assert!(serde_json::from_value::<Topology>(bad).is_err());
 }
 
 /// Omitted optional fields resolve to the CRD's documented defaults, not to
