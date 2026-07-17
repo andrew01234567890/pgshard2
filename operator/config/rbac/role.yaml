@@ -8,13 +8,24 @@ rules:
   - ""
   resources:
   - configmaps
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
   - pods
   - services
   verbs:
   - create
+  - delete
   - get
   - list
+  - patch
   - update
   - watch
 - apiGroups:
