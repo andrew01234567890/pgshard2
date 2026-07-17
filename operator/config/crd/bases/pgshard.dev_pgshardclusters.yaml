@@ -156,6 +156,32 @@ spec:
               pause:
                 description: Pause suspends reconciliation (hibernation).
                 type: boolean
+              placement:
+                description: |-
+                  PlacementSpec controls how a cluster's shard databases are laid out onto
+                  physical PgShardNodes. Moving along the density/isolation spectrum is an
+                  online operation, not a rebuild.
+                properties:
+                  colocateWith:
+                    description: |-
+                      ColocateWith names another cluster in the same namespace whose nodes this
+                      cluster's shard databases are packed onto (shared mode only): the two
+                      databases then share physical instances.
+                    type: string
+                  mode:
+                    default: dedicatedInstance
+                    description: |-
+                      PlacementMode trades physical density against isolation for a cluster's
+                      shard databases.
+                    enum:
+                    - shared
+                    - dedicatedInstance
+                    - dedicatedMachine
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: colocateWith is only valid with mode 'shared'
+                  rule: self.mode == 'shared' || !has(self.colocateWith)
               postgres:
                 description: PostgresSpec pins the PostgreSQL version and tuning inputs.
                 properties:
@@ -451,6 +477,11 @@ spec:
             - postgres
             - shards
             type: object
+            x-kubernetes-validations:
+            - message: placement is immutable; moving a database along the density/isolation
+                spectrum requires an online move
+              rule: has(self.placement) == has(oldSelf.placement) && (!has(self.placement)
+                || self.placement == oldSelf.placement)
           status:
             description: PgShardClusterStatus defines the observed state of PgShardCluster.
             properties:

@@ -87,6 +87,15 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
+	// Record where each shard's database will live. This is placement metadata
+	// only: the physical PgShardNodes are materialized (and the shard controller
+	// stops managing pods) in the physical-handoff step, so nothing here creates
+	// an object that could collide with the still-active shard controller.
+	assignment := shardNodeAssignment(&cluster, desired)
+	for i := range desired {
+		desired[i].Spec.NodeRef = assignment[desired[i].Name]
+	}
+
 	ready, degraded := int32(0), int32(0)
 	for i := range desired {
 		shard := &desired[i]
@@ -134,11 +143,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// cluster owns (config hash, sizing) without touching the rest.
 			if existing.Spec.PostgresConfigHash != shard.Spec.PostgresConfigHash ||
 				existing.Spec.Replicas != shard.Spec.Replicas ||
-				existing.Spec.Image != shard.Spec.Image {
+				existing.Spec.Image != shard.Spec.Image ||
+				existing.Spec.NodeRef != shard.Spec.NodeRef {
 				existing.Spec.PostgresConfigHash = shard.Spec.PostgresConfigHash
 				existing.Spec.Replicas = shard.Spec.Replicas
 				existing.Spec.Image = shard.Spec.Image
 				existing.Spec.Resources = shard.Spec.Resources
+				existing.Spec.NodeRef = shard.Spec.NodeRef
 				if err := r.Update(ctx, existing); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -244,6 +255,54 @@ func shardName(cluster, start, end string) string {
 		end = "max"
 	}
 	return fmt.Sprintf("%s-%s-%s", cluster, start, end)
+}
+
+func sharedNodeName(cluster string) string {
+	return fmt.Sprintf("%s-shared", cluster)
+}
+
+// shardNodeAssignment maps each shard to the PgShardNode name that will host its
+// database, per the cluster's placement mode. Dedicated modes give each shard
+// its own node (name = the shard name = today's per-shard topology); shared
+// packs every shard database onto one node (<cluster>-shared, or another
+// cluster's shared node via colocateWith). This only records the placement
+// decision as NodeRef — a pure function of the spec — so it can never collide
+// with, or race, the still-active shard controller; the physical PgShardNodes
+// (and the shard controller ceding pod ownership, and routing following) are
+// the physical-handoff step, not here.
+func shardNodeAssignment(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	shards []pgshardv1alpha1.PgShardShard,
+) map[string]string {
+	mode := pgshardv1alpha1.PlacementDedicatedInstance
+	colocateWith := ""
+	if cluster.Spec.Placement != nil {
+		if cluster.Spec.Placement.Mode != "" {
+			mode = cluster.Spec.Placement.Mode
+		}
+		colocateWith = cluster.Spec.Placement.ColocateWith
+	}
+	assignment := make(map[string]string, len(shards))
+
+	if mode == pgshardv1alpha1.PlacementShared {
+		target := cluster.Name
+		if colocateWith != "" {
+			target = colocateWith
+		}
+		node := sharedNodeName(target)
+		for i := range shards {
+			assignment[shards[i].Name] = node
+		}
+		return assignment
+	}
+
+	// dedicatedInstance / dedicatedMachine: one node per shard. Machine
+	// anti-affinity for dedicatedMachine is a follow-up (it needs a node
+	// scheduling field); the fan-out is what differs today.
+	for i := range shards {
+		assignment[shards[i].Name] = shards[i].Name
+	}
+	return assignment
 }
 
 // ensureConfigMap materializes the rendered postgresql parameters for one

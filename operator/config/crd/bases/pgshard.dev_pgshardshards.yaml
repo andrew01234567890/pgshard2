@@ -91,6 +91,12 @@ spec:
                     pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
                     type: string
                 type: object
+              nodeRef:
+                description: |-
+                  NodeRef names the PgShardNode that hosts this shard's database. The
+                  cluster controller assigns it per the cluster's placement; the shard's
+                  data lives as a Postgres database on that node.
+                type: string
               postgresConfigHash:
                 description: |-
                   Content hash of the shard's rendered PostgreSQL configuration; a
