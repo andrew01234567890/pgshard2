@@ -1,5 +1,6 @@
 //! The router's routing layer: turn a compiled [`Topology`] into an executable
-//! [`Router`], then route SQL to concrete node endpoints.
+//! [`Router`], then route SQL to concrete [`Target`]s (a node endpoint plus the
+//! shard's database, since each shard is its own database on a shared node).
 //!
 //! This is the bridge between the pieces that already exist — the topology watch
 //! ([`pgshard_topo`]), the SQL parser ([`pgshard_sql`]), and the planner
@@ -38,16 +39,29 @@ pub enum BuildError {
     Partition(#[from] pgshard_core::PartitionError),
 }
 
-/// Where the router should send one statement, resolved to concrete endpoints.
+/// A concrete place to run a statement: the node to connect to and the Postgres
+/// database on it. Each shard is its own database on a (possibly shared) node,
+/// so the node endpoint alone is not enough to reach the shard's data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub endpoint: Endpoint,
+    /// The database to connect to — the shard's name (a node hosts one database
+    /// per placed shard).
+    pub database: String,
+}
+
+/// Where the router should send one statement, resolved to concrete targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// Send to this one node.
-    Shard(Endpoint),
-    /// Fan a read out to these nodes and merge.
-    Scatter(Vec<Endpoint>),
-    /// Run on every shard's node (DDL).
-    Broadcast(Vec<Endpoint>),
-    /// The unsharded system database.
+    /// Send to this one shard database.
+    Shard(Target),
+    /// Fan a read out to these shard databases and merge.
+    Scatter(Vec<Target>),
+    /// Run on every shard database (DDL).
+    Broadcast(Vec<Target>),
+    /// The unsharded system database. Carries the node endpoint; the system
+    /// database name is not yet in the topology (a follow-up), so the wire layer
+    /// supplies it.
     System(Endpoint),
     /// The session layer handles it (SET/SHOW/txn/tableless).
     Local,
@@ -123,8 +137,8 @@ impl Router {
 
     fn resolve(&self, plan: Plan) -> Route {
         match plan {
-            Plan::SingleShard(id) => match self.primary(&id) {
-                Ok(ep) => Route::Shard(ep),
+            Plan::SingleShard(id) => match self.target(&id) {
+                Ok(t) => Route::Shard(t),
                 Err(unavail) => unavail,
             },
             Plan::Scatter(ids) => self.resolve_many(ids, Route::Scatter),
@@ -139,10 +153,14 @@ impl Router {
         }
     }
 
-    /// The primary endpoint of `id`, or a [`Route::Unavailable`] describing why.
-    fn primary(&self, id: &ShardId) -> Result<Endpoint, Route> {
+    /// The connection target for `id` (its primary node + its database), or a
+    /// [`Route::Unavailable`] describing why it cannot be reached.
+    fn target(&self, id: &ShardId) -> Result<Target, Route> {
         match self.primaries.get(id) {
-            Some(Some(ep)) => Ok(ep.clone()),
+            Some(Some(ep)) => Ok(Target {
+                endpoint: ep.clone(),
+                database: id.0.clone(),
+            }),
             Some(None) => Err(Route::Unavailable(format!("shard {id} has no primary"))),
             // The planner only names shards from this catalog, so a miss is a bug
             // rather than a routing outcome — surface it as unavailable.
@@ -152,15 +170,15 @@ impl Router {
         }
     }
 
-    fn resolve_many(&self, ids: Vec<ShardId>, wrap: fn(Vec<Endpoint>) -> Route) -> Route {
-        let mut eps = Vec::with_capacity(ids.len());
+    fn resolve_many(&self, ids: Vec<ShardId>, wrap: fn(Vec<Target>) -> Route) -> Route {
+        let mut targets = Vec::with_capacity(ids.len());
         for id in ids {
-            match self.primary(&id) {
-                Ok(ep) => eps.push(ep),
+            match self.target(&id) {
+                Ok(t) => targets.push(t),
                 Err(unavail) => return unavail,
             }
         }
-        wrap(eps)
+        wrap(targets)
     }
 }
 
@@ -205,6 +223,14 @@ mod tests {
             host: format!("{pod}-host"),
             port: 5432,
             can_read: false,
+        }
+    }
+
+    /// A target for shard `db` whose primary is pod `pod`.
+    fn target(db: &str, pod: &str) -> Target {
+        Target {
+            endpoint: instance(pod),
+            database: db.to_owned(),
         }
     }
 
@@ -274,11 +300,11 @@ mod tests {
         // customer_id=1 hashes into [80-) -> s1; =0 into [-80) -> s0.
         assert_eq!(
             one("SELECT * FROM orders WHERE customer_id = 1"),
-            Route::Shard(instance("s1p"))
+            Route::Shard(target("s1", "s1p"))
         );
         assert_eq!(
             one("INSERT INTO orders (customer_id) VALUES (0)"),
-            Route::Shard(instance("s0p"))
+            Route::Shard(target("s0", "s0p"))
         );
     }
 
@@ -286,11 +312,11 @@ mod tests {
     fn scatter_and_broadcast_resolve_to_primaries() {
         assert_eq!(
             one("SELECT * FROM orders"),
-            Route::Scatter(vec![instance("s0p"), instance("s1p")])
+            Route::Scatter(vec![target("s0", "s0p"), target("s1", "s1p")])
         );
         assert_eq!(
             one("CREATE TABLE t (id int)"),
-            Route::Broadcast(vec![instance("s0p"), instance("s1p")])
+            Route::Broadcast(vec![target("s0", "s0p"), target("s1", "s1p")])
         );
     }
 
@@ -366,7 +392,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap(),
-            Route::Shard(instance("s1p"))
+            Route::Shard(target("s1", "s1p"))
         );
     }
 
@@ -428,7 +454,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap(),
-            Route::Shard(instance("s0p"))
+            Route::Shard(target("s0", "s0p"))
         );
     }
 }
