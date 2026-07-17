@@ -1,6 +1,8 @@
-//! Router-facing topology model. Mirrors the PgShardRouting CRD (the
-//! Kubernetes watcher deserializes the CRD into these types; the file
-//! watcher reads them as JSON).
+//! Router-facing topology model — a faithful mirror of the PgShardRouting CRD
+//! (`PgShardRoutingSpec`). The Kubernetes watcher deserializes the CRD spec
+//! into these types; the file watcher reads the identical JSON shape (camelCase
+//! fields, `{start,end}` key ranges, `match`-nested gates), so a topology.json
+//! is exactly what the operator compiles into the CRD.
 
 use pgshard_core::KeyRange;
 use serde::{Deserialize, Serialize};
@@ -9,7 +11,10 @@ fn default_port() -> u16 {
     5432
 }
 
+/// A directly addressable PostgreSQL instance (CRD `RoutingEndpoint`). Routers
+/// dial the pod host, not a Service, so routing changes never wait on kube-proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Instance {
     pub pod: String,
     pub host: String,
@@ -30,26 +35,47 @@ pub enum ShardState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShardEntry {
     pub name: String,
     #[serde(with = "keyrange_serde")]
     pub key_range: KeyRange,
     pub state: ShardState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary: Option<Instance>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replicas: Vec<Instance>,
 }
 
+/// Reuses the vschema table kind (CRD `TableType`); the operator projects
+/// TableEntry.Type into RoutingTable.type, so the two must stay one enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TableType {
+    Sharded,
+    Global,
+}
+
+/// Binds a column to a global sequence (CRD `RoutingSequence`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sequence {
+    pub column: String,
+    pub sequence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableEntry {
     #[serde(default = "default_schema")]
     pub schema: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(rename = "type")]
+    pub table_type: TableType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key_column: Option<String>,
-    #[serde(default)]
-    pub global: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequences: Vec<Sequence>,
 }
 
 fn default_schema() -> String {
@@ -63,41 +89,70 @@ pub enum GateMode {
     BufferAll,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GateSpec {
-    pub id: String,
-    pub mode: GateMode,
-    /// RFC 3339 wall-clock deadline; the gate engine converts to a
-    /// monotonic instant when it applies the snapshot.
-    pub deadline: String,
-    #[serde(default)]
-    pub min_topology_generation: u64,
-    #[serde(default)]
+fn default_gate_mode() -> GateMode {
+    GateMode::BufferWrites
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Selects the traffic a gate buffers (CRD `GateMatch`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateMatch {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<String>,
-    #[serde(default, with = "keyrange_vec_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "keyrange_vec_serde"
+    )]
     pub key_ranges: Vec<KeyRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateSpec {
+    pub id: String,
+    #[serde(rename = "match", default)]
+    pub match_: GateMatch,
+    #[serde(default = "default_gate_mode")]
+    pub mode: GateMode,
+    /// RFC 3339 wall-clock deadline; the gate engine converts to a monotonic
+    /// instant when it applies the snapshot.
+    pub deadline: String,
+    #[serde(default)]
+    pub min_topology_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Topology {
     pub epoch: u64,
     pub topology_generation: u64,
+    #[serde(default = "default_write_lease_seconds")]
+    pub write_lease_seconds: u32,
     #[serde(default = "default_hash_function")]
     pub hash_function: String,
-    #[serde(default)]
-    pub write_lease_seconds: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shards: Vec<ShardEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<TableEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<GateSpec>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence_endpoint: Option<Instance>,
 }
 
 fn default_hash_function() -> String {
     "xxhash64_v1".to_string()
+}
+
+fn default_write_lease_seconds() -> u32 {
+    10
 }
 
 impl Default for Topology {
@@ -108,8 +163,8 @@ impl Default for Topology {
         Topology {
             epoch: 0,
             topology_generation: 0,
+            write_lease_seconds: default_write_lease_seconds(),
             hash_function: default_hash_function(),
-            write_lease_seconds: 0,
             shards: Vec::new(),
             tables: Vec::new(),
             gates: Vec::new(),
@@ -118,34 +173,67 @@ impl Default for Topology {
     }
 }
 
-/// Canonical trimmed-hex bound syntax ("40-80", "-" = full range), shared
-/// with the CRD and the Go operator.
+/// A key range in the CRD `{start,end}` shape: canonical trimmed big-endian hex
+/// bounds, where an empty string is 0 (start) or the top of the keyspace (end).
+/// Shared byte-for-byte with the Go operator's KeyRange.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Bounds {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    start: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    end: String,
+}
+
+impl Bounds {
+    fn from_range(kr: &KeyRange) -> Self {
+        Bounds {
+            start: pgshard_core::keyspace::format_bound(kr.start()),
+            end: kr
+                .end()
+                .map(pgshard_core::keyspace::format_bound)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn into_range<E: serde::de::Error>(self) -> Result<KeyRange, E> {
+        let start = pgshard_core::keyspace::parse_bound(&self.start).map_err(E::custom)?;
+        let end = if self.end.is_empty() {
+            None
+        } else {
+            Some(pgshard_core::keyspace::parse_bound(&self.end).map_err(E::custom)?)
+        };
+        KeyRange::new(start, end).map_err(E::custom)
+    }
+}
+
 mod keyrange_serde {
+    use super::Bounds;
     use pgshard_core::KeyRange;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(kr: &KeyRange, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&kr.to_string())
+        Bounds::from_range(kr).serialize(s)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<KeyRange, D::Error> {
-        let raw = String::deserialize(d)?;
-        raw.parse().map_err(serde::de::Error::custom)
+        Bounds::deserialize(d)?.into_range()
     }
 }
 
 mod keyrange_vec_serde {
+    use super::Bounds;
     use pgshard_core::KeyRange;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[KeyRange], s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(v.iter().map(|kr| kr.to_string()))
+        s.collect_seq(v.iter().map(Bounds::from_range))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<KeyRange>, D::Error> {
-        let raw = Vec::<String>::deserialize(d)?;
-        raw.into_iter()
-            .map(|s| s.parse().map_err(serde::de::Error::custom))
+        Vec::<Bounds>::deserialize(d)?
+            .into_iter()
+            .map(|b| b.into_range())
             .collect()
     }
 }

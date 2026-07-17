@@ -2,6 +2,11 @@
 //! Used by every integration test and by non-Kubernetes development; the
 //! Kubernetes watcher (kube-rs, separate module later) feeds the same
 //! channel with the same epoch-ordering rule.
+//!
+//! Writers must publish atomically (write a temp file, then rename over the
+//! path) so the poller never parses a half-written file: a partial write is
+//! rejected as invalid JSON and the current snapshot is kept, but the epoch
+//! rule assumes each observed file is internally consistent.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +30,14 @@ impl FileWatcher {
         path: impl Into<PathBuf>,
         interval: Duration,
     ) -> Result<Self, TopologyError> {
+        if interval.is_zero() {
+            // tokio::time::interval panics on a zero period; fail loudly at
+            // construction rather than spawn a task that dies on first tick and
+            // leaves a silently frozen watcher.
+            return Err(TopologyError::Invalid(
+                "poll interval must be non-zero".into(),
+            ));
+        }
         let path = path.into();
         let initial = load(&path).await?;
         let (sender, _) = watch::channel(Arc::new(initial));
@@ -33,7 +46,11 @@ impl FileWatcher {
         let poller = Arc::clone(&sender);
         let poll_path = path.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            // First tick after a full interval, not immediately: the initial
+            // snapshot is already loaded, and an immediate tick would race a
+            // caller's manual reload().
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
@@ -76,17 +93,16 @@ async fn load(path: &PathBuf) -> Result<Topology, TopologyError> {
     Ok(topology)
 }
 
-/// The single application rule: strictly increasing epochs only.
+/// The single application rule: strictly increasing epochs only. Returns
+/// whether the candidate was applied (send_if_modified reports the same, so no
+/// separate flag is needed).
 fn apply(sender: &watch::Sender<Arc<Topology>>, candidate: Topology) -> bool {
-    let mut applied = false;
     sender.send_if_modified(|current| {
         if candidate.epoch > current.epoch {
             *current = Arc::new(candidate);
-            applied = true;
             true
         } else {
             false
         }
-    });
-    applied
+    })
 }
