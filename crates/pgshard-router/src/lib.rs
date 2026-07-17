@@ -553,6 +553,12 @@ mod tests {
             "a build error must keep the last good router"
         );
 
+        // And the watcher survives the error: a later valid epoch still applies.
+        let mut recovered = topology(pair(), vec![orders()]);
+        recovered.epoch = 10;
+        tx.send(Arc::new(recovered)).unwrap();
+        wait_for_epoch(&router, 10).await;
+
         drop(tx);
         handle.await.unwrap();
     }
