@@ -21,9 +21,11 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -47,7 +49,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -57,6 +59,12 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if cluster.Spec.Pause {
+		if cluster.Status.Phase != pgshardv1alpha1.ClusterPaused {
+			cluster.Status.Phase = pgshardv1alpha1.ClusterPaused
+			if err := r.Status().Update(ctx, &cluster); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
+		}
 		log.Info("cluster paused; skipping reconcile")
 		return ctrl.Result{}, nil
 	}
@@ -99,6 +107,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		case err != nil:
 			return ctrl.Result{}, err
 		default:
+			// A shard with the desired name that this cluster does not own is a
+			// foreign object (or a stale one from a deleted cluster of the same
+			// name); converging it would corrupt the partition. Surface it.
+			if !metav1.IsControlledBy(existing, &cluster) {
+				return ctrl.Result{}, fmt.Errorf(
+					"shard %s exists but is not controlled by cluster %s", shard.Name, cluster.Name)
+			}
 			// Key range and clusterRef are immutable; converge the fields the
 			// cluster owns (config hash, sizing) without touching the rest.
 			if existing.Spec.PostgresConfigHash != shard.Spec.PostgresConfigHash ||
@@ -121,21 +136,32 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	cluster.Status.Shards = pgshardv1alpha1.ShardCounts{
-		Total:    int32(len(desired)),
-		Ready:    ready,
-		Degraded: degraded,
-	}
-	if cluster.Status.Phase == "" {
-		cluster.Status.Phase = pgshardv1alpha1.ClusterProvisioning
-	}
-	if ready == int32(len(desired)) && ready > 0 {
-		cluster.Status.Phase = pgshardv1alpha1.ClusterReady
-	}
-	if err := r.Status().Update(ctx, &cluster); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+	total := int32(len(desired))
+	newStatus := cluster.Status.DeepCopy()
+	newStatus.Shards = pgshardv1alpha1.ShardCounts{Total: total, Ready: ready, Degraded: degraded}
+	newStatus.Phase = clusterPhase(ready, degraded, total)
+	// Write status only when it changed: the cluster watches its own status
+	// updates, so an unconditional write would spin the reconcile loop.
+	if !equality.Semantic.DeepEqual(&cluster.Status, newStatus) {
+		cluster.Status = *newStatus
+		if err := r.Status().Update(ctx, &cluster); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// clusterPhase is recomputed from the shard counts every reconcile so the phase
+// tracks health in both directions (a degraded shard demotes a Ready cluster).
+func clusterPhase(ready, degraded, total int32) pgshardv1alpha1.ClusterPhase {
+	switch {
+	case total == 0 || ready < total && degraded == 0:
+		return pgshardv1alpha1.ClusterProvisioning
+	case ready == total:
+		return pgshardv1alpha1.ClusterReady
+	default:
+		return pgshardv1alpha1.ClusterDegraded
+	}
 }
 
 // desiredShards is the initial expansion: equal ranges for data shards plus
@@ -150,8 +176,6 @@ func desiredShards(
 	if err != nil {
 		return nil, fmt.Errorf("splitting keyspace: %w", err)
 	}
-	image := cluster.Spec.Postgres.Image
-
 	shards := make([]pgshardv1alpha1.PgShardShard, 0, len(ranges)+1)
 	for _, kr := range ranges {
 		start := topology.FormatBound(kr.Start())
@@ -160,37 +184,40 @@ func desiredShards(
 			end = topology.FormatBound(e)
 		}
 		name := shardName(cluster.Name, start, end)
-		shards = append(shards, pgshardv1alpha1.PgShardShard{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
-			Spec: pgshardv1alpha1.PgShardShardSpec{
-				ClusterRef:         cluster.Name,
-				KeyRange:           pgshardv1alpha1.KeyRange{Start: start, End: end},
-				Role:               pgshardv1alpha1.ShardRoleData,
-				Replicas:           rendered.ReplicasPerShard,
-				Serving:            true,
-				PostgresConfigHash: rendered.ConfigHash,
-				Image:              image,
-				Resources:          rendered.Resources.DeepCopy(),
-				Stanza:             fmt.Sprintf("%s-g1", name),
-			},
-		})
+		shards = append(shards, shardFor(cluster, name,
+			pgshardv1alpha1.KeyRange{Start: start, End: end}, pgshardv1alpha1.ShardRoleData, rendered))
 	}
+	// The system shard is unsharded: its Role — not its key range — is what
+	// excludes it from data routing, so the zero (full-range) KeyRange is never
+	// consulted for placement. Partition/routing logic keys on Role==system.
 	systemName := fmt.Sprintf("%s-system", cluster.Name)
-	shards = append(shards, pgshardv1alpha1.PgShardShard{
-		ObjectMeta: metav1.ObjectMeta{Name: systemName, Namespace: cluster.Namespace},
+	shards = append(shards, shardFor(cluster, systemName,
+		pgshardv1alpha1.KeyRange{}, pgshardv1alpha1.ShardRoleSystem, rendered))
+	return shards, nil
+}
+
+// shardFor builds a PgShardShard with the fields the cluster controller owns.
+func shardFor(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	name string,
+	kr pgshardv1alpha1.KeyRange,
+	role pgshardv1alpha1.ShardRole,
+	rendered pgconfig.Rendered,
+) pgshardv1alpha1.PgShardShard {
+	return pgshardv1alpha1.PgShardShard{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
 		Spec: pgshardv1alpha1.PgShardShardSpec{
 			ClusterRef:         cluster.Name,
-			KeyRange:           pgshardv1alpha1.KeyRange{},
-			Role:               pgshardv1alpha1.ShardRoleSystem,
+			KeyRange:           kr,
+			Role:               role,
 			Replicas:           rendered.ReplicasPerShard,
 			Serving:            true,
 			PostgresConfigHash: rendered.ConfigHash,
-			Image:              image,
+			Image:              cluster.Spec.Postgres.Image,
 			Resources:          rendered.Resources.DeepCopy(),
-			Stanza:             fmt.Sprintf("%s-g1", systemName),
+			Stanza:             fmt.Sprintf("%s-g1", name),
 		},
-	})
-	return shards, nil
+	}
 }
 
 func shardName(cluster, start, end string) string {
@@ -208,14 +235,16 @@ func shardName(cluster, start, end string) string {
 func (r *PgShardClusterReconciler) ensureConfigMap(
 	ctx context.Context,
 	cluster *pgshardv1alpha1.PgShardCluster,
-	shard string,
+	shardName string,
 	rendered pgconfig.Rendered,
 ) error {
+	name := fmt.Sprintf("%s-postgres-config", shardName)
+	if len(name) > validation.DNS1123SubdomainMaxLength {
+		return fmt.Errorf("config map name %q exceeds %d characters; shorten the cluster name",
+			name, validation.DNS1123SubdomainMaxLength)
+	}
 	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-postgres-config", shard),
-			Namespace: cluster.Namespace,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
 	}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
 		cm.Data = map[string]string{
