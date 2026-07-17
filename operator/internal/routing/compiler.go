@@ -28,7 +28,10 @@ const defaultWriteLeaseSeconds int32 = 10
 
 const defaultSchema = "public"
 
-const instanceRolePrimary pgshardv1alpha1.InstanceRole = "primary"
+const (
+	instanceRolePrimary pgshardv1alpha1.InstanceRole = "primary"
+	instanceRoleReplica pgshardv1alpha1.InstanceRole = "replica"
+)
 
 // CompileInputs gathers everything the compiled view derives from.
 type CompileInputs struct {
@@ -69,7 +72,13 @@ func Compile(in CompileInputs) (pgshardv1alpha1.PgShardRoutingSpec, error) {
 	// so any input-order dependence would churn the epoch / topologyGeneration.
 	gates := slices.Clone(in.Gates)
 	slices.SortFunc(gates, func(a, b pgshardv1alpha1.RoutingGate) int {
-		return cmp.Compare(a.ID, b.ID)
+		// Tie-break beyond ID so two distinct gates that share an ID still order
+		// deterministically.
+		return cmp.Or(
+			cmp.Compare(a.ID, b.ID),
+			cmp.Compare(a.Mode, b.Mode),
+			a.Deadline.Compare(b.Deadline.Time),
+		)
 	})
 	spec := pgshardv1alpha1.PgShardRoutingSpec{
 		WriteLeaseSeconds: writeLease,
@@ -80,7 +89,9 @@ func Compile(in CompileInputs) (pgshardv1alpha1.PgShardRoutingSpec, error) {
 	shards := slices.Clone(in.Shards)
 	slices.SortFunc(shards, func(a, b pgshardv1alpha1.PgShardShard) int {
 		// Total order: Start alone ties whenever a reshard source and a split
-		// target share a bound, so tiebreak on End then Name.
+		// target share a bound, so tiebreak on End then Name. Names are unique
+		// (Kubernetes object identity), so this is a strict order for any real
+		// input list.
 		return cmp.Or(
 			cmp.Compare(a.Spec.KeyRange.Start, b.Spec.KeyRange.Start),
 			cmp.Compare(a.Spec.KeyRange.End, b.Spec.KeyRange.End),
@@ -145,6 +156,9 @@ func primaryEndpoint(
 	instances []pgshardv1alpha1.InstanceState,
 	primary string,
 ) (pgshardv1alpha1.RoutingEndpoint, bool) {
+	if primary == "" {
+		return pgshardv1alpha1.RoutingEndpoint{}, false
+	}
 	for _, inst := range instances {
 		if inst.Pod != primary {
 			continue
@@ -168,7 +182,9 @@ func replicaEndpoints(
 ) []pgshardv1alpha1.RoutingEndpoint {
 	var out []pgshardv1alpha1.RoutingEndpoint
 	for _, inst := range instances {
-		if inst.Pod == primary || inst.Role == instanceRolePrimary {
+		// Only explicit replicas are readable — an empty or primary role could
+		// be a stale writer, never safe to route reads to.
+		if inst.Role != instanceRoleReplica || inst.Pod == primary {
 			continue
 		}
 		ep, ok := endpoints[inst.Pod]
@@ -188,9 +204,15 @@ func replicaEndpoints(
 // canonically-ordered catalog. Duplicate detection and output order both fold
 // identifiers to lower case, matching PostgreSQL's unquoted-identifier rules.
 func compileTables(configs []pgshardv1alpha1.PgShardTableConfig) ([]pgshardv1alpha1.RoutingTable, error) {
+	// Process configs in name order so duplicate-table error attribution
+	// (FirstConfig/SecondConfig) is deterministic regardless of input order.
+	sorted := slices.Clone(configs)
+	slices.SortFunc(sorted, func(a, b pgshardv1alpha1.PgShardTableConfig) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
 	owner := map[string]string{}
 	var tables []pgshardv1alpha1.RoutingTable
-	for _, tc := range configs {
+	for _, tc := range sorted {
 		for _, t := range tc.Spec.Tables {
 			schema := t.Schema
 			if schema == "" {

@@ -135,6 +135,29 @@ func TestCompileDetectsDuplicateTablesAcrossConfigs(t *testing.T) {
 	}
 }
 
+func TestCompileExcludesNonReplicaInstances(t *testing.T) {
+	s := shard("c-min-max", "", "", true, "p1", pgshardv1alpha1.ShardRoleData)
+	// A Ready instance with an empty role must not be published as a replica.
+	s.Status.Instances = append(s.Status.Instances, pgshardv1alpha1.InstanceState{Pod: "ghost", Ready: true})
+	in := CompileInputs{
+		Cluster:   cluster(),
+		Shards:    []pgshardv1alpha1.PgShardShard{s},
+		Endpoints: endpoints("p1", "p1-r", "ghost"),
+	}
+	spec, err := Compile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range spec.Shards[0].Replicas {
+		if r.Pod == "ghost" {
+			t.Fatalf("empty-role instance must not be a replica: %+v", spec.Shards[0].Replicas)
+		}
+	}
+	if len(spec.Shards[0].Replicas) != 1 || spec.Shards[0].Replicas[0].Pod != "p1-r" {
+		t.Fatalf("want only the explicit replica p1-r, got %+v", spec.Shards[0].Replicas)
+	}
+}
+
 func TestCompileFoldsIdentifierCaseForDuplicates(t *testing.T) {
 	// PostgreSQL folds unquoted identifiers, so orders and Orders are one table.
 	in := CompileInputs{
