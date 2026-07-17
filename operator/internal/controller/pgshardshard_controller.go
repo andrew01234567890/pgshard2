@@ -80,7 +80,7 @@ type PgShardShardReconciler struct {
 	// StatusPollInterval is the requeue cadence for status aggregation.
 	StatusPollInterval time.Duration
 	// dialAgent resolves a pod address to an AgentService client. Defaults
-	// to the connection pool; tests inject fakes.
+	// to the connection pool; tests inject per-pod fakes.
 	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
 }
 
@@ -471,6 +471,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
 	polled := make([]corev1.Pod, 0, len(pods.Items))
+	views := make([]instanceView, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, shard) {
@@ -479,14 +480,20 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			continue
 		}
 		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
+		view := instanceView{pod: pod.Name, host: pod.Status.PodIP}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			status, err := r.pollAgent(pollCtx, pod.Status.PodIP)
 			cancel()
 			if err == nil {
+				view.observed = true
 				state.Ready = status.Ready
+				view.ready = status.Ready
+				view.receivedLSN = lsnValue(status.WalReceiveLsn)
+				view.walReceiver = status.WalReceiverActive
 				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
 					state.Role = roleLabelPrimary
+					view.isPrimary = true
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
 				state.WalReplayLSN = lsnString(status.WalReplayLsn)
@@ -494,6 +501,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		}
 		instances = append(instances, state)
 		polled = append(polled, *pod)
+		views = append(views, view)
 	}
 
 	shard.Status.Instances = instances
@@ -502,6 +510,12 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	// writes to a stale primary).
 	shard.Status.CurrentPrimary, shard.Status.Phase =
 		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
+
+	// Drive the target/current-primary handshake: track the healthy primary, or
+	// elect and promote a replacement when it is gone.
+	if err := r.reconcileFailover(ctx, shard, views); err != nil {
+		return nil, err
+	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a
 	// scale-down may prune (never the primary, never an unpollable pod).
@@ -563,6 +577,13 @@ func deriveShardStatus(
 	default:
 		return currentPrimary, pgshardv1alpha1.ShardDegraded
 	}
+}
+
+func lsnValue(lsn *pgshardv1.Lsn) uint64 {
+	if lsn == nil {
+		return 0
+	}
+	return lsn.Value
 }
 
 func (r *PgShardShardReconciler) pollAgent(

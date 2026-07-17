@@ -80,7 +80,7 @@ var _ = Describe("PgShardShard Controller", func() {
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 				Agents: agentclient.NewInsecurePool(),
-				Images: ShardImages{Postgres: "pg:test", Agent: "agent:test"},
+				Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
