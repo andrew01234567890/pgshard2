@@ -6,12 +6,23 @@
 //!
 //! This first slice handles the simple-query protocol for statements that route
 //! to a single target: a shard database, the system database, or a session-local
-//! statement. It connects a fresh backend per query with [`tokio_postgres`] and
-//! relays results in text form. Deferred to follow-ups: the extended protocol
-//! (Parse/Bind/Execute, which is where [`pgshard_plan::resolve_bound`] is used),
-//! scatter/merge, connection pooling, real session state (`SET` replay, txn
-//! pinning), SCRAM auth, and TLS. Until then a multi-statement query, a scatter,
-//! or a parameterized simple query is rejected rather than mis-handled.
+//! statement (which runs on any shard so `SELECT 1`/`SHOW` return real rows). It
+//! connects a fresh backend per query with [`tokio_postgres`] and relays results
+//! in text form.
+//!
+//! It never mis-handles what it cannot yet support: multi-statement queries,
+//! scatter/broadcast, parameterized simple queries, and transaction control
+//! (which would silently autocommit across per-query connections) are rejected
+//! with a clear SQLSTATE.
+//!
+//! Deferred to follow-ups: the extended protocol (Parse/Bind/Execute, where
+//! [`pgshard_plan::resolve_bound`] is used), scatter/merge, connection pooling,
+//! real session state (`SET` does not persist across queries yet), transaction
+//! pinning, SCRAM auth, and TLS. Because [`tokio_postgres`]'s text-mode simple
+//! query drops column type OIDs and the backend's command tag, v1 advertises all
+//! columns as text and reconstructs the tag from the leading keyword; a verbatim
+//! raw-protocol backend (which also streams rather than buffering rows) is the
+//! planned replacement.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -102,7 +113,9 @@ impl SimpleQueryHandler for Proxy {
             .map_err(|e| user_error("42601", format!("could not parse query: {e}")))?;
 
         match routes.as_slice() {
-            [] => Ok(vec![]),
+            // A submitted query with no statements (empty or comment-only) gets an
+            // EmptyQueryResponse, as PostgreSQL sends.
+            [] => Ok(vec![Response::EmptyQuery]),
             [route] => self.dispatch(route.clone(), query).await,
             _ => Err(user_error(
                 "0A000",
@@ -112,15 +125,35 @@ impl SimpleQueryHandler for Proxy {
     }
 }
 
+/// Transaction-control statements cannot be honored while the router opens a
+/// fresh backend connection per query: a `BEGIN` would silently autocommit its
+/// following statements. They are rejected rather than falsely acknowledged
+/// until session pinning lands.
+fn is_transaction_control(query: &str) -> bool {
+    matches!(
+        command_tag(query).as_str(),
+        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
+    )
+}
+
 impl Proxy {
     async fn dispatch(&self, route: Route, query: &str) -> PgWireResult<Vec<Response>> {
         match route {
             Route::Shard(t) => self.run_on(&t.endpoint, &t.database, query).await,
             Route::System(ep) => self.run_on(&ep, &self.backend.system_database, query).await,
-            // Session-local statements (SET/SHOW/txn/tableless) have no shard yet;
-            // acknowledge them without applying state (real session handling is a
-            // follow-up).
-            Route::Local => Ok(vec![Response::Execution(Tag::new(&command_tag(query)))]),
+            // Session-local statements: reject transaction control (it would break
+            // atomicity across per-query connections), and run everything else
+            // (`SELECT 1`, `SHOW`, `SET`) on any shard so reads return real rows.
+            // A `SET` there does not persist across queries yet — a documented
+            // limitation until session state lands.
+            Route::Local if is_transaction_control(query) => Err(user_error(
+                "0A000",
+                "transactions are not supported by this router version".to_owned(),
+            )),
+            Route::Local => match self.router.any_shard_target() {
+                Some(t) => self.run_on(&t.endpoint, &t.database, query).await,
+                None => Ok(vec![Response::Execution(Tag::new(&command_tag(query)))]),
+            },
             Route::Reject { code, reason } => Err(user_error(code, reason)),
             Route::Unavailable(reason) => Err(user_error("57P01", reason)),
             Route::Scatter(_) | Route::Broadcast(_) => Err(user_error(
@@ -145,6 +178,10 @@ fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec
     for msg in messages {
         match msg {
             SimpleQueryMessage::RowDescription(cols) => {
+                // v1 forwards a single statement, so there is one result set. If a
+                // second description ever arrives, start fresh so rows always match
+                // the current schema (never index a stale one out of bounds).
+                rows.clear();
                 schema = Some(Arc::new(
                     cols.iter()
                         .map(|c| {
@@ -181,9 +218,15 @@ fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec
             schema, row_stream,
         ))])
     } else {
-        Ok(vec![Response::Execution(
-            Tag::new(&command_tag(query)).with_rows(affected as usize),
-        )])
+        let command = command_tag(query);
+        // Only INSERT carries the `oid rows` tag shape (`INSERT 0 n`); UPDATE and
+        // DELETE are `verb n`. Getting INSERT's zero oid right keeps libpq's
+        // PQcmdTuples (psycopg2 rowcount) working.
+        let mut tag = Tag::new(&command).with_rows(affected as usize);
+        if command == "INSERT" {
+            tag = tag.with_oid(0);
+        }
+        Ok(vec![Response::Execution(tag)])
     }
 }
 

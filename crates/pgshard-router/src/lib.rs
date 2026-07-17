@@ -130,6 +130,18 @@ impl Router {
         self.epoch
     }
 
+    /// Any serving shard with a primary, as a connection [`Target`]. Used to run
+    /// tableless/session statements (`SELECT 1`, `SHOW`) that route nowhere in
+    /// particular — they run correctly on any shard database.
+    pub fn any_shard_target(&self) -> Option<Target> {
+        self.primaries.iter().find_map(|(id, primary)| {
+            primary.as_ref().map(|ep| Target {
+                endpoint: ep.clone(),
+                database: id.0.clone(),
+            })
+        })
+    }
+
     /// Route a (possibly multi-statement) query, one [`Route`] per statement.
     pub fn route(&self, sql: &str) -> Result<Vec<Route>, SqlError> {
         let parsed = pgshard_sql::parse(sql)?;

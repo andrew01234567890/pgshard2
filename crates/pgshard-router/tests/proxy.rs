@@ -127,4 +127,16 @@ async fn routes_single_shard_reads_and_writes_through_to_the_backend() {
         .await
         .unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+
+    // A tableless read runs on a shard and returns a real row (liveness probe).
+    let rows = client.simple_query("SELECT 1 AS one").await.unwrap();
+    let one = rows.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => Some(r.get("one").unwrap().to_owned()),
+        _ => None,
+    });
+    assert_eq!(one.as_deref(), Some("1"));
+
+    // Explicit transaction control is rejected, not silently autocommitted.
+    let err = client.simple_query("BEGIN").await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
 }
