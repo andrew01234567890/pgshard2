@@ -7,6 +7,7 @@ package fakes
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"sync"
 
@@ -335,8 +336,6 @@ func (f *FakeAgent) Databases() map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[string]string, len(f.databases))
-	for k, v := range f.databases {
-		out[k] = v
-	}
+	maps.Copy(out, f.databases)
 	return out
 }

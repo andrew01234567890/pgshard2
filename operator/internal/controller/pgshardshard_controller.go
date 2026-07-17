@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	grpcstatus "google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -276,7 +276,7 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		// InvalidArgument is a permanent contract violation; record it terminally
 		// rather than retrying forever. Other errors are transient — the poll
 		// interval retries.
-		if status.Code(err) == codes.InvalidArgument {
+		if grpcstatus.Code(err) == codes.InvalidArgument {
 			r.setDatabaseCondition(shard, metav1.ConditionFalse, "Rejected", err.Error())
 		} else {
 			log.Error(err, "creating shard database", "database", name)
