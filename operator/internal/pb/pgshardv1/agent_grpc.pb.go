@@ -40,6 +40,8 @@ const (
 	AgentService_DropSlot_FullMethodName           = "/pgshard.v1.AgentService/DropSlot"
 	AgentService_ExecSchema_FullMethodName         = "/pgshard.v1.AgentService/ExecSchema"
 	AgentService_MigrationStep_FullMethodName      = "/pgshard.v1.AgentService/MigrationStep"
+	AgentService_CreateDatabase_FullMethodName     = "/pgshard.v1.AgentService/CreateDatabase"
+	AgentService_DropDatabase_FullMethodName       = "/pgshard.v1.AgentService/DropDatabase"
 )
 
 // AgentServiceClient is the client API for AgentService service.
@@ -69,6 +71,8 @@ type AgentServiceClient interface {
 	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
 	ExecSchema(ctx context.Context, in *ExecSchemaRequest, opts ...grpc.CallOption) (*ExecSchemaResponse, error)
 	MigrationStep(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationStepResponse, error)
+	CreateDatabase(ctx context.Context, in *CreateDatabaseRequest, opts ...grpc.CallOption) (*CreateDatabaseResponse, error)
+	DropDatabase(ctx context.Context, in *DropDatabaseRequest, opts ...grpc.CallOption) (*DropDatabaseResponse, error)
 }
 
 type agentServiceClient struct {
@@ -307,6 +311,26 @@ func (c *agentServiceClient) MigrationStep(ctx context.Context, in *MigrationSte
 	return out, nil
 }
 
+func (c *agentServiceClient) CreateDatabase(ctx context.Context, in *CreateDatabaseRequest, opts ...grpc.CallOption) (*CreateDatabaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateDatabaseResponse)
+	err := c.cc.Invoke(ctx, AgentService_CreateDatabase_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentServiceClient) DropDatabase(ctx context.Context, in *DropDatabaseRequest, opts ...grpc.CallOption) (*DropDatabaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropDatabaseResponse)
+	err := c.cc.Invoke(ctx, AgentService_DropDatabase_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServiceServer is the server API for AgentService service.
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
@@ -334,6 +358,8 @@ type AgentServiceServer interface {
 	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
 	ExecSchema(context.Context, *ExecSchemaRequest) (*ExecSchemaResponse, error)
 	MigrationStep(context.Context, *MigrationStepRequest) (*MigrationStepResponse, error)
+	CreateDatabase(context.Context, *CreateDatabaseRequest) (*CreateDatabaseResponse, error)
+	DropDatabase(context.Context, *DropDatabaseRequest) (*DropDatabaseResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -406,6 +432,12 @@ func (UnimplementedAgentServiceServer) ExecSchema(context.Context, *ExecSchemaRe
 }
 func (UnimplementedAgentServiceServer) MigrationStep(context.Context, *MigrationStepRequest) (*MigrationStepResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method MigrationStep not implemented")
+}
+func (UnimplementedAgentServiceServer) CreateDatabase(context.Context, *CreateDatabaseRequest) (*CreateDatabaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateDatabase not implemented")
+}
+func (UnimplementedAgentServiceServer) DropDatabase(context.Context, *DropDatabaseRequest) (*DropDatabaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DropDatabase not implemented")
 }
 func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
@@ -792,6 +824,42 @@ func _AgentService_MigrationStep_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_CreateDatabase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateDatabaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).CreateDatabase(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_CreateDatabase_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).CreateDatabase(ctx, req.(*CreateDatabaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentService_DropDatabase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropDatabaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).DropDatabase(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_DropDatabase_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).DropDatabase(ctx, req.(*DropDatabaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -874,6 +942,14 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MigrationStep",
 			Handler:    _AgentService_MigrationStep_Handler,
+		},
+		{
+			MethodName: "CreateDatabase",
+			Handler:    _AgentService_CreateDatabase_Handler,
+		},
+		{
+			MethodName: "DropDatabase",
+			Handler:    _AgentService_DropDatabase_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

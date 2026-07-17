@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use tokio_postgres::NoTls;
+use tokio_postgres::error::SqlState;
 
 use crate::instance::{Instance, Snapshot};
 
@@ -27,6 +28,14 @@ impl PgInstance {
         });
         Ok(client)
     }
+}
+
+/// Quote a PostgreSQL identifier: wrap in double quotes and double any embedded
+/// double quote. Database names come from the operator (Kubernetes object
+/// names), but quoting keeps the generated DDL correct for names with hyphens
+/// and safe against injection regardless of the source.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 /// PostgreSQL text LSN ("X/Y", hex) to the u64 the wire protocol uses.
@@ -124,11 +133,46 @@ impl Instance for PgInstance {
         self.connect().await?.batch_execute(sql).await?;
         Ok(())
     }
+
+    async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()> {
+        let client = self.connect().await?;
+        // Fast path: skip the DDL (and its error) when the database is present.
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&name],
+            )
+            .await?
+            .get(0);
+        if exists {
+            return Ok(());
+        }
+        let mut stmt = format!("CREATE DATABASE {}", quote_ident(name));
+        if !owner.is_empty() {
+            stmt.push_str(&format!(" OWNER {}", quote_ident(owner)));
+        }
+        // CREATE DATABASE cannot run inside a transaction block; simple-query.
+        match client.batch_execute(&stmt).await {
+            Ok(()) => Ok(()),
+            // Lost the check-then-create race with a concurrent caller: the
+            // database now exists, which is the requested end state.
+            Err(e) if e.code() == Some(&SqlState::DUPLICATE_DATABASE) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn drop_database(&self, name: &str) -> anyhow::Result<()> {
+        // IF EXISTS makes the drop idempotent; WITH (FORCE) terminates any
+        // sessions still on the database (PG13+) so it can be removed at once.
+        let stmt = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", quote_ident(name));
+        self.connect().await?.batch_execute(&stmt).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_lsn;
+    use super::{parse_lsn, quote_ident};
 
     #[test]
     fn parses_hex_lsn() {
@@ -136,5 +180,11 @@ mod tests {
         assert_eq!(parse_lsn("0/5000000"), 0x5000000);
         assert_eq!(parse_lsn("1/0"), 1u64 << 32);
         assert_eq!(parse_lsn("garbage"), 0);
+    }
+
+    #[test]
+    fn quotes_identifiers_and_escapes_embedded_quotes() {
+        assert_eq!(quote_ident("mycl-x40-x80"), "\"mycl-x40-x80\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 }
