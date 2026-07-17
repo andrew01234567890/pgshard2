@@ -1,0 +1,18 @@
+[package]
+name = "pgshard-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pg_query = "6.1.1"
+pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
+pgshard-sql = { version = "0.0.0", path = "../pgshard-sql" }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+insta = "1.48.0"
