@@ -234,6 +234,7 @@ func compileTables(configs []pgshardv1alpha1.PgShardTableConfig) ([]pgshardv1alp
 				Name:           t.Name,
 				Type:           t.Type,
 				ShardKeyColumn: t.ShardKeyColumn,
+				ShardKeyType:   t.ShardKeyType,
 				Sequences:      seqs,
 			})
 		}

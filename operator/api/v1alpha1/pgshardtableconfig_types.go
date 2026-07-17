@@ -30,6 +30,21 @@ const (
 	TableGlobal  TableType = "global"
 )
 
+// ShardKeyType is the type of a shard-key column. The router coerces a literal
+// to it before hashing so that different spellings of one value (e.g. `id = 1`
+// and `id = '1'`) route to the same shard. The string values are the wire
+// contract with the Rust router's `pgshard_topo::ShardKeyType` — keep them in
+// sync.
+// +kubebuilder:validation:Enum=int;text;uuid;bytea
+type ShardKeyType string
+
+const (
+	ShardKeyInt   ShardKeyType = "int"
+	ShardKeyText  ShardKeyType = "text"
+	ShardKeyUUID  ShardKeyType = "uuid"
+	ShardKeyBytea ShardKeyType = "bytea"
+)
+
 // TableEntry declares one table's sharding configuration. Identifier fields
 // flow into PostgreSQL DDL, so they are constrained at admission to
 // unquoted-identifier syntax (letters/digits/underscore/$, not starting with
@@ -56,6 +71,12 @@ type TableEntry struct {
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
 
+	// Type of the shard-key column, so the router coerces a literal to it
+	// before hashing (`id = '1'` and `id = 1` route alike). Required for
+	// sharded tables; must match the column's actual PostgreSQL type.
+	// +optional
+	ShardKeyType ShardKeyType `json:"shardKeyType,omitempty"`
+
 	// +optional
 	Sequences []RoutingSequence `json:"sequences,omitempty"`
 }
@@ -79,6 +100,7 @@ type SequenceEntry struct {
 // tables independently); the routing compiler validates that no table is
 // declared twice across the union.
 // +kubebuilder:validation:XValidation:rule="!has(self.tables) || self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyColumn) && size(t.shardKeyColumn) > 0))",message="sharded tables must declare shardKeyColumn"
+// +kubebuilder:validation:XValidation:rule="!has(self.tables) || self.tables.all(t, !has(t.type) || t.type != 'sharded' || (has(t.shardKeyType) && size(t.shardKeyType) > 0))",message="sharded tables must declare shardKeyType"
 type PgShardTableConfigSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterRef is immutable"
 	ClusterRef string `json:"clusterRef"`

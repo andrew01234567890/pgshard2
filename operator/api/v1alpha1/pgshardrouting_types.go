@@ -104,6 +104,12 @@ type RoutingTable struct {
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
 
+	// Type of the shard-key column, projected from TableEntry so the router can
+	// coerce literals before hashing. The wire values match the Rust router's
+	// `pgshard_topo::ShardKeyType`.
+	// +optional
+	ShardKeyType ShardKeyType `json:"shardKeyType,omitempty"`
+
 	// +optional
 	Sequences []RoutingSequence `json:"sequences,omitempty"`
 }

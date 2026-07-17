@@ -296,6 +296,17 @@ spec:
                       maxLength: 63
                       pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
+                    shardKeyType:
+                      description: |-
+                        Type of the shard-key column, projected from TableEntry so the router can
+                        coerce literals before hashing. The wire values match the Rust router's
+                        `pgshard_topo::ShardKeyType`.
+                      enum:
+                      - int
+                      - text
+                      - uuid
+                      - bytea
+                      type: string
                     type:
                       description: |-
                         Reuses the vschema TableType (sharded;global); the routing compiler

@@ -122,6 +122,17 @@ spec:
                       maxLength: 63
                       pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
                       type: string
+                    shardKeyType:
+                      description: |-
+                        Type of the shard-key column, so the router coerces a literal to it
+                        before hashing (`id = '1'` and `id = 1` route alike). Required for
+                        sharded tables; must match the column's actual PostgreSQL type.
+                      enum:
+                      - int
+                      - text
+                      - uuid
+                      - bytea
+                      type: string
                     type:
                       default: sharded
                       description: TableType classifies a table in the sharding schema.
@@ -142,6 +153,9 @@ spec:
               rule: '!has(self.tables) || self.tables.all(t, !has(t.type) || t.type
                 != ''sharded'' || (has(t.shardKeyColumn) && size(t.shardKeyColumn)
                 > 0))'
+            - message: sharded tables must declare shardKeyType
+              rule: '!has(self.tables) || self.tables.all(t, !has(t.type) || t.type
+                != ''sharded'' || (has(t.shardKeyType) && size(t.shardKeyType) > 0))'
           status:
             description: PgShardTableConfigStatus reports compilation results.
             properties:

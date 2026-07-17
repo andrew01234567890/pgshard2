@@ -142,9 +142,17 @@ var _ = Describe("API validation", func() {
 		Expect(k8sClient.Create(ctx, tc("tc-nokey", []pgshardv1alpha1.TableEntry{
 			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded},
 		}))).NotTo(Succeed())
+		// Sharded table with a key column but no key type is rejected: the
+		// router needs the type to hash literals correctly.
+		Expect(k8sClient.Create(ctx, tc("tc-notype", []pgshardv1alpha1.TableEntry{
+			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol},
+		}))).NotTo(Succeed())
 		// Identifier with a SQL metacharacter is rejected.
 		Expect(k8sClient.Create(ctx, tc("tc-inject", []pgshardv1alpha1.TableEntry{
-			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: `id"); DROP TABLE x; --`},
+			{
+				Name: ordersTable, Type: pgshardv1alpha1.TableSharded,
+				ShardKeyColumn: `id"); DROP TABLE x; --`, ShardKeyType: pgshardv1alpha1.ShardKeyInt,
+			},
 		}))).NotTo(Succeed())
 		// A sequence-only config (no tables) is admitted — the CEL rule must
 		// not dereference an absent tables list.
@@ -159,7 +167,10 @@ var _ = Describe("API validation", func() {
 		_ = k8sClient.Delete(ctx, seqOnly)
 		// A valid sharded table is admitted.
 		ok := tc("tc-ok", []pgshardv1alpha1.TableEntry{
-			{Name: ordersTable, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol},
+			{
+				Name: ordersTable, Type: pgshardv1alpha1.TableSharded,
+				ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt,
+			},
 		})
 		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
 		_ = k8sClient.Delete(ctx, ok)
