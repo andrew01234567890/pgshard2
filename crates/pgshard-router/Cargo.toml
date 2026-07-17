@@ -1,0 +1,16 @@
+[package]
+name = "pgshard-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
+pgshard-plan = { version = "0.0.0", path = "../pgshard-plan" }
+pgshard-sql = { version = "0.0.0", path = "../pgshard-sql" }
+pgshard-topo = { version = "0.0.0", path = "../pgshard-topo" }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

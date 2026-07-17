@@ -1,0 +1,386 @@
+//! The router's routing layer: turn a compiled [`Topology`] into an executable
+//! [`Router`], then route SQL to concrete node endpoints.
+//!
+//! This is the bridge between the pieces that already exist — the topology watch
+//! ([`pgshard_topo`]), the SQL parser ([`pgshard_sql`]), and the planner
+//! ([`pgshard_plan`]) — and the wire session loop that will call it. [`Router`]
+//! is an immutable snapshot built from one epoch's topology; the session layer
+//! swaps a new one in when a higher epoch is applied.
+//!
+//! # Scope
+//!
+//! The routable shard set is the topology's `Serving` shards, which must
+//! partition the keyspace (they do at steady state; a transient reshard state
+//! that does not is a build error, so the caller keeps the previous snapshot).
+//! Writes and single-shard reads go to a shard's primary; a scatter read fans to
+//! the primaries of the covered shards (M1 does not route reads to replicas
+//! through the router). A shard with no current primary (mid-failover) resolves
+//! to [`Route::Unavailable`] rather than a wrong endpoint.
+
+use std::collections::BTreeMap;
+
+use pgshard_core::{KeyRange, SequenceBinding, TableDef, TableName, VSchema, VSchemaError};
+use pgshard_plan::{Parameterized, Plan, ShardCatalog, ShardId};
+use pgshard_sql::SqlError;
+use pgshard_topo::{ShardState, TableType, Topology};
+
+pub use pgshard_topo::Instance as Endpoint;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    #[error("sharded table {0} has no shard key column")]
+    MissingShardKey(TableName),
+    #[error(transparent)]
+    VSchema(#[from] VSchemaError),
+    #[error("serving shards do not partition the keyspace: {0}")]
+    Partition(#[from] pgshard_core::PartitionError),
+}
+
+/// Where the router should send one statement, resolved to concrete endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Send to this one node.
+    Shard(Endpoint),
+    /// Fan a read out to these nodes and merge.
+    Scatter(Vec<Endpoint>),
+    /// Run on every shard's node (DDL).
+    Broadcast(Vec<Endpoint>),
+    /// The unsharded system database.
+    System(Endpoint),
+    /// The session layer handles it (SET/SHOW/txn/tableless).
+    Local,
+    /// Routing needs bind parameters; the executor finishes at Bind.
+    NeedsBind(Parameterized),
+    /// A targeted shard currently has no primary (failing over); the router must
+    /// not guess an endpoint.
+    Unavailable(String),
+    /// The statement cannot be routed; return this SQLSTATE.
+    Reject { code: &'static str, reason: String },
+}
+
+/// An immutable routing snapshot for one topology epoch.
+pub struct Router {
+    epoch: u64,
+    vschema: VSchema,
+    catalog: ShardCatalog,
+    /// Every serving shard's current primary, if it has one.
+    primaries: BTreeMap<ShardId, Option<Endpoint>>,
+    /// The system (unsharded) database endpoint, if known.
+    system: Option<Endpoint>,
+}
+
+impl Router {
+    /// Build a router from a compiled topology. Fails if a sharded table lacks a
+    /// shard key, the hash function is unknown, or the serving shards do not
+    /// partition the keyspace.
+    pub fn build(topo: &Topology) -> Result<Self, BuildError> {
+        let vschema = build_vschema(topo)?;
+
+        let mut serving: Vec<(KeyRange, ShardId)> = Vec::new();
+        let mut primaries = BTreeMap::new();
+        for shard in &topo.shards {
+            if shard.state != ShardState::Serving {
+                continue;
+            }
+            let id = ShardId::new(shard.name.clone());
+            serving.push((shard.key_range, id.clone()));
+            primaries.insert(id, shard.primary.clone());
+        }
+        let catalog = ShardCatalog::new(serving)?;
+
+        Ok(Router {
+            epoch: topo.epoch,
+            vschema,
+            catalog,
+            primaries,
+            system: topo.sequence_endpoint.clone(),
+        })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Route a (possibly multi-statement) query, one [`Route`] per statement.
+    pub fn route(&self, sql: &str) -> Result<Vec<Route>, SqlError> {
+        let parsed = pgshard_sql::parse(sql)?;
+        let plans = pgshard_plan::plan_all(&parsed, &self.vschema, &self.catalog);
+        Ok(plans.into_iter().map(|p| self.resolve(p)).collect())
+    }
+
+    fn resolve(&self, plan: Plan) -> Route {
+        match plan {
+            Plan::SingleShard(id) => match self.primary(&id) {
+                Ok(ep) => Route::Shard(ep),
+                Err(unavail) => unavail,
+            },
+            Plan::Scatter(ids) => self.resolve_many(ids, Route::Scatter),
+            Plan::Broadcast(ids) => self.resolve_many(ids, Route::Broadcast),
+            Plan::Unsharded => match &self.system {
+                Some(ep) => Route::System(ep.clone()),
+                None => Route::Unavailable("system database has no endpoint".to_owned()),
+            },
+            Plan::RouterLocal => Route::Local,
+            Plan::Parameterized(p) => Route::NeedsBind(p),
+            Plan::Reject { code, reason } => Route::Reject { code, reason },
+        }
+    }
+
+    /// The primary endpoint of `id`, or a [`Route::Unavailable`] describing why.
+    fn primary(&self, id: &ShardId) -> Result<Endpoint, Route> {
+        match self.primaries.get(id) {
+            Some(Some(ep)) => Ok(ep.clone()),
+            Some(None) => Err(Route::Unavailable(format!("shard {id} has no primary"))),
+            // The planner only names shards from this catalog, so a miss is a bug
+            // rather than a routing outcome — surface it as unavailable.
+            None => Err(Route::Unavailable(format!(
+                "shard {id} is not in the topology"
+            ))),
+        }
+    }
+
+    fn resolve_many(&self, ids: Vec<ShardId>, wrap: fn(Vec<Endpoint>) -> Route) -> Route {
+        let mut eps = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.primary(&id) {
+                Ok(ep) => eps.push(ep),
+                Err(unavail) => return unavail,
+            }
+        }
+        wrap(eps)
+    }
+}
+
+fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {
+    let mut vschema = VSchema::default();
+    for t in &topo.tables {
+        let name = TableName::new(t.schema.clone(), t.name.clone());
+        let def = match t.table_type {
+            TableType::Global => TableDef::Global,
+            TableType::Sharded => {
+                let shard_key_column = t
+                    .shard_key_column
+                    .clone()
+                    .ok_or_else(|| BuildError::MissingShardKey(name.clone()))?;
+                TableDef::Sharded {
+                    shard_key_column,
+                    shard_function: topo.hash_function.clone(),
+                    sequences: t
+                        .sequences
+                        .iter()
+                        .map(|s| SequenceBinding {
+                            column: s.column.clone(),
+                            sequence: s.sequence.clone(),
+                        })
+                        .collect(),
+                }
+            }
+        };
+        vschema.insert(name, def)?;
+    }
+    Ok(vschema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pgshard_topo::{Instance, Sequence, ShardEntry, TableEntry};
+
+    fn instance(pod: &str) -> Instance {
+        Instance {
+            pod: pod.to_owned(),
+            host: format!("{pod}-host"),
+            port: 5432,
+            can_read: false,
+        }
+    }
+
+    fn shard(name: &str, range: &str, primary: Option<&str>) -> ShardEntry {
+        ShardEntry {
+            name: name.to_owned(),
+            key_range: range.parse().unwrap(),
+            state: ShardState::Serving,
+            primary: primary.map(instance),
+            replicas: Vec::new(),
+        }
+    }
+
+    fn orders() -> TableEntry {
+        TableEntry {
+            schema: "public".into(),
+            name: "orders".into(),
+            table_type: TableType::Sharded,
+            shard_key_column: Some("customer_id".into()),
+            sequences: vec![Sequence {
+                column: "id".into(),
+                sequence: "orders_id".into(),
+            }],
+        }
+    }
+
+    fn settings() -> TableEntry {
+        TableEntry {
+            schema: "public".into(),
+            name: "settings".into(),
+            table_type: TableType::Global,
+            shard_key_column: None,
+            sequences: Vec::new(),
+        }
+    }
+
+    fn topology(shards: Vec<ShardEntry>, tables: Vec<TableEntry>) -> Topology {
+        Topology {
+            epoch: 7,
+            topology_generation: 1,
+            write_lease_seconds: 10,
+            hash_function: "xxhash64_v1".into(),
+            shards,
+            tables,
+            gates: Vec::new(),
+            sequence_endpoint: Some(instance("system")),
+        }
+    }
+
+    fn router() -> Router {
+        Router::build(&topology(
+            vec![
+                shard("s0", "-80", Some("s0p")),
+                shard("s1", "80-", Some("s1p")),
+            ],
+            vec![orders(), settings()],
+        ))
+        .unwrap()
+    }
+
+    fn one(sql: &str) -> Route {
+        router().route(sql).unwrap().into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn single_shard_resolves_to_that_shards_primary() {
+        // customer_id=1 hashes into [80-) -> s1; =0 into [-80) -> s0.
+        assert_eq!(
+            one("SELECT * FROM orders WHERE customer_id = 1"),
+            Route::Shard(instance("s1p"))
+        );
+        assert_eq!(
+            one("INSERT INTO orders (customer_id) VALUES (0)"),
+            Route::Shard(instance("s0p"))
+        );
+    }
+
+    #[test]
+    fn scatter_and_broadcast_resolve_to_primaries() {
+        assert_eq!(
+            one("SELECT * FROM orders"),
+            Route::Scatter(vec![instance("s0p"), instance("s1p")])
+        );
+        assert_eq!(
+            one("CREATE TABLE t (id int)"),
+            Route::Broadcast(vec![instance("s0p"), instance("s1p")])
+        );
+    }
+
+    #[test]
+    fn global_reads_go_to_the_system_endpoint() {
+        assert_eq!(
+            one("SELECT * FROM settings"),
+            Route::System(instance("system"))
+        );
+        assert_eq!(one("SELECT 1"), Route::Local);
+    }
+
+    #[test]
+    fn parameterized_and_reject_pass_through() {
+        assert!(matches!(
+            one("SELECT * FROM orders WHERE customer_id = $1"),
+            Route::NeedsBind(_)
+        ));
+        assert!(matches!(
+            one("UPDATE orders SET total = 1"),
+            Route::Reject { code: "0A000", .. }
+        ));
+    }
+
+    #[test]
+    fn a_shard_without_a_primary_is_unavailable() {
+        let r = Router::build(&topology(
+            vec![
+                shard("s0", "-80", Some("s0p")),
+                shard("s1", "80-", None), // failing over
+            ],
+            vec![orders()],
+        ))
+        .unwrap();
+        // customer_id=1 -> s1, which has no primary.
+        assert!(matches!(
+            r.route("SELECT * FROM orders WHERE customer_id = 1")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+            Route::Unavailable(_)
+        ));
+        // A scatter also becomes unavailable if any covered shard lacks a primary.
+        assert!(matches!(
+            r.route("SELECT * FROM orders")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+            Route::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn non_serving_shards_are_excluded_from_routing() {
+        // A buffered reshard target does not partition the space on its own; the
+        // serving shards must still partition. Here the serving pair does.
+        let mut extra = shard("target", "40-80", Some("tp"));
+        extra.state = ShardState::Buffered;
+        let r = Router::build(&topology(
+            vec![
+                shard("s0", "-80", Some("s0p")),
+                shard("s1", "80-", Some("s1p")),
+                extra,
+            ],
+            vec![orders()],
+        ))
+        .unwrap();
+        assert_eq!(
+            r.route("SELECT * FROM orders WHERE customer_id = 1")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+            Route::Shard(instance("s1p"))
+        );
+    }
+
+    #[test]
+    fn build_rejects_bad_topologies() {
+        // Serving shards that leave a gap are not a partition.
+        let gap = topology(
+            vec![shard("s0", "-40", Some("a")), shard("s1", "80-", Some("b"))],
+            vec![orders()],
+        );
+        assert!(matches!(Router::build(&gap), Err(BuildError::Partition(_))));
+
+        // A sharded table with no shard key.
+        let mut bad_table = orders();
+        bad_table.shard_key_column = None;
+        let missing = topology(vec![shard("s0", "-", Some("a"))], vec![bad_table]);
+        assert!(matches!(
+            Router::build(&missing),
+            Err(BuildError::MissingShardKey(_))
+        ));
+
+        // An unknown hash function.
+        let mut unknown = topology(vec![shard("s0", "-", Some("a"))], vec![orders()]);
+        unknown.hash_function = "md5".into();
+        assert!(matches!(
+            Router::build(&unknown),
+            Err(BuildError::VSchema(_))
+        ));
+    }
+}
