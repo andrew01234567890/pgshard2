@@ -27,9 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard2/operator/internal/pgconfig"
@@ -49,6 +51,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardnodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -87,13 +90,16 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Record where each shard's database will live. This is placement metadata
-	// only: the physical PgShardNodes are materialized (and the shard controller
-	// stops managing pods) in the physical-handoff step, so nothing here creates
-	// an object that could collide with the still-active shard controller.
-	assignment := shardNodeAssignment(&cluster, desired)
-	for i := range desired {
-		desired[i].Spec.NodeRef = assignment[desired[i].Name]
+	// Create the physical PgShardNodes and record each shard's placement. A
+	// placed shard's own controller gates off its physical half, so the node is
+	// the sole owner of that shard's pods/services — no collision even though a
+	// dedicated node shares its shard's name.
+	requeue, err := r.placeShards(ctx, &cluster, rendered, desired)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if requeue {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	ready, degraded := int32(0), int32(0)
@@ -257,23 +263,15 @@ func shardName(cluster, start, end string) string {
 	return fmt.Sprintf("%s-%s-%s", cluster, start, end)
 }
 
+// nodeNameMaxLength mirrors the PgShardNode name CEL limit (a name must build a
+// Service name within 63 chars).
+const nodeNameMaxLength = 58
+
 func sharedNodeName(cluster string) string {
 	return fmt.Sprintf("%s-shared", cluster)
 }
 
-// shardNodeAssignment maps each shard to the PgShardNode name that will host its
-// database, per the cluster's placement mode. Dedicated modes give each shard
-// its own node (name = the shard name = today's per-shard topology); shared
-// packs every shard database onto one node (<cluster>-shared, or another
-// cluster's shared node via colocateWith). This only records the placement
-// decision as NodeRef — a pure function of the spec — so it can never collide
-// with, or race, the still-active shard controller; the physical PgShardNodes
-// (and the shard controller ceding pod ownership, and routing following) are
-// the physical-handoff step, not here.
-func shardNodeAssignment(
-	cluster *pgshardv1alpha1.PgShardCluster,
-	shards []pgshardv1alpha1.PgShardShard,
-) map[string]string {
+func placementOf(cluster *pgshardv1alpha1.PgShardCluster) (pgshardv1alpha1.PlacementMode, string) {
 	mode := pgshardv1alpha1.PlacementDedicatedInstance
 	colocateWith := ""
 	if cluster.Spec.Placement != nil {
@@ -282,18 +280,41 @@ func shardNodeAssignment(
 		}
 		colocateWith = cluster.Spec.Placement.ColocateWith
 	}
-	assignment := make(map[string]string, len(shards))
+	return mode, colocateWith
+}
+
+// desiredPlacement computes each shard's node assignment plus the PgShardNodes
+// this cluster owns and must create. Dedicated modes give each shard its own
+// node (name = the shard name = today's per-shard topology); shared packs every
+// shard database onto one node (<cluster>-shared, or another cluster's shared
+// node via colocateWith, which that cluster owns — external names it but does
+// not create it).
+func desiredPlacement(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	rendered pgconfig.Rendered,
+	shards []pgshardv1alpha1.PgShardShard,
+) (assignment map[string]string, owned []pgshardv1alpha1.PgShardNode, external string, err error) {
+	mode, colocateWith := placementOf(cluster)
+	assignment = make(map[string]string, len(shards))
 
 	if mode == pgshardv1alpha1.PlacementShared {
 		target := cluster.Name
 		if colocateWith != "" {
 			target = colocateWith
+			external = sharedNodeName(target)
 		}
 		node := sharedNodeName(target)
 		for i := range shards {
 			assignment[shards[i].Name] = node
 		}
-		return assignment
+		if colocateWith == "" {
+			n, err := nodeFor(cluster, node, rendered)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			owned = append(owned, n)
+		}
+		return assignment, owned, external, nil
 	}
 
 	// dedicatedInstance / dedicatedMachine: one node per shard. Machine
@@ -301,8 +322,116 @@ func shardNodeAssignment(
 	// scheduling field); the fan-out is what differs today.
 	for i := range shards {
 		assignment[shards[i].Name] = shards[i].Name
+		n, err := nodeFor(cluster, shards[i].Name, rendered)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		owned = append(owned, n)
 	}
-	return assignment
+	return assignment, owned, "", nil
+}
+
+// nodeFor builds a PgShardNode with the physical fields the cluster owns,
+// derived from the same rendered configuration the shards use.
+func nodeFor(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	name string,
+	rendered pgconfig.Rendered,
+) (pgshardv1alpha1.PgShardNode, error) {
+	if len(name) > nodeNameMaxLength {
+		return pgshardv1alpha1.PgShardNode{}, fmt.Errorf(
+			"node name %q exceeds %d characters; shorten the cluster name", name, nodeNameMaxLength)
+	}
+	return pgshardv1alpha1.PgShardNode{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
+		Spec: pgshardv1alpha1.PgShardNodeSpec{
+			Replicas:           rendered.ReplicasPerShard,
+			Image:              cluster.Spec.Postgres.Image,
+			Resources:          rendered.Resources.DeepCopy(),
+			PostgresConfigHash: rendered.ConfigHash,
+		},
+	}, nil
+}
+
+// placeShards creates the cluster-owned PgShardNodes and assigns each shard's
+// NodeRef to the node that hosts its database.
+func (r *PgShardClusterReconciler) placeShards(
+	ctx context.Context,
+	cluster *pgshardv1alpha1.PgShardCluster,
+	rendered pgconfig.Rendered,
+	desired []pgshardv1alpha1.PgShardShard,
+) (requeue bool, err error) {
+	assignment, owned, external, err := desiredPlacement(cluster, rendered, desired)
+	if err != nil {
+		return false, err
+	}
+	if external != "" {
+		// colocateWith points shards at another cluster's shared node; require it
+		// to exist before adopting the placement.
+		var ext pgshardv1alpha1.PgShardNode
+		if err := r.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: external}, &ext); err != nil {
+			return false, fmt.Errorf("colocation target node %s: %w", external, err)
+		}
+	}
+	for i := range owned {
+		requeue, err := r.ensureNode(ctx, cluster, &owned[i], rendered)
+		if err != nil {
+			return false, err
+		}
+		if requeue {
+			return true, nil
+		}
+	}
+	for i := range desired {
+		desired[i].Spec.NodeRef = assignment[desired[i].Name]
+	}
+	return false, nil
+}
+
+// ensureNode creates a cluster-owned PgShardNode (and its config map) if absent,
+// or converges the fields the cluster owns on an existing owned node. It mirrors
+// the shard create path: on AlreadyExists it requeues so the next reconcile Gets
+// the node and runs the ownership check before writing its config map.
+func (r *PgShardClusterReconciler) ensureNode(
+	ctx context.Context,
+	cluster *pgshardv1alpha1.PgShardCluster,
+	node *pgshardv1alpha1.PgShardNode,
+	rendered pgconfig.Rendered,
+) (requeue bool, err error) {
+	existing := &pgshardv1alpha1.PgShardNode{}
+	getErr := r.Get(ctx, client.ObjectKeyFromObject(node), existing)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		if err := controllerutil.SetControllerReference(cluster, node, r.Scheme); err != nil {
+			return false, err
+		}
+		if err := r.Create(ctx, node); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return true, nil
+			}
+			return false, fmt.Errorf("creating node %s: %w", node.Name, err)
+		}
+		return false, r.ensureConfigMap(ctx, cluster, node.Name, rendered)
+	case getErr != nil:
+		return false, getErr
+	default:
+		if !metav1.IsControlledBy(existing, cluster) {
+			return false, fmt.Errorf("node %s exists but is not controlled by cluster %s", node.Name, cluster.Name)
+		}
+		if err := r.ensureConfigMap(ctx, cluster, node.Name, rendered); err != nil {
+			return false, err
+		}
+		if existing.Spec.PostgresConfigHash != node.Spec.PostgresConfigHash ||
+			existing.Spec.Replicas != node.Spec.Replicas ||
+			existing.Spec.Image != node.Spec.Image {
+			existing.Spec.PostgresConfigHash = node.Spec.PostgresConfigHash
+			existing.Spec.Replicas = node.Spec.Replicas
+			existing.Spec.Image = node.Spec.Image
+			existing.Spec.Resources = node.Spec.Resources
+			return false, r.Update(ctx, existing)
+		}
+		return false, nil
+	}
 }
 
 // ensureConfigMap materializes the rendered postgresql parameters for one
@@ -349,6 +478,10 @@ func (r *PgShardClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Owns(&pgshardv1alpha1.PgShardShard{}).
+		// A node's status advances its WAL LSN every commit without bumping its
+		// generation; watch only generation changes so healthy nodes do not
+		// re-enqueue the cluster on every poll (O(shards) events otherwise).
+		Owns(&pgshardv1alpha1.PgShardNode{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.ConfigMap{}).
 		Named("pgshardcluster").
 		Complete(r)
