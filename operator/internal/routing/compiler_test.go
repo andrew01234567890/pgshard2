@@ -2,12 +2,25 @@ package routing
 
 import (
 	"errors"
+	"reflect"
+	"slices"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
+
+func tableConfig(name string, tables ...string) pgshardv1alpha1.PgShardTableConfig {
+	c := pgshardv1alpha1.PgShardTableConfig{}
+	c.Name = name
+	for _, tbl := range tables {
+		c.Spec.Tables = append(c.Spec.Tables, pgshardv1alpha1.TableEntry{
+			Name: tbl, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "id",
+		})
+	}
+	return c
+}
 
 func cluster() *pgshardv1alpha1.PgShardCluster {
 	c := &pgshardv1alpha1.PgShardCluster{}
@@ -119,5 +132,60 @@ func TestCompileDetectsDuplicateTablesAcrossConfigs(t *testing.T) {
 	var dup *DuplicateTableError
 	if !errors.As(err, &dup) || dup.FirstConfig != "team-a" || dup.SecondConfig != "team-b" {
 		t.Fatalf("expected duplicate-table error naming both configs, got %v", err)
+	}
+}
+
+func TestCompileFoldsIdentifierCaseForDuplicates(t *testing.T) {
+	// PostgreSQL folds unquoted identifiers, so orders and Orders are one table.
+	in := CompileInputs{
+		Cluster:   cluster(),
+		Shards:    []pgshardv1alpha1.PgShardShard{shard("all", "", "", true, "p1", pgshardv1alpha1.ShardRoleData)},
+		Endpoints: endpoints("p1"),
+		TableConfigs: []pgshardv1alpha1.PgShardTableConfig{
+			tableConfig("team-a", "orders"), tableConfig("team-b", "Orders"),
+		},
+	}
+	var dup *DuplicateTableError
+	if _, err := Compile(in); !errors.As(err, &dup) {
+		t.Fatalf("case-variant table names must be detected as duplicates, got %v", err)
+	}
+}
+
+func TestCompileIsDeterministicUnderInputPermutation(t *testing.T) {
+	// Includes a reshard source [40,80) (hidden) that shares Start=40 with the
+	// split target [40,60) — the case a Start-only sort key cannot order.
+	shards := []pgshardv1alpha1.PgShardShard{
+		shard("c-min-40", "", "40", true, "p1", pgshardv1alpha1.ShardRoleData),
+		shard("c-40-60", "40", "60", true, "p4", pgshardv1alpha1.ShardRoleData),
+		shard("c-60-80", "60", "80", true, "p5", pgshardv1alpha1.ShardRoleData),
+		shard("c-80-max", "80", "", true, "p2", pgshardv1alpha1.ShardRoleData),
+		shard("c-40-80", "40", "80", false, "p3", pgshardv1alpha1.ShardRoleData),
+		shard("c-system", "", "", true, "ps", pgshardv1alpha1.ShardRoleSystem),
+	}
+	eps := endpoints("p1", "p2", "p3", "p4", "p5", "ps")
+	gates := []pgshardv1alpha1.RoutingGate{{ID: "g2"}, {ID: "g1"}}
+	configs := []pgshardv1alpha1.PgShardTableConfig{
+		tableConfig("team-b", "items", "orders"), tableConfig("team-a", "customers"),
+	}
+	inA := CompileInputs{Cluster: cluster(), Shards: shards, Endpoints: eps, Gates: gates, TableConfigs: configs}
+
+	shardsRev := slices.Clone(shards)
+	slices.Reverse(shardsRev)
+	gatesRev := slices.Clone(gates)
+	slices.Reverse(gatesRev)
+	configsRev := slices.Clone(configs)
+	slices.Reverse(configsRev)
+	inB := CompileInputs{Cluster: cluster(), Shards: shardsRev, Endpoints: eps, Gates: gatesRev, TableConfigs: configsRev}
+
+	a, err := Compile(inA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Compile(inB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("compile output depends on input order:\n%+v\nvs\n%+v", a, b)
 	}
 }

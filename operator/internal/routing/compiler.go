@@ -7,9 +7,11 @@
 package routing
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +25,10 @@ import (
 // defaultWriteLeaseSeconds mirrors RouterSpec.writeLeaseSeconds's CRD default,
 // used when a cluster leaves the router (or its lease) unset.
 const defaultWriteLeaseSeconds int32 = 10
+
+const defaultSchema = "public"
+
+const instanceRolePrimary pgshardv1alpha1.InstanceRole = "primary"
 
 // CompileInputs gathers everything the compiled view derives from.
 type CompileInputs struct {
@@ -58,30 +64,42 @@ func Compile(in CompileInputs) (pgshardv1alpha1.PgShardRoutingSpec, error) {
 	if rt := in.Cluster.Spec.Router; rt != nil && rt.WriteLeaseSeconds > 0 {
 		writeLease = rt.WriteLeaseSeconds
 	}
+	// Every emitted list is sorted into a canonical order: the compiled spec is
+	// compared byte-for-byte (specEquivalent) and index-aligned (structuralChange),
+	// so any input-order dependence would churn the epoch / topologyGeneration.
+	gates := slices.Clone(in.Gates)
+	slices.SortFunc(gates, func(a, b pgshardv1alpha1.RoutingGate) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 	spec := pgshardv1alpha1.PgShardRoutingSpec{
 		WriteLeaseSeconds: writeLease,
 		HashFunction:      in.Cluster.Spec.Postgres.HashFunction,
-		Gates:             in.Gates,
+		Gates:             gates,
 	}
 
 	shards := slices.Clone(in.Shards)
 	slices.SortFunc(shards, func(a, b pgshardv1alpha1.PgShardShard) int {
-		switch {
-		case a.Spec.KeyRange.Start < b.Spec.KeyRange.Start:
-			return -1
-		case a.Spec.KeyRange.Start > b.Spec.KeyRange.Start:
-			return 1
-		default:
-			return 0
-		}
+		// Total order: Start alone ties whenever a reshard source and a split
+		// target share a bound, so tiebreak on End then Name.
+		return cmp.Or(
+			cmp.Compare(a.Spec.KeyRange.Start, b.Spec.KeyRange.Start),
+			cmp.Compare(a.Spec.KeyRange.End, b.Spec.KeyRange.End),
+			cmp.Compare(a.Name, b.Name),
+		)
 	})
 
 	var servingRanges []topology.KeyRange
+	systemSeen := false
 	for _, shard := range shards {
 		if shard.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
 			// The system shard is not part of the sharded keyspace; it is
-			// published as the sequence endpoint instead.
-			if ep, ok := in.Endpoints[shard.Status.CurrentPrimary]; ok {
+			// published as the sequence endpoint instead. There must be exactly
+			// one, or the sequence host is ambiguous.
+			if systemSeen {
+				return spec, fmt.Errorf("cluster has more than one system shard")
+			}
+			systemSeen = true
+			if ep, ok := primaryEndpoint(in.Endpoints, shard.Status.Instances, shard.Status.CurrentPrimary); ok {
 				spec.SequenceEndpoint = &ep
 			}
 			continue
@@ -101,59 +119,105 @@ func Compile(in CompileInputs) (pgshardv1alpha1.PgShardRoutingSpec, error) {
 			KeyRange: shard.Spec.KeyRange,
 			State:    state,
 		}
-		if ep, ok := in.Endpoints[shard.Status.CurrentPrimary]; ok {
+		if ep, ok := primaryEndpoint(in.Endpoints, shard.Status.Instances, shard.Status.CurrentPrimary); ok {
 			entry.Primary = &ep
 		}
-		for _, inst := range shard.Status.Instances {
-			if inst.Pod == shard.Status.CurrentPrimary {
-				continue
-			}
-			if ep, ok := in.Endpoints[inst.Pod]; ok {
-				ep.CanRead = inst.Ready
-				entry.Replicas = append(entry.Replicas, ep)
-			}
-		}
+		entry.Replicas = replicaEndpoints(in.Endpoints, shard.Status.Instances, shard.Status.CurrentPrimary)
 		spec.Shards = append(spec.Shards, entry)
 	}
 	if err := topology.ValidatePartition(servingRanges); err != nil {
 		return spec, fmt.Errorf("serving shards do not partition the keyspace: %w", err)
 	}
 
-	configs := slices.Clone(in.TableConfigs)
-	slices.SortFunc(configs, func(a, b pgshardv1alpha1.PgShardTableConfig) int {
-		switch {
-		case a.Name < b.Name:
-			return -1
-		case a.Name > b.Name:
-			return 1
-		default:
-			return 0
+	tables, err := compileTables(in.TableConfigs)
+	if err != nil {
+		return spec, err
+	}
+	spec.Tables = tables
+	return spec, nil
+}
+
+// primaryEndpoint returns the current primary's endpoint only when that
+// instance is present, Ready, and primary-role — so routing never publishes an
+// unconfirmed writer.
+func primaryEndpoint(
+	endpoints map[string]pgshardv1alpha1.RoutingEndpoint,
+	instances []pgshardv1alpha1.InstanceState,
+	primary string,
+) (pgshardv1alpha1.RoutingEndpoint, bool) {
+	for _, inst := range instances {
+		if inst.Pod != primary {
+			continue
 		}
+		if !inst.Ready || inst.Role != instanceRolePrimary {
+			return pgshardv1alpha1.RoutingEndpoint{}, false
+		}
+		ep, ok := endpoints[primary]
+		return ep, ok
+	}
+	return pgshardv1alpha1.RoutingEndpoint{}, false
+}
+
+// replicaEndpoints returns the shard's replica endpoints in canonical (pod)
+// order, excluding the current primary and any stale primary-role instance (an
+// old primary after failover must not be published as a read replica).
+func replicaEndpoints(
+	endpoints map[string]pgshardv1alpha1.RoutingEndpoint,
+	instances []pgshardv1alpha1.InstanceState,
+	primary string,
+) []pgshardv1alpha1.RoutingEndpoint {
+	var out []pgshardv1alpha1.RoutingEndpoint
+	for _, inst := range instances {
+		if inst.Pod == primary || inst.Role == instanceRolePrimary {
+			continue
+		}
+		ep, ok := endpoints[inst.Pod]
+		if !ok {
+			continue
+		}
+		ep.CanRead = inst.Ready
+		out = append(out, ep)
+	}
+	slices.SortFunc(out, func(a, b pgshardv1alpha1.RoutingEndpoint) int {
+		return cmp.Compare(a.Pod, b.Pod)
 	})
+	return out
+}
+
+// compileTables folds every table config's entries into one deduplicated,
+// canonically-ordered catalog. Duplicate detection and output order both fold
+// identifiers to lower case, matching PostgreSQL's unquoted-identifier rules.
+func compileTables(configs []pgshardv1alpha1.PgShardTableConfig) ([]pgshardv1alpha1.RoutingTable, error) {
 	owner := map[string]string{}
+	var tables []pgshardv1alpha1.RoutingTable
 	for _, tc := range configs {
 		for _, t := range tc.Spec.Tables {
 			schema := t.Schema
 			if schema == "" {
-				schema = "public"
+				schema = defaultSchema
 			}
-			key := schema + "." + t.Name
+			key := strings.ToLower(schema + "." + t.Name)
 			if first, dup := owner[key]; dup {
-				return spec, &DuplicateTableError{
-					Table: key, FirstConfig: first, SecondConfig: tc.Name,
-				}
+				return nil, &DuplicateTableError{Table: key, FirstConfig: first, SecondConfig: tc.Name}
 			}
 			owner[key] = tc.Name
-			spec.Tables = append(spec.Tables, pgshardv1alpha1.RoutingTable{
+			seqs := slices.Clone(t.Sequences)
+			slices.SortFunc(seqs, func(a, b pgshardv1alpha1.RoutingSequence) int {
+				return cmp.Or(cmp.Compare(a.Column, b.Column), cmp.Compare(a.Sequence, b.Sequence))
+			})
+			tables = append(tables, pgshardv1alpha1.RoutingTable{
 				Schema:         schema,
 				Name:           t.Name,
 				Type:           t.Type,
 				ShardKeyColumn: t.ShardKeyColumn,
-				Sequences:      t.Sequences,
+				Sequences:      seqs,
 			})
 		}
 	}
-	return spec, nil
+	slices.SortFunc(tables, func(a, b pgshardv1alpha1.RoutingTable) int {
+		return cmp.Or(cmp.Compare(a.Schema, b.Schema), cmp.Compare(a.Name, b.Name))
+	})
+	return tables, nil
 }
 
 // Write persists the compiled spec with a strictly monotonic epoch bump,
@@ -179,7 +243,10 @@ func Write(
 			if apierrors.IsAlreadyExists(createErr) {
 				continue
 			}
-			return 1, true, createErr
+			if createErr != nil {
+				return 0, false, createErr
+			}
+			return 1, true, nil
 		case getErr != nil:
 			return 0, false, getErr
 		}
@@ -208,23 +275,16 @@ func specEquivalent(a, b pgshardv1alpha1.PgShardRoutingSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 
-// structuralChange: the parts a restore pins and resharding changes —
-// shard set (names, ranges, states) and the table catalog.
+// structuralChange: the parts a restore pins and resharding changes — the
+// shard set (names, ranges, states) and the table catalog. Endpoint/primary
+// churn is deliberately excluded (it bumps the epoch but not the generation).
 func structuralChange(old, updated pgshardv1alpha1.PgShardRoutingSpec) bool {
-	if len(old.Shards) != len(updated.Shards) || len(old.Tables) != len(updated.Tables) {
-		return true
-	}
-	for i := range old.Shards {
-		if old.Shards[i].Name != updated.Shards[i].Name ||
-			old.Shards[i].KeyRange != updated.Shards[i].KeyRange ||
-			old.Shards[i].State != updated.Shards[i].State {
-			return true
-		}
-	}
-	for i := range old.Tables {
-		if !apiequality.Semantic.DeepEqual(old.Tables[i], updated.Tables[i]) {
-			return true
-		}
-	}
-	return false
+	return !slices.EqualFunc(old.Shards, updated.Shards, sameStructuralShard) ||
+		!apiequality.Semantic.DeepEqual(old.Tables, updated.Tables)
+}
+
+// sameStructuralShard compares only a shard's structural identity. New
+// structural fields (ones a reshard/restore changes) must be added here.
+func sameStructuralShard(a, b pgshardv1alpha1.RoutingShard) bool {
+	return a.Name == b.Name && a.KeyRange == b.KeyRange && a.State == b.State
 }

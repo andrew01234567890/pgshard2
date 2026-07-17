@@ -2,11 +2,16 @@ package routing
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
@@ -96,5 +101,44 @@ func TestWriteEpochAndGenerationSemantics(t *testing.T) {
 	if current.Spec.Epoch != 4 || current.Spec.TopologyGeneration != 3 {
 		t.Fatalf("catalog change: epoch=%d gen=%d",
 			current.Spec.Epoch, current.Spec.TopologyGeneration)
+	}
+}
+
+func TestWriteRetriesOnConflict(t *testing.T) {
+	ctx := context.Background()
+	key := types.NamespacedName{Name: "c", Namespace: "default"}
+
+	existing := &pgshardv1alpha1.PgShardRouting{}
+	existing.Name, existing.Namespace = key.Name, key.Namespace
+	existing.Spec = baseSpec()
+	existing.Spec.Epoch, existing.Spec.TopologyGeneration = 1, 1
+
+	// A client that rejects the first Update with a conflict, then behaves
+	// normally — the writer must re-read and retry (optimistic concurrency),
+	// never lose or reuse an epoch.
+	firstUpdate := true
+	c := newClient(t).WithObjects(existing).WithInterceptorFuncs(interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if firstUpdate {
+				firstUpdate = false
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: "pgshard.dev", Resource: "pgshardroutings"},
+					key.Name, fmt.Errorf("simulated conflict"))
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+	}).Build()
+
+	changed := baseSpec()
+	changed.WriteLeaseSeconds = 20 // a real, non-structural change
+	epoch, wrote, err := Write(ctx, c, key, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstUpdate {
+		t.Fatal("expected the writer to hit and retry a conflict")
+	}
+	if !wrote || epoch != 2 {
+		t.Fatalf("after a conflict retry want epoch 2 / wrote=true, got epoch=%d wrote=%v", epoch, wrote)
 	}
 }
