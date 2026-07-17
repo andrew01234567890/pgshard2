@@ -423,6 +423,7 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
 	polled := make([]corev1.Pod, 0, len(pods.Items))
+	views := make([]instanceView, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, node) {
@@ -430,15 +431,27 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 			// into status (it could otherwise be preserved as CurrentPrimary).
 			continue
 		}
-		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
+		state := pgshardv1alpha1.InstanceState{Pod: pod.Name}
+		view := instanceView{pod: pod.Name, host: pod.Status.PodIP}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			status, err := r.pollAgent(pollCtx, pod.Status.PodIP)
 			cancel()
 			if err == nil {
+				view.observed = true
 				state.Ready = status.Ready
-				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
+				view.ready = status.Ready
+				view.receivedLSN = lsnValue(status.WalReceiveLsn)
+				view.walReceiver = status.WalReceiverActive
+				// Role is set only from an explicit report: an UNSPECIFIED or
+				// unpolled instance stays roleless, so it is never treated as a
+				// prunable replica on the strength of a missing role.
+				switch status.Role {
+				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
 					state.Role = roleLabelPrimary
+					view.isPrimary = true
+				case pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY:
+					state.Role = roleLabelReplica
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
 				state.WalReplayLSN = lsnString(status.WalReplayLsn)
@@ -446,15 +459,21 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 		}
 		instances = append(instances, state)
 		polled = append(polled, *pod)
+		views = append(views, view)
 	}
 
 	node.Status.Instances = instances
 	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
 	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
-	// writes to a stale primary). Electing a replacement is the failover
-	// controller's job; this controller only reflects observed reality.
+	// writes to a stale primary).
 	node.Status.CurrentPrimary, node.Status.Phase =
 		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
+
+	// Drive the target/current-primary handshake: track the healthy primary, or
+	// elect and promote a replacement when it is gone.
+	if err := r.reconcileFailover(ctx, node, views); err != nil {
+		return nil, err
+	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a
 	// scale-down may prune (never the primary, never an unpollable pod).
