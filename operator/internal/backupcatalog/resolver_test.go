@@ -237,7 +237,11 @@ func TestSharedTopologyStanzaIsRejected(t *testing.T) {
 func TestDuplicateManifestIDIsRejected(t *testing.T) {
 	catalog := driftCatalog()
 	catalog.Backups = append(catalog.Backups, catalog.Backups[0])
+	// Rejected for an explicit id AND for Latest, which never looks up by id.
 	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
 		t.Fatal("two backup manifests sharing an id must be rejected as ambiguous")
+	}
+	if _, err := Resolve(catalog, Target{Latest: true}); err == nil {
+		t.Fatal("latest must also reject a catalog with duplicate backup ids")
 	}
 }

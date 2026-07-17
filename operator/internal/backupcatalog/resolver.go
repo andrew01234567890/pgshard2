@@ -74,6 +74,9 @@ func Resolve(catalog Catalog, target Target) (RestorePlan, error) {
 	if selectors != 1 {
 		return RestorePlan{}, errf("restore target must set exactly one selector, got %d", selectors)
 	}
+	if err := validate(catalog); err != nil {
+		return RestorePlan{}, err
+	}
 	switch {
 	case target.BarrierID != "":
 		return resolveBarrier(catalog, target.BarrierID)
@@ -183,38 +186,51 @@ func planFromBackup(catalog Catalog, backup BackupManifest) (RestorePlan, error)
 	return plan, sanity(plan)
 }
 
+// validate enforces the catalog-wide identity invariants every resolution
+// path relies on: manifest ids and topology generations are unique, so a
+// first-match lookup (and resolveLatest, which never looks up by id) can never
+// silently pick a catalog-order-dependent manifest.
+func validate(catalog Catalog) error {
+	barrierIDs := make(map[string]bool, len(catalog.Barriers))
+	for _, b := range catalog.Barriers {
+		if barrierIDs[b.ID] {
+			return errf("barrier id %s is not unique in the catalog", b.ID)
+		}
+		barrierIDs[b.ID] = true
+	}
+	backupIDs := make(map[string]bool, len(catalog.Backups))
+	for _, b := range catalog.Backups {
+		if backupIDs[b.ID] {
+			return errf("backup id %s is not unique in the catalog", b.ID)
+		}
+		backupIDs[b.ID] = true
+	}
+	generations := make(map[int64]bool, len(catalog.Topologies))
+	for _, s := range catalog.Topologies {
+		if generations[s.Generation] {
+			return errf("topology generation %d is not unique in the catalog", s.Generation)
+		}
+		generations[s.Generation] = true
+	}
+	return nil
+}
+
 func findBarrier(catalog Catalog, id string) (BarrierManifest, error) {
-	var found *BarrierManifest
-	for i := range catalog.Barriers {
-		if catalog.Barriers[i].ID != id {
-			continue
+	for _, barrier := range catalog.Barriers {
+		if barrier.ID == id {
+			return barrier, nil
 		}
-		if found != nil {
-			return BarrierManifest{}, errf("barrier %s is ambiguous: multiple manifests share the id", id)
-		}
-		found = &catalog.Barriers[i]
 	}
-	if found == nil {
-		return BarrierManifest{}, errf("barrier %s not found", id)
-	}
-	return *found, nil
+	return BarrierManifest{}, errf("barrier %s not found", id)
 }
 
 func findBackup(catalog Catalog, id string) (BackupManifest, error) {
-	var found *BackupManifest
-	for i := range catalog.Backups {
-		if catalog.Backups[i].ID != id {
-			continue
+	for _, backup := range catalog.Backups {
+		if backup.ID == id {
+			return backup, nil
 		}
-		if found != nil {
-			return BackupManifest{}, errf("backup %s is ambiguous: multiple manifests share the id", id)
-		}
-		found = &catalog.Backups[i]
 	}
-	if found == nil {
-		return BackupManifest{}, errf("backup %s not found", id)
-	}
-	return *found, nil
+	return BackupManifest{}, errf("backup %s not found", id)
 }
 
 func topologyByGeneration(catalog Catalog, generation int64) (TopologySnapshot, error) {
