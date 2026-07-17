@@ -21,13 +21,14 @@ func TestDeriveShardStatus(t *testing.T) {
 	}{
 		{"all ready with a primary", []pgshardv1alpha1.InstanceState{inst(s0, "primary", true), inst("s-1", "replica", true)}, 2, true, s0, pgshardv1alpha1.ShardReady},
 		{"over-provisioned is still ready", []pgshardv1alpha1.InstanceState{inst(s0, "primary", true), inst("s-1", "replica", true), inst("s-2", "replica", true)}, 2, true, s0, pgshardv1alpha1.ShardReady},
+		{"excess ready must not mask a failed desired replica", []pgshardv1alpha1.InstanceState{inst(s0, "primary", true), inst("s-1", "replica", false), inst("s-2", "replica", true)}, 2, true, s0, pgshardv1alpha1.ShardDegraded},
 		{"split brain withholds the primary", []pgshardv1alpha1.InstanceState{inst(s0, "primary", true), inst("s-1", "primary", true)}, 2, true, "", pgshardv1alpha1.ShardDegraded},
 		{"primary gone clears and degrades", []pgshardv1alpha1.InstanceState{inst(s0, "replica", true), inst("s-1", "replica", true)}, 2, true, "", pgshardv1alpha1.ShardDegraded},
 		{"initial bring-up provisions", []pgshardv1alpha1.InstanceState{inst(s0, "replica", false)}, 1, false, "", pgshardv1alpha1.ShardProvisioning},
 		{"provisioning keeps a not-ready primary", []pgshardv1alpha1.InstanceState{inst(s0, "primary", false)}, 1, false, s0, pgshardv1alpha1.ShardProvisioning},
 	}
 	for _, c := range cases {
-		gotPrimary, gotPhase := deriveShardStatus(c.instances, c.replicas, c.hadPrimary)
+		gotPrimary, gotPhase := deriveShardStatus(c.instances, c.replicas, c.hadPrimary, "s-")
 		if gotPrimary != c.wantPrimary || gotPhase != c.wantPhase {
 			t.Errorf("%s: got (%q,%s) want (%q,%s)", c.name, gotPrimary, gotPhase, c.wantPrimary, c.wantPhase)
 		}

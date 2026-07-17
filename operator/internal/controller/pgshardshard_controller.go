@@ -501,7 +501,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
 	// writes to a stale primary).
 	shard.Status.CurrentPrimary, shard.Status.Phase =
-		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "")
+		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
 
 	// Ready replicas, bound to their polled pod objects: the only pods a
 	// scale-down may prune (never the primary, never an unpollable pod).
@@ -528,12 +528,19 @@ func (r *PgShardShardReconciler) aggregateStatus(
 // shard that had a primary and now has none is Degraded (not Provisioning,
 // which is the initial bring-up only).
 func deriveShardStatus(
-	instances []pgshardv1alpha1.InstanceState, replicas int32, hadPrimary bool,
+	instances []pgshardv1alpha1.InstanceState, replicas int32, hadPrimary bool, namePrefix string,
 ) (string, pgshardv1alpha1.ShardPhase) {
-	currentPrimary, primaries, ready := "", 0, 0
+	currentPrimary, primaries, anyReady := "", 0, 0
+	desiredReady := map[int32]bool{}
 	for _, s := range instances {
 		if s.Ready {
-			ready++
+			anyReady++
+			// Only desired ordinals (< replicas) count toward readiness, so a
+			// failed desired instance is never masked by extra ready pods that
+			// are pending a scale-down prune.
+			if ord, ok := ordinalOf(s.Pod, namePrefix); ok && ord < replicas {
+				desiredReady[ord] = true
+			}
 		}
 		if s.Role == roleLabelPrimary {
 			currentPrimary = s.Pod
@@ -543,12 +550,12 @@ func deriveShardStatus(
 	switch {
 	case primaries > 1:
 		return "", pgshardv1alpha1.ShardDegraded
-	case ready >= int(replicas) && currentPrimary != "":
-		// >= not ==: an over-provisioned shard (extra ready pods pending a
-		// scale-down prune) is still healthy, and must reach Ready for pruning
-		// to run — otherwise it would be stuck Degraded forever.
+	case int32(len(desiredReady)) == replicas && currentPrimary != "":
+		// Every desired ordinal is ready; extra ready pods (awaiting prune) are
+		// fine — an over-provisioned but healthy shard must reach Ready so that
+		// pruning runs, else it would be stuck Degraded forever.
 		return currentPrimary, pgshardv1alpha1.ShardReady
-	case ready == 0 && !hadPrimary:
+	case anyReady == 0 && !hadPrimary:
 		// Initial bring-up: keep a uniquely-confirmed (but not-yet-ready)
 		// primary so its label is set; the Service's readiness gate withholds
 		// traffic until it is actually ready.
