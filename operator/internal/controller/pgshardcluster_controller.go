@@ -94,12 +94,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		err := r.Get(ctx, client.ObjectKeyFromObject(shard), existing)
 		switch {
 		case apierrors.IsNotFound(err):
-			// New shard: render its config (this also length-checks the name),
-			// then create it. If a concurrent create wins (AlreadyExists despite
-			// the cached NotFound), the object exists after all — requeue so the
-			// next reconcile Gets it and validates ownership, rather than
-			// assuming it is ours.
-			if err := r.ensureConfigMap(ctx, &cluster, shard.Name, rendered); err != nil {
+			// Validate the derived child name up front (cheap, no side effect),
+			// but only materialize the ConfigMap AFTER Create establishes our
+			// ownership — otherwise a stale cached NotFound over a foreign shard
+			// would let us write config for a shard we do not own. A concurrent
+			// create (AlreadyExists) means it exists after all: requeue so the
+			// next reconcile Gets and ownership-checks it.
+			if _, err := configMapName(shard.Name); err != nil {
 				return ctrl.Result{}, err
 			}
 			if err := controllerutil.SetControllerReference(&cluster, shard, r.Scheme); err != nil {
@@ -110,6 +111,9 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					return ctrl.Result{Requeue: true}, nil
 				}
 				return ctrl.Result{}, fmt.Errorf("creating shard %s: %w", shard.Name, err)
+			}
+			if err := r.ensureConfigMap(ctx, &cluster, shard.Name, rendered); err != nil {
+				return ctrl.Result{}, err
 			}
 			log.Info("created shard", "shard", shard.Name, "range", shard.Spec.KeyRange)
 		case err != nil:
@@ -244,21 +248,32 @@ func shardName(cluster, start, end string) string {
 
 // ensureConfigMap materializes the rendered postgresql parameters for one
 // shard; the content hash in the shard spec is what agents/rollouts compare.
+// configMapName derives (and length-validates) a shard's config-map name. It
+// is pure so callers can validate a name before creating the shard without the
+// side effect of writing the config map.
+func configMapName(shardName string) (string, error) {
+	name := fmt.Sprintf("%s-postgres-config", shardName)
+	if len(name) > validation.DNS1123SubdomainMaxLength {
+		return "", fmt.Errorf("config map name %q exceeds %d characters; shorten the cluster name",
+			name, validation.DNS1123SubdomainMaxLength)
+	}
+	return name, nil
+}
+
 func (r *PgShardClusterReconciler) ensureConfigMap(
 	ctx context.Context,
 	cluster *pgshardv1alpha1.PgShardCluster,
 	shardName string,
 	rendered pgconfig.Rendered,
 ) error {
-	name := fmt.Sprintf("%s-postgres-config", shardName)
-	if len(name) > validation.DNS1123SubdomainMaxLength {
-		return fmt.Errorf("config map name %q exceeds %d characters; shorten the cluster name",
-			name, validation.DNS1123SubdomainMaxLength)
+	name, err := configMapName(shardName)
+	if err != nil {
+		return err
 	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
 	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
 		cm.Data = map[string]string{
 			"config-hash": rendered.ConfigHash,
 		}
