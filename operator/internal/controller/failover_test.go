@@ -31,16 +31,25 @@ func TestEvaluateFailover(t *testing.T) {
 		{
 			name: "healthy primary: no failover",
 			instances: []instanceView{
-				{pod: "p0", ready: true, isPrimary: true},
-				{pod: "p1", ready: true},
+				{pod: "p0", ready: true, isPrimary: true, observed: true},
+				{pod: "p1", ready: true, observed: true},
 			},
 		},
 		{
-			name: "primary down: elect most-advanced ready replica",
+			name: "old primary relinquished the role: elect most-advanced ready replica",
 			instances: []instanceView{
-				{pod: "p0", ready: false, isPrimary: true},
-				{pod: "p1", ready: true, receivedLSN: 100},
-				{pod: "p2", ready: true, receivedLSN: 200},
+				{pod: "p0", ready: false, observed: true}, // demoted to standby
+				{pod: "p1", ready: true, receivedLSN: 100, observed: true},
+				{pod: "p2", ready: true, receivedLSN: 200, observed: true},
+			},
+			wantWarranted: true,
+			wantTarget:    "p2",
+		},
+		{
+			name: "old primary pod gone from the set: elect most-advanced ready replica",
+			instances: []instanceView{
+				{pod: "p1", ready: true, receivedLSN: 100, observed: true},
+				{pod: "p2", ready: true, receivedLSN: 200, observed: true},
 			},
 			wantWarranted: true,
 			wantTarget:    "p2",
@@ -48,17 +57,44 @@ func TestEvaluateFailover(t *testing.T) {
 		{
 			name: "tie on LSN broken by pod name",
 			instances: []instanceView{
-				{pod: "pb", ready: true, receivedLSN: 200},
-				{pod: "pa", ready: true, receivedLSN: 200},
+				{pod: "pb", ready: true, receivedLSN: 200, observed: true},
+				{pod: "pa", ready: true, receivedLSN: 200, observed: true},
 			},
 			wantWarranted: true,
 			wantTarget:    "pa",
 		},
 		{
+			name: "settling primary still claims the role: wait, never a second promote",
+			instances: []instanceView{
+				{pod: "p0", isPrimary: true, ready: false, observed: true},
+				{pod: "p1", ready: true, receivedLSN: 200, observed: true},
+			},
+			wantWarranted: true,
+			wantWait:      true,
+		},
+		{
+			name: "an instance is unobserved: wait, its state may be a live primary",
+			instances: []instanceView{
+				{pod: "p0", observed: false}, // poll failed — unknown, not down
+				{pod: "p1", ready: true, receivedLSN: 200, observed: true},
+			},
+			wantWarranted: true,
+			wantWait:      true,
+		},
+		{
+			name: "a not-ready standby is still receiving WAL: wait for it to drain",
+			instances: []instanceView{
+				{pod: "p1", ready: true, receivedLSN: 100, observed: true},
+				{pod: "p2", ready: false, receivedLSN: 200, walReceiver: true, observed: true},
+			},
+			wantWarranted: true,
+			wantWait:      true,
+		},
+		{
 			name: "wait while a candidate WAL receiver is still running",
 			instances: []instanceView{
-				{pod: "p1", ready: true, receivedLSN: 200, walReceiver: true},
-				{pod: "p2", ready: true, receivedLSN: 100},
+				{pod: "p1", ready: true, receivedLSN: 200, walReceiver: true, observed: true},
+				{pod: "p2", ready: true, receivedLSN: 100, observed: true},
 			},
 			wantWarranted: true,
 			wantWait:      true,
@@ -66,8 +102,8 @@ func TestEvaluateFailover(t *testing.T) {
 		{
 			name: "primary down with no ready replica: not an electable failover",
 			instances: []instanceView{
-				{pod: "p0", ready: false, isPrimary: true},
-				{pod: "p1", ready: false},
+				{pod: "p0", ready: false, observed: true},
+				{pod: "p1", ready: false, observed: true},
 			},
 		},
 		{
@@ -84,8 +120,8 @@ func TestEvaluateFailover(t *testing.T) {
 			if got.targetPrimary != tc.wantTarget {
 				t.Fatalf("target = %q, want %q", got.targetPrimary, tc.wantTarget)
 			}
-			if got.waitReceivers != tc.wantWait {
-				t.Fatalf("waitReceivers = %v, want %v", got.waitReceivers, tc.wantWait)
+			if got.wait != tc.wantWait {
+				t.Fatalf("wait = %v, want %v", got.wait, tc.wantWait)
 			}
 		})
 	}

@@ -486,6 +486,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			status, err := r.pollAgent(pollCtx, pod.Status.PodIP)
 			cancel()
 			if err == nil {
+				view.observed = true
 				state.Ready = status.Ready
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)

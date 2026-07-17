@@ -33,24 +33,33 @@ var _ = Describe("PgShardShard failover", func() {
 	const ns = "default"
 
 	It("elects the most-advanced replica and drives it to primary via the epoch-guarded agent", func() {
-		// Two fake agents standing in for two instances.
+		// Three fake agents: a primary and two standbys, so the election
+		// actually exercises most-advanced selection (not a single candidate).
 		primaryAgent, err := fakes.NewFakeAgent()
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(primaryAgent.Stop)
-		replicaAgent, err := fakes.NewFakeAgent()
+		laggingAgent, err := fakes.NewFakeAgent()
 		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(replicaAgent.Stop)
+		DeferCleanup(laggingAgent.Stop)
+		advancedAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(advancedAgent.Stop)
 
 		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
-		replicaAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		laggingAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		advancedAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
 
 		// The reconciler dials by the address we stamp on each pod; map those
-		// synthetic addresses to the two fakes.
+		// synthetic addresses to the three fakes.
 		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
-			if host == "127.0.0.2" {
+			switch host {
+			case "127.0.0.2":
 				return primaryAgent.Client()
+			case "127.0.0.3":
+				return laggingAgent.Client()
+			default:
+				return advancedAgent.Client()
 			}
-			return replicaAgent.Client()
 		}
 		r := &PgShardShardReconciler{
 			Client:    k8sClient,
@@ -62,7 +71,7 @@ var _ = Describe("PgShardShard failover", func() {
 		shard := &pgshardv1alpha1.PgShardShard{
 			ObjectMeta: metav1.ObjectMeta{Name: "fo", Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
-				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 2,
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 3,
 			},
 		}
 		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
@@ -73,34 +82,53 @@ var _ = Describe("PgShardShard failover", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 		}
+		get := func() pgshardv1alpha1.PgShardShard {
+			var got pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fo", Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
 
 		// First reconcile creates the pods.
 		reconcile()
 		stampPodIP("fo-0", ns, "127.0.0.2")
 		stampPodIP("fo-1", ns, "127.0.0.3")
-		replicaAgent.SetReceivedLSN(500) // most advanced
+		stampPodIP("fo-2", ns, "127.0.0.4")
+		laggingAgent.SetReceivedLSN(300)
+		advancedAgent.SetReceivedLSN(500) // most advanced -> should be elected
 
-		// Healthy state: reconcile records the primary, no failover.
+		// Healthy state: reconcile records the primary and — crucially — does
+		// NOT promote any replica while a ready primary exists.
 		reconcile()
-		var got pgshardv1alpha1.PgShardShard
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fo", Namespace: ns}, &got)).To(Succeed())
-		Expect(got.Status.CurrentPrimary).To(Equal("fo-0"))
+		Expect(get().Status.CurrentPrimary).To(Equal("fo-0"))
+		Expect(advancedAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+		Expect(advancedAgent.AppliedEpoch()).To(Equal(uint64(0)))
+		Expect(laggingAgent.AppliedEpoch()).To(Equal(uint64(0)))
 
-		// Primary goes down.
+		// Primary relinquishes the role (clean demotion) and goes not-ready.
 		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
 		primaryAgent.SetReady(false)
 
-		// Reconcile elects fo-1 (the advanced replica) and promotes it.
+		// Election pass: the decision epoch + target are persisted, but NO agent
+		// is promoted yet — the epoch must be durable before it is ever used.
 		reconcile()
-		// The fake replica flipped to primary via Promote at epoch >= 1.
-		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
-		Expect(replicaAgent.AppliedEpoch()).To(BeNumerically(">=", uint64(1)))
+		elected := get()
+		Expect(elected.Status.TargetPrimary).To(Equal("fo-2"))
+		Expect(elected.Status.DecisionEpoch).To(BeNumerically(">=", 1))
+		Expect(advancedAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+		Expect(advancedAgent.AppliedEpoch()).To(Equal(uint64(0)))
 
-		// Next reconcile sees fo-1 as primary and records currentPrimary.
+		// Promote pass: the durable epoch drives Promote on the elected replica
+		// only — the lagging replica is never promoted.
 		reconcile()
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fo", Namespace: ns}, &got)).To(Succeed())
-		Expect(got.Status.CurrentPrimary).To(Equal("fo-1"))
-		Expect(got.Status.TargetPrimary).To(Equal("fo-1"))
+		Expect(advancedAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
+		Expect(advancedAgent.AppliedEpoch()).To(BeNumerically(">=", uint64(1)))
+		Expect(laggingAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+
+		// Observe pass: the poll sees fo-2 as primary and records currentPrimary.
+		reconcile()
+		got := get()
+		Expect(got.Status.CurrentPrimary).To(Equal("fo-2"))
+		Expect(got.Status.TargetPrimary).To(Equal("fo-2"))
 
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
