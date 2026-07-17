@@ -366,11 +366,18 @@ func (r *PgShardClusterReconciler) placeShards(
 		return false, err
 	}
 	if external != "" {
-		// colocateWith points shards at another cluster's shared node; require it
-		// to exist before adopting the placement.
+		// colocateWith points shards at another cluster's shared node. Require it
+		// to exist AND to be controlled by the named cluster, so a foreign or
+		// hand-made same-named node can never be adopted.
+		_, colocateWith := placementOf(cluster)
 		var ext pgshardv1alpha1.PgShardNode
 		if err := r.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: external}, &ext); err != nil {
 			return false, fmt.Errorf("colocation target node %s: %w", external, err)
+		}
+		if owner := metav1.GetControllerOf(&ext); owner == nil ||
+			owner.Kind != "PgShardCluster" || owner.Name != colocateWith {
+			return false, fmt.Errorf(
+				"colocation target node %s is not controlled by cluster %s", external, colocateWith)
 		}
 	}
 	for i := range owned {

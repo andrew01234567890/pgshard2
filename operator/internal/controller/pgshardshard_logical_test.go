@@ -74,5 +74,14 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(k8sClient.List(ctx, &svcs, client.InNamespace(ns),
 			client.MatchingLabels{labelShard: shardNm})).To(Succeed())
 		Expect(svcs.Items).To(BeEmpty(), "and no services")
+
+		// A shard-level fence flag is meaningless for a placed shard (fencing is
+		// the node's action); it must not stop the status mirror.
+		got.Spec.Fenced = true
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: shardNm, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardNm, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady), "a fenced placed shard still mirrors its node")
 	})
 })

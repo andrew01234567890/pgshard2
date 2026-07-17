@@ -115,18 +115,20 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &shard); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// A placed shard is logical: its PgShardNode owns the pods, services, status,
+	// and failover — including fencing, which is a node-level action. This
+	// controller creates no physical objects for it and only mirrors the node's
+	// health so the cluster's shard counts keep working. Checked before fencing
+	// so a (meaningless) shard-level fence flag cannot wedge the status mirror.
+	if shard.Spec.NodeRef != "" {
+		return r.reconcileLogicalShard(ctx, &shard)
+	}
+
 	if shard.Spec.Fenced {
 		// Fencing is executed by agents (they keep PostgreSQL down); the
 		// controller stops mutating pods while frozen.
 		log.Info("shard fenced; skipping pod reconcile")
 		return ctrl.Result{}, nil
-	}
-
-	// A placed shard is logical: its PgShardNode owns the pods, services, status,
-	// and failover. This controller creates no physical objects for it and only
-	// mirrors the node's health so the cluster's shard counts keep working.
-	if shard.Spec.NodeRef != "" {
-		return r.reconcileLogicalShard(ctx, &shard)
 	}
 
 	if r.Images.Agent == "" {
@@ -158,10 +160,7 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	interval := r.StatusPollInterval
-	if interval == 0 {
-		interval = 10 * time.Second
-	}
+	interval := r.pollInterval()
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
@@ -190,14 +189,18 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 		shard.Status.CurrentPrimary = node.Status.CurrentPrimary
 	}
 
-	interval := r.StatusPollInterval
-	if interval == 0 {
-		interval = 10 * time.Second
-	}
+	interval := r.pollInterval()
 	if apiequality.Semantic.DeepEqual(before, &shard.Status) {
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 	return ctrl.Result{RequeueAfter: interval}, client.IgnoreNotFound(r.Status().Update(ctx, shard))
+}
+
+func (r *PgShardShardReconciler) pollInterval() time.Duration {
+	if r.StatusPollInterval == 0 {
+		return 10 * time.Second
+	}
+	return r.StatusPollInterval
 }
 
 func shardPhaseForNode(phase pgshardv1alpha1.NodePhase) pgshardv1alpha1.ShardPhase {
