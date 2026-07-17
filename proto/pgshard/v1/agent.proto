@@ -228,11 +228,13 @@ message DropSlotResponse {}
 // transaction, so the agent checks pg_database and issues the statement over
 // the simple-query path, treating a duplicate-database error as success.
 message CreateDatabaseRequest {
-  // Database name. Required, nonempty. The agent quotes it as an identifier.
+  // Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+  // NAMEDATALEN-1; a longer name would be silently truncated and could resolve
+  // to a different database). The agent quotes it as an identifier.
   string name = 1;
   // Role that owns the new database; empty leaves it owned by the connecting
-  // (bootstrap) role. Only applied at creation — ownership of an already
-  // existing database is not reconciled here.
+  // (bootstrap) role. At most 63 bytes when set. Only applied at creation —
+  // ownership of an already existing database is not reconciled here.
   string owner = 2;
 }
 
@@ -243,7 +245,9 @@ message CreateDatabaseResponse {}
 // terminated (WITH FORCE) so the database can be removed without waiting for
 // clients to disconnect.
 message DropDatabaseRequest {
-  // Database name. Required, nonempty. The agent quotes it as an identifier.
+  // Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+  // NAMEDATALEN-1; a longer name would be silently truncated and could drop a
+  // different database). The agent quotes it as an identifier.
   string name = 1;
 }
 

@@ -2187,11 +2187,13 @@ func (*DropSlotResponse) Descriptor() ([]byte, []int) {
 // the simple-query path, treating a duplicate-database error as success.
 type CreateDatabaseRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Database name. Required, nonempty. The agent quotes it as an identifier.
+	// Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+	// NAMEDATALEN-1; a longer name would be silently truncated and could resolve
+	// to a different database). The agent quotes it as an identifier.
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Role that owns the new database; empty leaves it owned by the connecting
-	// (bootstrap) role. Only applied at creation — ownership of an already
-	// existing database is not reconciled here.
+	// (bootstrap) role. At most 63 bytes when set. Only applied at creation —
+	// ownership of an already existing database is not reconciled here.
 	Owner         string `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2283,7 +2285,9 @@ func (*CreateDatabaseResponse) Descriptor() ([]byte, []int) {
 // clients to disconnect.
 type DropDatabaseRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Database name. Required, nonempty. The agent quotes it as an identifier.
+	// Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+	// NAMEDATALEN-1; a longer name would be silently truncated and could drop a
+	// different database). The agent quotes it as an identifier.
 	Name          string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

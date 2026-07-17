@@ -60,6 +60,32 @@ fn internal(err: anyhow::Error) -> Status {
     Status::internal(err.to_string())
 }
 
+/// PostgreSQL's `NAMEDATALEN - 1`: identifiers longer than this are silently
+/// truncated. A truncated database name could resolve to a *different* existing
+/// database (and a create could then falsely succeed via a duplicate-database
+/// error, or a drop delete the wrong database), so reject overlong identifiers
+/// up front rather than let PostgreSQL truncate them.
+const MAX_IDENT_BYTES: usize = 63;
+
+/// Validate a database identifier: `required` names must be nonempty, and any
+/// value must fit in [`MAX_IDENT_BYTES`] so PostgreSQL does not truncate it. An
+/// empty optional value (e.g. no owner) passes.
+fn check_ident(what: &str, value: &str, required: bool) -> Result<(), Status> {
+    if value.is_empty() {
+        return if required {
+            Err(Status::invalid_argument(format!("{what} is required")))
+        } else {
+            Ok(())
+        };
+    }
+    if value.len() > MAX_IDENT_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{what} exceeds PostgreSQL's {MAX_IDENT_BYTES}-byte identifier limit"
+        )));
+    }
+    Ok(())
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -305,9 +331,8 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         request: Request<v1::CreateDatabaseRequest>,
     ) -> Result<Response<v1::CreateDatabaseResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("database name is required"));
-        }
+        check_ident("database name", &req.name, true)?;
+        check_ident("owner", &req.owner, false)?;
         self.instance
             .create_database(&req.name, &req.owner)
             .await
@@ -319,9 +344,7 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         request: Request<v1::DropDatabaseRequest>,
     ) -> Result<Response<v1::DropDatabaseResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("database name is required"));
-        }
+        check_ident("database name", &req.name, true)?;
         self.instance
             .drop_database(&req.name)
             .await
@@ -523,6 +546,45 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn database_ops_reject_overlong_identifiers() {
+        let s = svc(FakeInstance::primary());
+        let too_long = "a".repeat(64); // PostgreSQL truncates beyond 63 bytes.
+        // An overlong name is rejected on both create and drop, and nothing is
+        // executed against the instance (no truncated collision).
+        assert_eq!(
+            s.create_database(Request::new(v1::CreateDatabaseRequest {
+                name: too_long.clone(),
+                owner: String::new(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            s.drop_database(Request::new(v1::DropDatabaseRequest {
+                name: too_long.clone(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        // An overlong owner is rejected too.
+        assert_eq!(
+            s.create_database(Request::new(v1::CreateDatabaseRequest {
+                name: "ok".into(),
+                owner: too_long,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert!(s.instance.databases().is_empty());
     }
 
     #[tokio::test]
