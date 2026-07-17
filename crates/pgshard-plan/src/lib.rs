@@ -359,6 +359,21 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         return reject("INSERT without a target relation");
     };
     let table = range_var_table(rv);
+    // A CTE (`WITH`, possibly data-modifying) or a subquery in a VALUES cell can
+    // read or write rows on other shards, but would run only on the shard this
+    // INSERT routes to. Reject before routing rather than execute against the
+    // wrong shard — otherwise, once a sequence fills the omitted id, the
+    // statement would silently succeed with wrong data.
+    if s.with_clause.is_some() {
+        return reject(&format!(
+            "INSERT into {table} with a CTE (WITH) is not supported in M1"
+        ));
+    }
+    if extract::insert_values_have_sublink(s) {
+        return reject(&format!(
+            "INSERT into {table} with a subquery in VALUES is not supported in M1"
+        ));
+    }
     match placement(vschema, &table) {
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
@@ -854,6 +869,32 @@ mod tests {
         assert!(is_reject(&plan1(
             "INSERT INTO orders (customer_id) VALUES (DEFAULT)"
         )));
+    }
+
+    #[test]
+    fn insert_with_a_cte_or_a_values_subquery_is_rejected() {
+        // A data-modifying CTE would run only on the INSERT's shard, executing
+        // its writes against the wrong shard's rows.
+        assert!(is_reject(&plan1(
+            "WITH d AS (DELETE FROM orders WHERE customer_id = 1 RETURNING id) \
+             INSERT INTO orders (customer_id, note) VALUES (0, 'x')"
+        )));
+        // A subquery in a non-key VALUES cell would read the wrong shard's data,
+        // whether bare or hidden inside a CASE (or another expression node).
+        assert!(is_reject(&plan1(
+            "INSERT INTO orders (customer_id, note) \
+             VALUES (0, (SELECT note FROM orders WHERE customer_id = 1 LIMIT 1))"
+        )));
+        assert!(is_reject(&plan1(
+            "INSERT INTO orders (customer_id, note) VALUES \
+             (0, CASE WHEN true THEN (SELECT note FROM orders WHERE customer_id = 1) ELSE 'y' END)"
+        )));
+        // Without either, a plain INSERT (even omitting the sequence column)
+        // still routes by its shard key.
+        assert_eq!(
+            plan1("INSERT INTO orders (customer_id, note) VALUES (0, 'x')"),
+            Plan::SingleShard(shard_of(0))
+        );
     }
 
     #[test]

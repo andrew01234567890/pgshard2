@@ -439,7 +439,23 @@ async fn an_omitted_sequence_column_is_filled_from_the_system_database() {
         .await
         .expect("multi-row insert with injected ids");
 
-    // Every row now carries a positive id, and all three are distinct. A plain
+    // INSERT ... RETURNING id surfaces the injected id to the client.
+    let rows = client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (3, 'r') RETURNING id")
+        .await
+        .unwrap();
+    let returned = rows.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => {
+            Some(r.get("id").unwrap().parse::<i64>().unwrap())
+        }
+        _ => None,
+    });
+    assert!(
+        returned.is_some_and(|id| id >= 1),
+        "RETURNING surfaces the injected id"
+    );
+
+    // Every row now carries a positive id, and all four are distinct. A plain
     // keyless read concatenates (no ORDER BY, which a scatter cannot merge yet).
     let rows = client.simple_query("SELECT id FROM orders").await.unwrap();
     let mut ids: Vec<i64> = rows
@@ -451,9 +467,38 @@ async fn an_omitted_sequence_column_is_filled_from_the_system_database() {
             _ => None,
         })
         .collect();
-    assert_eq!(ids.len(), 3, "all three rows were stored with an id");
+    assert_eq!(ids.len(), 4, "all four rows were stored with an id");
     assert!(ids.iter().all(|&id| id >= 1), "ids come from the sequence");
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 3, "each row got a distinct id");
+    assert_eq!(ids.len(), 4, "each row got a distinct id");
+}
+
+#[tokio::test]
+async fn an_insert_needing_a_sequence_without_one_configured_errors() {
+    let pg = Pg::start().await.expect("start postgres");
+    let router =
+        pgshard_router::shared(Router::build(&sequenced_topology(pg.host(), pg.port())).unwrap());
+    // A proxy with no sequence allocator (Proxy::new, not with_sequences).
+    let proxy = Arc::new(Proxy::new(
+        router,
+        Backend {
+            user: "postgres".into(),
+            password: "postgres".into(),
+            system_database: "postgres".into(),
+        },
+    ));
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // The INSERT omits the sequence-bound `id`, but no allocator is configured:
+    // it fails loudly rather than routing a row with a missing id.
+    let err = client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'x')")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("55000"));
 }

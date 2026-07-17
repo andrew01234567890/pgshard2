@@ -149,22 +149,18 @@ impl Proxy {
             ));
         };
         let rows = pgshard_plan::sequence::value_row_count(node);
-        let names: Vec<(String, String)> = injections
-            .into_iter()
-            .map(|i| (i.column, i.sequence))
-            .collect();
         // A reservation drives a blocking client that must not run on an async
         // worker (its nested block_on would panic), so allocate on the blocking
         // pool. One id is drawn per value row.
         let columns = tokio::task::spawn_blocking(move || {
-            names
+            injections
                 .into_iter()
-                .map(|(column, sequence)| {
+                .map(|inj| {
                     let ids = (0..rows)
-                        .map(|_| seq.next_id(&sequence))
+                        .map(|_| seq.next_id(&inj.sequence))
                         .collect::<Result<Vec<i64>, _>>()?;
                     Ok::<_, pgshard_seq::SeqError>(pgshard_plan::sequence::InjectedColumn {
-                        column,
+                        column: inj.column,
                         ids,
                     })
                 })

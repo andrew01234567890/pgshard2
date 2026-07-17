@@ -137,8 +137,10 @@ pub fn rewrite_insert(
     if rows == 0 {
         return Err(RewriteError::NotInjectable);
     }
-    // Validate every injection before mutating, so a mismatch leaves `pb`
-    // untouched (it is a discarded clone anyway, but the function stays total).
+    // Validate every injection up front: the mutation loop below zips ids with
+    // rows, which would silently truncate (emitting malformed SQL) on a short id
+    // vector, so a count mismatch must become a clean error, not a partial
+    // rewrite.
     for inj in injected {
         if inj.ids.len() != rows {
             return Err(RewriteError::RowCountMismatch {
