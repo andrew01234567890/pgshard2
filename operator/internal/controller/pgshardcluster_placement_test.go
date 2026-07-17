@@ -128,6 +128,16 @@ var _ = Describe("PgShardCluster placement", func() {
 		Expect(ok).To(BeTrue())
 		Expect(system.Spec.Storage).NotTo(BeNil())
 		Expect(system.Spec.Storage.Size.String()).To(Equal("5Gi"), "system node uses the system storage")
+
+		// A later storage change converges onto the node so a scale-up gets the
+		// right size.
+		var got pgshardv1alpha1.PgShardCluster
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "stor", Namespace: ns}, &got)).To(Succeed())
+		got.Spec.Size.Overrides.Storage.Size = resource.MustParse("100Gi")
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+		Expect(reconcile("stor")).To(Succeed())
+		data, _ = getNode("stor-min-80")
+		Expect(data.Spec.Storage.Size.String()).To(Equal("100Gi"), "storage change converges onto the node")
 	})
 
 	It("rejects changing placement (an online move, not yet supported)", func() {

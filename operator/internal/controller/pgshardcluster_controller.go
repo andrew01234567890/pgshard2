@@ -462,11 +462,15 @@ func (r *PgShardClusterReconciler) ensureNode(
 		}
 		if existing.Spec.PostgresConfigHash != node.Spec.PostgresConfigHash ||
 			existing.Spec.Replicas != node.Spec.Replicas ||
-			existing.Spec.Image != node.Spec.Image {
+			existing.Spec.Image != node.Spec.Image ||
+			!equality.Semantic.DeepEqual(existing.Spec.Storage, node.Spec.Storage) {
 			existing.Spec.PostgresConfigHash = node.Spec.PostgresConfigHash
 			existing.Spec.Replicas = node.Spec.Replicas
 			existing.Spec.Image = node.Spec.Image
 			existing.Spec.Resources = node.Spec.Resources
+			// Converge the desired storage so a scale-up gets a correctly-sized
+			// PVC; resizing an existing instance's volume is a separate concern.
+			existing.Spec.Storage = node.Spec.Storage
 			return false, r.Update(ctx, existing)
 		}
 		return false, nil
