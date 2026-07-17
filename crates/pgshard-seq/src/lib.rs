@@ -7,15 +7,21 @@
 //! single `UPDATE pgshard.sequences SET next_id = next_id + cache_size ...
 //! RETURNING` that grants a half-open range `[start, start+size)`; the
 //! router then hands ids out of that range without touching the database
-//! until it drains. Ids are monotonic-ish (gaps on router restart are
-//! expected and documented) and never duplicated across routers.
+//! until it drains. Ids are monotonic-ish (gaps on router restart or
+//! over-reservation are expected and documented) and never duplicated across
+//! routers.
 //!
 //! This crate is the in-memory allocator over reserved blocks plus the
 //! trait for the reservation backend; the concrete Postgres backend lives
-//! in the router where the connection pool is.
+//! in the router where the connection pool is. Concurrent callers that drain
+//! a block are single-flighted: exactly one performs the reservation while the
+//! others wait for it, so a burst never fans out into N database round-trips.
+//! Reserving synchronously on full drain still blocks that one caller on the
+//! database; a router avoids even that by watching `needs_refill` and
+//! reserving the next block in the background before the current one drains.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use thiserror::Error;
 
@@ -37,11 +43,18 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn new(start: i64, size: i64) -> Block {
-        Block {
-            next: start,
-            end: start.saturating_add(size),
-        }
+    /// Builds a block over `[start, start + size)`. Returns `None` if the range
+    /// would overflow `i64` (a malformed reservation near the top of the space),
+    /// so a bad backend result is rejected rather than silently truncated.
+    pub fn new(start: i64, size: i64) -> Option<Block> {
+        let end = start.checked_add(size)?;
+        Some(Block { next: start, end })
+    }
+
+    /// An already-drained block, used as a placeholder while a first
+    /// reservation is in flight.
+    const fn empty() -> Block {
+        Block { next: 0, end: 0 }
     }
 
     fn take(&mut self) -> Option<i64> {
@@ -62,6 +75,15 @@ impl Block {
 
 /// Reserves the next block for a sequence from the authoritative store.
 /// Implementations run the `UPDATE ... RETURNING` against the system DB.
+///
+/// Correctness contract — the store is the ONLY thing that enforces global
+/// uniqueness, so an implementation MUST return, for each `sequence`, ranges
+/// that are:
+///   - positive (`size > 0`) and representable (`start + size` fits in i64),
+///   - globally DISJOINT across every router and every call — two reservations
+///     that overlap immediately duplicate ids, the one thing sequences must
+///     never do. The atomic `UPDATE ... SET next_id = next_id + size RETURNING`
+///     against the single system row is what guarantees this.
 pub trait BlockReserver: Send + Sync {
     /// Returns the reserved range's start and size for `sequence`.
     fn reserve(&self, sequence: &str) -> Result<(i64, i64), SeqError>;
@@ -69,17 +91,25 @@ pub trait BlockReserver: Send + Sync {
 
 struct SeqState {
     block: Block,
-    /// Reserve the next block once the current one drops to this many ids,
-    /// so steady-state traffic never blocks on the database.
+    /// Once the current block drops to this many ids, `needs_refill` reports
+    /// true so a router can reserve the next block in the background before the
+    /// current one drains (this crate itself only reserves on full drain).
     refill_at: i64,
+    /// True while one caller holds the single-flight reservation claim for this
+    /// sequence; others wait on the condvar rather than reserving in parallel.
     reserving: bool,
 }
 
 /// Hands out ids for many sequences, reserving fresh blocks as they drain.
-/// Cheap and lock-guarded; the hot path is a single mutex + integer bump.
+/// Cheap and lock-guarded; the steady-state hot path is a single mutex + integer
+/// bump. Sequence names are expected to come from the bounded, registered
+/// sequence catalog (the vschema), so the per-name map does not grow unbounded.
 pub struct SequenceCache<R: BlockReserver> {
     reserver: R,
     state: Mutex<HashMap<String, SeqState>>,
+    /// Notified whenever a reservation completes (success or failure), so
+    /// callers waiting on a single-flighted reservation re-check their block.
+    reserved: Condvar,
 }
 
 impl<R: BlockReserver> SequenceCache<R> {
@@ -87,53 +117,77 @@ impl<R: BlockReserver> SequenceCache<R> {
         SequenceCache {
             reserver,
             state: Mutex::new(HashMap::new()),
+            reserved: Condvar::new(),
         }
     }
 
-    /// Returns the next id for `sequence`, reserving a new block if the
-    /// current one is exhausted (or was never reserved).
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, SeqState>> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Returns the next id for `sequence`, reserving a new block if the current
+    /// one is exhausted (or was never reserved). Concurrent callers on a drained
+    /// sequence single-flight the reservation: one reserves, the rest wait.
     pub fn next_id(&self, sequence: &str) -> Result<i64, SeqError> {
-        // Fast path under the lock; on a drained block we reserve while
-        // holding no lock, then re-acquire to install the block (the
-        // double-buffered async refill is a router-side optimization on
-        // top of this).
-        {
-            let mut state = self.state.lock().expect("sequence cache lock");
-            if let Some(entry) = state.get_mut(sequence)
-                && let Some(id) = entry.block.take()
-            {
-                return Ok(id);
+        let mut state = self.lock();
+        loop {
+            match state.get_mut(sequence) {
+                Some(entry) => {
+                    if let Some(id) = entry.block.take() {
+                        return Ok(id);
+                    }
+                    if entry.reserving {
+                        // Another caller is reserving the next block; wait for it
+                        // rather than issue a second reservation, then re-check.
+                        state = self.reserved.wait(state).unwrap_or_else(|p| p.into_inner());
+                        continue;
+                    }
+                    entry.reserving = true;
+                }
+                None => {
+                    // First use: claim the reservation with a drained placeholder
+                    // so concurrent first-callers single-flight too.
+                    state.insert(
+                        sequence.to_string(),
+                        SeqState {
+                            block: Block::empty(),
+                            refill_at: 0,
+                            reserving: true,
+                        },
+                    );
+                }
             }
-        }
 
-        let (start, size) = self.reserver.reserve(sequence)?;
-        if size <= 0 {
-            return Err(SeqError::Backend(format!(
-                "sequence {sequence:?} reserved a non-positive block size {size}"
-            )));
-        }
-        let mut block = Block::new(start, size);
-        let id = block
-            .take()
-            .ok_or_else(|| SeqError::Exhausted(sequence.to_string()))?;
-        let refill_at = (size / 5).max(1);
+            // We hold the single-flight claim. Reserve without the lock, then
+            // re-acquire to install the block and wake the waiters.
+            drop(state);
+            let result = self.reserver.reserve(sequence);
+            state = self.lock();
+            let entry = state.get_mut(sequence).expect("reservation claim present");
+            entry.reserving = false;
+            self.reserved.notify_all();
 
-        let mut state = self.state.lock().expect("sequence cache lock");
-        state.insert(
-            sequence.to_string(),
-            SeqState {
-                block,
-                refill_at,
-                reserving: false,
-            },
-        );
-        Ok(id)
+            let (start, size) = result?;
+            if size <= 0 {
+                return Err(SeqError::Backend(format!(
+                    "sequence {sequence:?} reserved a non-positive block size {size}"
+                )));
+            }
+            let mut block =
+                Block::new(start, size).ok_or_else(|| SeqError::Exhausted(sequence.to_string()))?;
+            let id = block
+                .take()
+                .ok_or_else(|| SeqError::Exhausted(sequence.to_string()))?;
+            entry.block = block;
+            entry.refill_at = (size / 5).max(1);
+            return Ok(id);
+        }
     }
 
     /// Whether the sequence's cached block has drained past its refill
     /// threshold (a router uses this to trigger a background reservation).
     pub fn needs_refill(&self, sequence: &str) -> bool {
-        let state = self.state.lock().expect("sequence cache lock");
+        let state = self.lock();
         state
             .get(sequence)
             .is_some_and(|s| !s.reserving && s.block.remaining() <= s.refill_at)
@@ -239,5 +293,46 @@ mod tests {
     fn non_positive_block_size_is_rejected() {
         let cache = SequenceCache::new(BadSizeReserver);
         assert!(cache.next_id("s").is_err());
+    }
+
+    struct OverflowReserver;
+    impl BlockReserver for OverflowReserver {
+        fn reserve(&self, _: &str) -> Result<(i64, i64), SeqError> {
+            Ok((i64::MAX - 1, 10))
+        }
+    }
+
+    #[test]
+    fn overflowing_reservation_is_rejected_not_truncated() {
+        let cache = SequenceCache::new(OverflowReserver);
+        assert!(matches!(cache.next_id("s"), Err(SeqError::Exhausted(_))));
+    }
+
+    #[test]
+    fn concurrent_drainers_single_flight_the_reservation() {
+        use std::sync::Arc;
+        // Block of 1: every id past the first drains and must reserve. If N
+        // threads race the same drained sequence, single-flighting keeps the
+        // ids unique and contiguous rather than fanning out duplicate blocks.
+        let cache = Arc::new(SequenceCache::new(FakeReserver::new(1)));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                (0..50).map(|_| c.next_id("s").unwrap()).collect::<Vec<_>>()
+            }));
+        }
+        let mut all: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            n,
+            "ids must be unique across concurrent drainers"
+        );
     }
 }
