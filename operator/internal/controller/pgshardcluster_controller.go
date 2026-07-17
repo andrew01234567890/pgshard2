@@ -90,17 +90,25 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	ready, degraded := int32(0), int32(0)
 	for i := range desired {
 		shard := &desired[i]
-		if err := r.ensureConfigMap(ctx, &cluster, shard.Name, rendered); err != nil {
-			return ctrl.Result{}, err
-		}
 		existing := &pgshardv1alpha1.PgShardShard{}
 		err := r.Get(ctx, client.ObjectKeyFromObject(shard), existing)
 		switch {
 		case apierrors.IsNotFound(err):
+			// New shard: render its config (this also length-checks the name),
+			// then create it. If a concurrent create wins (AlreadyExists despite
+			// the cached NotFound), the object exists after all — requeue so the
+			// next reconcile Gets it and validates ownership, rather than
+			// assuming it is ours.
+			if err := r.ensureConfigMap(ctx, &cluster, shard.Name, rendered); err != nil {
+				return ctrl.Result{}, err
+			}
 			if err := controllerutil.SetControllerReference(&cluster, shard, r.Scheme); err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.Create(ctx, shard); err != nil && !apierrors.IsAlreadyExists(err) {
+			if err := r.Create(ctx, shard); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
 				return ctrl.Result{}, fmt.Errorf("creating shard %s: %w", shard.Name, err)
 			}
 			log.Info("created shard", "shard", shard.Name, "range", shard.Spec.KeyRange)
@@ -109,10 +117,14 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		default:
 			// A shard with the desired name that this cluster does not own is a
 			// foreign object (or a stale one from a deleted cluster of the same
-			// name); converging it would corrupt the partition. Surface it.
+			// name); mutating it or its ConfigMap would corrupt the partition, so
+			// verify ownership before touching either.
 			if !metav1.IsControlledBy(existing, &cluster) {
 				return ctrl.Result{}, fmt.Errorf(
 					"shard %s exists but is not controlled by cluster %s", shard.Name, cluster.Name)
+			}
+			if err := r.ensureConfigMap(ctx, &cluster, shard.Name, rendered); err != nil {
+				return ctrl.Result{}, err
 			}
 			// Key range and clusterRef are immutable; converge the fields the
 			// cluster owns (config hash, sizing) without touching the rest.
