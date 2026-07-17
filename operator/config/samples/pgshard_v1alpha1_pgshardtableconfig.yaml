@@ -10,6 +10,7 @@ spec:
   tables:
     - name: orders
       shardKeyColumn: customer_id
+      shardKeyType: int
       sequences:
         - column: id
           sequence: orders_id

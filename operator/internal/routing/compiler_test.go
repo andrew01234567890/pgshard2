@@ -17,6 +17,7 @@ func tableConfig(name string, tables ...string) pgshardv1alpha1.PgShardTableConf
 	for _, tbl := range tables {
 		c.Spec.Tables = append(c.Spec.Tables, pgshardv1alpha1.TableEntry{
 			Name: tbl, Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: "id",
+			ShardKeyType: pgshardv1alpha1.ShardKeyInt,
 		})
 	}
 	return c
@@ -132,6 +133,24 @@ func TestCompileDetectsDuplicateTablesAcrossConfigs(t *testing.T) {
 	var dup *DuplicateTableError
 	if !errors.As(err, &dup) || dup.FirstConfig != "team-a" || dup.SecondConfig != "team-b" {
 		t.Fatalf("expected duplicate-table error naming both configs, got %v", err)
+	}
+}
+
+func TestCompileProjectsShardKeyType(t *testing.T) {
+	in := CompileInputs{
+		Cluster:      cluster(),
+		Shards:       []pgshardv1alpha1.PgShardShard{shard("all", "", "", true, "p1", pgshardv1alpha1.ShardRoleData)},
+		Endpoints:    endpoints("p1"),
+		TableConfigs: []pgshardv1alpha1.PgShardTableConfig{tableConfig("team-a", "orders")},
+	}
+	spec, err := Compile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shard-key type must reach the compiled view so the router can coerce
+	// literals before hashing.
+	if len(spec.Tables) != 1 || spec.Tables[0].ShardKeyType != pgshardv1alpha1.ShardKeyInt {
+		t.Fatalf("compiled table must carry the shard-key type, got %+v", spec.Tables)
 	}
 }
 
