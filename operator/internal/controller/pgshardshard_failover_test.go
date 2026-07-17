@@ -33,6 +33,7 @@ const (
 	testPostgresImage = "pg:test"
 	testAgentImage    = "agent:test"
 	primaryPodIP      = "127.0.0.2"
+	replicaPodIP      = "127.0.0.3"
 )
 
 var _ = Describe("PgShardShard failover", func() {
@@ -61,7 +62,7 @@ var _ = Describe("PgShardShard failover", func() {
 			switch host {
 			case primaryPodIP:
 				return primaryAgent.Client()
-			case "127.0.0.3":
+			case replicaPodIP:
 				return laggingAgent.Client()
 			default:
 				return advancedAgent.Client()
@@ -97,7 +98,7 @@ var _ = Describe("PgShardShard failover", func() {
 		// First reconcile creates the pods.
 		reconcile()
 		stampPodIP("fo-0", primaryPodIP)
-		stampPodIP("fo-1", "127.0.0.3")
+		stampPodIP("fo-1", replicaPodIP)
 		stampPodIP("fo-2", "127.0.0.4")
 		laggingAgent.SetReceivedLSN(300)
 		advancedAgent.SetReceivedLSN(500) // most advanced -> should be elected
@@ -130,11 +131,13 @@ var _ = Describe("PgShardShard failover", func() {
 		Expect(advancedAgent.AppliedEpoch()).To(BeNumerically(">=", uint64(1)))
 		Expect(laggingAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
 
-		// Observe pass: the poll sees fo-2 as primary and records currentPrimary.
+		// Observe pass: the poll sees fo-2 as a ready primary and records
+		// currentPrimary. The election commitment is cleared now the failover
+		// completed, so a later failure re-elects afresh.
 		reconcile()
 		got := get()
 		Expect(got.Status.CurrentPrimary).To(Equal("fo-2"))
-		Expect(got.Status.TargetPrimary).To(Equal("fo-2"))
+		Expect(got.Status.TargetPrimary).To(BeEmpty())
 
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
@@ -183,7 +186,7 @@ var _ = Describe("PgShardShard failover", func() {
 
 		reconcile()
 		stampPodIP("blip-0", primaryPodIP)
-		stampPodIP("blip-1", "127.0.0.3")
+		stampPodIP("blip-1", replicaPodIP)
 
 		// Healthy: the primary is recorded.
 		reconcile()
@@ -239,7 +242,7 @@ var _ = Describe("PgShardShard failover", func() {
 			switch host {
 			case primaryPodIP:
 				return primaryAgent.Client()
-			case "127.0.0.3": // sticky-1 (earlyName, sorts first)
+			case replicaPodIP: // sticky-1 (earlyName, sorts first)
 				return earlyName.Client()
 			default: // 127.0.0.4 sticky-2 (firstElected, sorts last)
 				return firstElected.Client()
@@ -273,7 +276,7 @@ var _ = Describe("PgShardShard failover", func() {
 
 		reconcile()
 		stampPodIP("sticky-0", primaryPodIP)
-		stampPodIP("sticky-1", "127.0.0.3")
+		stampPodIP("sticky-1", replicaPodIP)
 		stampPodIP("sticky-2", "127.0.0.4")
 		// Both standbys hold the same LSN; sticky-1 sorts first by name. sticky-1
 		// is initially not-ready, so only sticky-2 is electable this cycle.
@@ -350,7 +353,7 @@ var _ = Describe("PgShardShard failover", func() {
 
 		reconcile()
 		stampPodIP("twonode-0", primaryPodIP)
-		stampPodIP("twonode-1", "127.0.0.3")
+		stampPodIP("twonode-1", replicaPodIP)
 
 		reconcile() // healthy
 		Expect(get().Status.CurrentPrimary).To(Equal("twonode-0"))
@@ -369,6 +372,92 @@ var _ = Describe("PgShardShard failover", func() {
 		reconcile() // drive pass
 		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
 		Expect(replicaAgent.AppliedEpoch()).To(BeNumerically(">=", uint64(1)))
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("re-elects a fresh target when a promoted primary later fails (no stale-commit deadlock)", func() {
+		n0, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(n0.Stop)
+		n1, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(n1.Stop)
+		n2, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(n2.Stop)
+		n0.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		n1.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		n2.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			switch host {
+			case primaryPodIP:
+				return n0.Client()
+			case replicaPodIP:
+				return n1.Client()
+			default:
+				return n2.Client()
+			}
+		}
+		r := &PgShardShardReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		const shardName = "refail"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 3,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: shardName, Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardShard {
+			var got pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardName, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("refail-0", primaryPodIP)
+		stampPodIP("refail-1", replicaPodIP)
+		stampPodIP("refail-2", "127.0.0.4")
+		n1.SetReceivedLSN(500) // both standbys caught up; refail-1 sorts first
+		n2.SetReceivedLSN(500)
+
+		reconcile() // healthy
+		Expect(get().Status.CurrentPrimary).To(Equal("refail-0"))
+
+		// First failover: refail-0 dies, refail-1 is elected and promoted.
+		n0.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		n0.SetReady(false)
+		reconcile() // elect
+		Expect(get().Status.TargetPrimary).To(Equal("refail-1"))
+		reconcile() // promote
+		Expect(n1.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
+		reconcile() // observe: commitment cleared once refail-1 is a ready primary
+		Expect(get().Status.CurrentPrimary).To(Equal("refail-1"))
+		Expect(get().Status.TargetPrimary).To(BeEmpty())
+
+		// Second failover: the new primary's pod is removed (node failure). The
+		// caught-up refail-2 must be elected — not parked forever on the stale,
+		// now-gone commitment to refail-1.
+		var p1 corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "refail-1", Namespace: ns}, &p1)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &p1)).To(Succeed())
+
+		reconcile() // recreates refail-1 (no IP), elects refail-2
+		Expect(get().Status.TargetPrimary).To(Equal("refail-2"))
+		reconcile() // promote refail-2
+		Expect(n2.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
 
 		got := get()
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())

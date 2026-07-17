@@ -72,6 +72,25 @@ func TestEvaluateFailover(t *testing.T) {
 			wantWait:        true,
 		},
 		{
+			name: "committed target lost its pod IP (evicted): park, never elect a different replica around it",
+			instances: []instanceView{
+				{pod: "p1", host: "", observed: false},                     // committed, rescheduled Pending
+				{pod: "p2", ready: true, receivedLSN: 400, observed: true}, // a behind replica
+			},
+			committedTarget: "p1",
+			wantWarranted:   true,
+			wantWait:        true,
+		},
+		{
+			name: "committed target vanished from the set: park, do not promote a survivor",
+			instances: []instanceView{
+				{pod: "p2", ready: true, receivedLSN: 400, observed: true},
+			},
+			committedTarget: "p1", // absent from the set entirely
+			wantWarranted:   true,
+			wantWait:        true,
+		},
+		{
 			name: "old primary relinquished the role: elect most-advanced ready replica",
 			instances: []instanceView{
 				{pod: "p0", ready: false, observed: true}, // demoted to standby

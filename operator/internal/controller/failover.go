@@ -122,9 +122,9 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 	if hasReadyPrimary {
 		return failoverDecision{}
 	}
-	// Nothing to act on: no ready replica to elect and no committed target still
-	// being driven to promotion (a shard with neither is provisioning or down).
-	if len(candidates) == 0 && !committedDrivable {
+	// Nothing to act on: no ready replica to elect, no committed target to drive,
+	// and no outstanding commitment to wait for (provisioning or fully down).
+	if len(candidates) == 0 && !committedDrivable && committedTarget == "" {
 		return failoverDecision{}
 	}
 	// Only safe to promote from a no-claimant snapshot in which every started
@@ -132,21 +132,33 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 	if anyClaimsPrimary || anyRunningUnobserved || anyReceiverActive {
 		return failoverDecision{warranted: true, wait: true}
 	}
-	// Sticky/drive: once committed to a target keep driving that same pod while it
-	// is present and observable — even mid-promotion, when it is momentarily not a
-	// ready candidate. This neither abandons it for a newly-preferred pod
-	// (split-brain) nor strands a two-node failover whose only instance is the
-	// not-ready target. It is still held to the WAL guard: a committed target that
-	// has fallen behind an observed peer (e.g. rebuilt from an empty volume) must
-	// not be promoted as a laggard.
-	if committedDrivable {
-		if committedLSN < maxObservedLSN {
+	// A durable commitment to a specific target governs the decision: keep driving
+	// that same pod, or wait for it — but never elect a DIFFERENT, possibly-behind
+	// pod around it. reconcileFailover clears the commitment once its target
+	// becomes a ready primary, so a committed target here is one we are still
+	// driving to promotion.
+	if committedTarget != "" {
+		switch {
+		case !committedDrivable:
+			// Gone or without a pod IP this cycle: unaccounted for. It may return
+			// holding WAL only it has, or may already be promoted, so we park rather
+			// than promote a replacement. Because the operator durably committed to
+			// this target (it was the most advanced at election), waiting — not a
+			// WAL watermark — is the data-safe choice; only STONITH/bounded-lag
+			// (deferred) may later abandon it.
 			return failoverDecision{warranted: true, wait: true}
+		case committedLSN < maxObservedLSN:
+			// Present but behind an observed peer (e.g. rebuilt from an empty
+			// volume): never promote it as a laggard.
+			return failoverDecision{warranted: true, wait: true}
+		default:
+			// Keep driving it, even mid-promotion when it is momentarily not a ready
+			// candidate (so a two-node failover is not stranded).
+			return failoverDecision{warranted: true, targetPrimary: committedTarget}
 		}
-		return failoverDecision{warranted: true, targetPrimary: committedTarget}
 	}
+	// Fresh election: the most-advanced ready candidate, ties broken by pod name.
 	slices.SortFunc(candidates, func(a, b instanceView) int {
-		// Most advanced first; ties broken by pod name for determinism.
 		if a.receivedLSN != b.receivedLSN {
 			return cmp.Compare(b.receivedLSN, a.receivedLSN)
 		}
@@ -182,6 +194,12 @@ func (r *PgShardShardReconciler) reconcileFailover(
 	// yet safe to elect: leave the phase deriveShardStatus computed this cycle —
 	// Degraded while a split-brain or a quorum loss persists is the honest signal.
 	if !decision.warranted || decision.wait {
+		// A confirmed ready primary means any in-flight failover has completed:
+		// drop the election commitment so a later failure of THIS primary starts a
+		// fresh election instead of parking forever on the now-stale target.
+		if !decision.warranted && shard.Status.CurrentPrimary != "" && shard.Status.TargetPrimary != "" {
+			shard.Status.TargetPrimary = ""
+		}
 		return nil
 	}
 
