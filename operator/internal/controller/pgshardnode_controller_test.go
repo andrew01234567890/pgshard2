@@ -35,11 +35,11 @@ import (
 var _ = Describe("PgShardNode lifecycle", func() {
 	const ns = "default"
 
-	newNode := func(name string, replicas int32) *pgshardv1alpha1.PgShardNode {
+	newNode := func(name string) *pgshardv1alpha1.PgShardNode {
 		return &pgshardv1alpha1.PgShardNode{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardNodeSpec{
-				Replicas:           replicas,
+				Replicas:           2,
 				PostgresConfigHash: "hash-1",
 				Storage:            &pgshardv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")},
 			},
@@ -51,9 +51,9 @@ var _ = Describe("PgShardNode lifecycle", func() {
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Agents: agentclient.NewInsecurePool(),
-			Images: ShardImages{Postgres: "pg:test", Agent: "agent:test"},
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
 		}
-		Expect(k8sClient.Create(ctx, newNode("n1", 2))).To(Succeed())
+		Expect(k8sClient.Create(ctx, newNode("n1"))).To(Succeed())
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1", Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -73,7 +73,7 @@ var _ = Describe("PgShardNode lifecycle", func() {
 		for _, name := range []string{"n1-0", "n1-1"} {
 			var pod corev1.Pod
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &pod)).To(Succeed())
-			Expect(pod.Spec.InitContainers[0].Image).To(Equal("agent:test"))
+			Expect(pod.Spec.InitContainers[0].Image).To(Equal(testAgentImage))
 			Expect(pod.Spec.Containers[0].Command[0]).To(Equal("/pgshard/pgshard-agent"))
 			Expect(pod.Spec.Containers[0].Env[0]).To(Equal(corev1.EnvVar{Name: "PGSHARD_NODE", Value: "n1"}))
 			for _, e := range pod.Spec.Containers[0].Env {
@@ -95,14 +95,22 @@ var _ = Describe("PgShardNode lifecycle", func() {
 		Expect(got.Status.Instances).To(HaveLen(2))
 	})
 
+	It("rejects a node name that would build invalid Service names", func() {
+		bad := newNode("has.dots")
+		Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed(), "dotted name is not a DNS label")
+		long := newNode("tmp")
+		long.Name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 60 chars
+		Expect(k8sClient.Create(ctx, long)).NotTo(Succeed(), "over-long name overflows the 63-char Service limit")
+	})
+
 	It("does not touch pods while fenced", func() {
 		r := &PgShardNodeReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			Agents: agentclient.NewInsecurePool(),
-			Images: ShardImages{Postgres: "pg:test", Agent: "agent:test"},
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
 		}
-		node := newNode("n2", 2)
+		node := newNode("n2")
 		node.Spec.Fenced = true
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "n2", Namespace: ns}})
@@ -131,10 +139,10 @@ var _ = Describe("PgShardNode lifecycle", func() {
 		r := &PgShardNodeReconciler{
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
-			Images:    ShardImages{Postgres: "pg:test", Agent: "agent:test"},
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
 			dialAgent: dial,
 		}
-		Expect(k8sClient.Create(ctx, newNode("n3", 2))).To(Succeed())
+		Expect(k8sClient.Create(ctx, newNode("n3"))).To(Succeed())
 		reconcile := func() {
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "n3", Namespace: ns}})
 			Expect(err).NotTo(HaveOccurred())

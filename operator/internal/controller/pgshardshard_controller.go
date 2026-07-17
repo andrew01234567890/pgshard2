@@ -61,6 +61,15 @@ const (
 	portNamePostgres  = "postgres"
 	agentVolumeName   = "agent"
 	headlessSvcSuffix = "-pods"
+
+	// Service suffixes and volume names shared by the shard and node
+	// controllers (physical conventions); they consolidate onto the node
+	// controller when the shard's physical half is removed.
+	svcSuffixRW   = "-rw"
+	svcSuffixRO   = "-ro"
+	volNameData   = "data"
+	volNameConfig = "config"
+	volNameWAL    = "wal"
 )
 
 // ShardImages are the images shard pods run; wired from manager flags.
@@ -170,8 +179,8 @@ func (r *PgShardShardReconciler) ensureServices(
 		selector map[string]string
 		headless bool
 	}{
-		{"-rw", withRole(shardSelector(shard), roleLabelPrimary), false},
-		{"-ro", withRole(shardSelector(shard), roleLabelReplica), false},
+		{svcSuffixRW, withRole(shardSelector(shard), roleLabelPrimary), false},
+		{svcSuffixRO, withRole(shardSelector(shard), roleLabelReplica), false},
 		{"-r", shardSelector(shard), false},
 		{headlessSvcSuffix, shardSelector(shard), true},
 	}
@@ -373,7 +382,7 @@ func (r *PgShardShardReconciler) instancePod(
 				}},
 			}},
 			Containers: []corev1.Container{{
-				Name:    "postgres",
+				Name:    portNamePostgres,
 				Image:   postgresImage,
 				Command: []string{agentVolumePath + "/pgshard-agent", "run"},
 				Env: []corev1.EnvVar{
@@ -384,7 +393,7 @@ func (r *PgShardShardReconciler) instancePod(
 					}},
 				},
 				Ports: []corev1.ContainerPort{
-					{Name: "postgres", ContainerPort: 5432},
+					{Name: portNamePostgres, ContainerPort: 5432},
 					{Name: "agent-grpc", ContainerPort: agentPort},
 					{Name: "probes", ContainerPort: 8080},
 				},
@@ -411,20 +420,20 @@ func (r *PgShardShardReconciler) instancePod(
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "agent", MountPath: agentVolumePath},
-					{Name: "data", MountPath: "/var/lib/postgresql/data"},
-					{Name: "config", MountPath: "/etc/pgshard/config"},
+					{Name: volNameData, MountPath: "/var/lib/postgresql/data"},
+					{Name: volNameConfig, MountPath: "/etc/pgshard/config"},
 				},
 			}},
 			Volumes: []corev1.Volume{
 				{Name: agentVolumeName, VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				}},
-				{Name: "data", VolumeSource: corev1.VolumeSource{
+				{Name: volNameData, VolumeSource: corev1.VolumeSource{
 					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 						ClaimName: name + "-data",
 					},
 				}},
-				{Name: "config", VolumeSource: corev1.VolumeSource{
+				{Name: volNameConfig, VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
 						LocalObjectReference: corev1.LocalObjectReference{
 							Name: shard.Name + "-postgres-config",
@@ -440,10 +449,10 @@ func (r *PgShardShardReconciler) instancePod(
 	if shard.Spec.Storage != nil && shard.Spec.Storage.WalSeparate {
 		c := &pod.Spec.Containers[0]
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
-			Name: "wal", MountPath: "/var/lib/postgresql/wal",
+			Name: volNameWAL, MountPath: "/var/lib/postgresql/wal",
 		})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-			Name: "wal", VolumeSource: corev1.VolumeSource{
+			Name: volNameWAL, VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: name + "-wal",
 				},
