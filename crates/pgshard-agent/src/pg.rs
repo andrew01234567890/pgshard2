@@ -95,8 +95,15 @@ impl Instance for PgInstance {
         if !promoted {
             anyhow::bail!("pg_promote timed out before the standby became primary");
         }
+        // Read the LIVE timeline from the current WAL file name, not
+        // pg_control_checkpoint(): the latter reflects the last completed
+        // checkpoint, and the post-promotion checkpoint is asynchronous, so it
+        // would still report the pre-promotion timeline for a while.
         let timeline: i32 = client
-            .query_one("SELECT timeline_id FROM pg_control_checkpoint()", &[])
+            .query_one(
+                "SELECT ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int",
+                &[],
+            )
             .await?
             .get(0);
         Ok(timeline as u32)
