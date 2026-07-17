@@ -8,5 +8,5 @@ pub mod vschema;
 
 pub use keyspace::{KeyRange, KeyspaceId, PartitionError, validate_partition};
 pub use lsn::Lsn;
-pub use shardfn::{ScalarValue, ShardFnError, ShardFunction, shard_function};
+pub use shardfn::{ScalarType, ScalarValue, ShardFnError, ShardFunction, shard_function};
 pub use vschema::{SequenceBinding, TableDef, TableName, VSchema, VSchemaError};

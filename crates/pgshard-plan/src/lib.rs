@@ -14,13 +14,13 @@
 //! - Shard keys are read from top-level `key = value` / `key IN (...)`
 //!   constraints (AND-reachable); OR/NOT subtrees are not mined, so such a read
 //!   scatters and such a write is rejected.
-//! - Literal shard keys are hashed by their SQL form — integer literals as
-//!   `Int64`, string literals as `Text`. The vschema does not yet carry the
-//!   shard-key column's type, so a quoted literal against an integer column
-//!   (`customer_id = '1'`) hashes as text and can route differently from the
-//!   `Int64` the row was stored under. Typed coercion (and uuid/bytea hashing)
-//!   is a follow-up; until then the operator must use literals in the column's
-//!   native form.
+//! - Literal shard keys are coerced to the column's declared type before hashing
+//!   ([`ScalarType::coerce`]), so different spellings of one value route
+//!   identically — `customer_id = '1'` and `customer_id = 1` hit the same shard
+//!   for an integer key. A literal that is not a valid value of the type (PG
+//!   would reject it) is treated as unroutable: the read scatters and the write
+//!   is rejected. When the topology does not declare the column's type, the
+//!   literal is hashed in the form it was written (the pre-typing behavior).
 //! - A `$n` shard key yields a [`Plan::Parameterized`]: the value is known only
 //!   at Bind, so bind-time resolution is left to the executor. A predicate that
 //!   mixes a literal and a parameter (`key IN (1, $1)`) is not parameterizable
@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 
-use pgshard_core::{ScalarValue, TableDef, TableName, VSchema, shard_function};
+use pgshard_core::{ScalarType, ScalarValue, TableDef, TableName, VSchema, shard_function};
 use pgshard_sql::{Parsed, StatementKind};
 
 pub use catalog::{ShardCatalog, ShardId};
@@ -78,6 +78,10 @@ pub enum Plan {
 pub struct Parameterized {
     /// Shard function that maps each bound shard-key value to a keyspace id.
     pub shard_function: String,
+    /// The shard-key column's type, so a bound value is coerced the same way a
+    /// literal is before hashing (`resolve_bound`). `None` hashes the value as
+    /// delivered — matching the untyped literal path.
+    pub key_type: Option<ScalarType>,
     /// The 1-based `$n` positions that supply shard-key values.
     pub param_indices: Vec<u32>,
     /// True for INSERT/UPDATE/DELETE: at Bind every value must land on one
@@ -130,12 +134,14 @@ pub fn plan_all(parsed: &Parsed, vschema: &VSchema, shards: &ShardCatalog) -> Ve
 
 /// Complete a [`Parameterized`] plan once its bind parameters are known.
 ///
-/// `values` are the statement's bound parameters, 0-indexed (`$1` = `values[0]`),
-/// already coerced to the column's type by the wire layer. Each shard-key
-/// parameter is hashed with the plan's shard function and routed through
-/// `shards` — the same decision the planner makes for literals: one shard →
-/// [`Plan::SingleShard`]; a read spanning several → [`Plan::Scatter`]; a write
-/// spanning several → rejected as cross-shard.
+/// `values` are the statement's bound parameters, 0-indexed (`$1` = `values[0]`).
+/// Each shard-key parameter is coerced to the plan's [`Parameterized::key_type`]
+/// and hashed with the plan's shard function — the same decision the planner
+/// makes for literals, so a bound `"1"` and a bound `1` route alike for an
+/// integer key. A value that is not valid for the type is rejected rather than
+/// routed to a guessed shard. One shard → [`Plan::SingleShard`]; a read spanning
+/// several → [`Plan::Scatter`]; a write spanning several → rejected as
+/// cross-shard.
 pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &ShardCatalog) -> Plan {
     // Planner-built plans always name a vschema-validated function, but this is a
     // public entry point with public fields — reject an unknown one, never panic.
@@ -152,7 +158,18 @@ pub fn resolve_bound(param: &Parameterized, values: &[ScalarValue], shards: &Sha
                 "bind parameter ${idx} for the shard key is missing"
             ));
         };
-        hit.insert(shards.route(func.keyspace_id(value)).clone());
+        let id = match param.key_type {
+            Some(t) => match t.coerce(value) {
+                Some(canonical) => func.keyspace_id(&canonical),
+                None => {
+                    return reject(&format!(
+                        "bind parameter ${idx} is not a valid value for the shard key type"
+                    ));
+                }
+            },
+            None => func.keyspace_id(value),
+        };
+        hit.insert(shards.route(id).clone());
     }
     let hit: Vec<ShardId> = hit.into_iter().collect();
     match (param.write, hit.len()) {
@@ -185,11 +202,21 @@ enum Resolution {
     /// resolution sees only the params, so neither `Shards` nor `Params` is
     /// sound: the caller must scatter (read) or reject (write).
     Mixed,
+    /// A literal shard key that is not a valid value of the column's declared
+    /// type (PostgreSQL would reject it), so it cannot be hashed. Handled like
+    /// `Mixed`: the read scatters (every shard returns PG's type error) and the
+    /// write is rejected rather than routed to a guessed shard.
+    Uncoercible,
     /// All values are literals; carries the distinct shards they hit.
     Shards(Vec<ShardId>),
 }
 
-fn route_values(values: &[KeyVal], shard_fn: &str, shards: &ShardCatalog) -> Resolution {
+fn route_values(
+    values: &[KeyVal],
+    key_type: Option<ScalarType>,
+    shard_fn: &str,
+    shards: &ShardCatalog,
+) -> Resolution {
     if values.is_empty() {
         return Resolution::Unkeyed;
     }
@@ -210,7 +237,17 @@ fn route_values(values: &[KeyVal], shard_fn: &str, shards: &ShardCatalog) -> Res
     let mut hit = BTreeSet::new();
     for v in values {
         if let KeyVal::Const(sv) = v {
-            hit.insert(shards.route(func.keyspace_id(sv)).clone());
+            // Untyped columns hash the literal as written; typed columns coerce
+            // first, and a value invalid for the type is unroutable (see
+            // `ScalarType::coerce`).
+            let id = match key_type {
+                Some(t) => match t.coerce(sv) {
+                    Some(canonical) => func.keyspace_id(&canonical),
+                    None => return Resolution::Uncoercible,
+                },
+                None => func.keyspace_id(sv),
+            };
+            hit.insert(shards.route(id).clone());
         }
     }
     Resolution::Shards(hit.into_iter().collect())
@@ -227,7 +264,11 @@ fn read_from_shards(mut hit: Vec<ShardId>) -> Plan {
 
 /// The sharded/global classification of a referenced table.
 enum Placement<'a> {
-    Sharded { key: &'a str, shard_fn: &'a str },
+    Sharded {
+        key: &'a str,
+        key_type: Option<ScalarType>,
+        shard_fn: &'a str,
+    },
     Global,
     Unknown,
 }
@@ -236,10 +277,12 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
     match vschema.get(table) {
         Some(TableDef::Sharded {
             shard_key_column,
+            shard_key_type,
             shard_function,
             ..
         }) => Placement::Sharded {
             key: shard_key_column,
+            key_type: *shard_key_type,
             shard_fn: shard_function,
         },
         Some(TableDef::Global) => Placement::Global,
@@ -249,11 +292,15 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
 
 fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
     let from = analyze_from(&s.from_clause);
-    let sharded: Vec<(&str, &str)> = from
+    let sharded: Vec<(&str, Option<ScalarType>, &str)> = from
         .tables
         .iter()
         .filter_map(|t| match placement(vschema, t) {
-            Placement::Sharded { key, shard_fn } => Some((key, shard_fn)),
+            Placement::Sharded {
+                key,
+                key_type,
+                shard_fn,
+            } => Some((key, key_type, shard_fn)),
             _ => None,
         })
         .collect();
@@ -275,7 +322,7 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     // qualifier resolution the extractor does not do and cross-shard join
     // semantics that are out of M1 scope — reject rather than risk
     // under-routing.
-    let [(key, shard_fn)] = sharded[..] else {
+    let [(key, key_type, shard_fn)] = sharded[..] else {
         return reject("SELECT joining multiple sharded tables is not supported in M1");
     };
     if from.tables.len() > 1 || !from.all_plain {
@@ -290,10 +337,15 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     }
 
     let values = where_key_values(s.where_clause.as_deref(), key);
-    match route_values(&values, shard_fn, shards) {
-        Resolution::Unkeyed | Resolution::Mixed => Plan::Scatter(shards.all()),
+    match route_values(&values, key_type, shard_fn, shards) {
+        // An uncoercible literal matches no row of the column's type; scattering
+        // lets PostgreSQL return its own type error rather than guess a shard.
+        Resolution::Unkeyed | Resolution::Mixed | Resolution::Uncoercible => {
+            Plan::Scatter(shards.all())
+        }
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
+            key_type,
             param_indices,
             write: false,
         }),
@@ -309,7 +361,11 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     match placement(vschema, &table) {
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
-        Placement::Sharded { key, shard_fn } => {
+        Placement::Sharded {
+            key,
+            key_type,
+            shard_fn,
+        } => {
             // `ON CONFLICT ... DO UPDATE` runs only on the shard the INSERT
             // routes to, but the conflicting row (found by an arbitrary arbiter)
             // may live on another shard, and the SET may even move the shard key.
@@ -327,15 +383,19 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
                     "INSERT into sharded table {table} must list column {key} with a literal or bind-parameter value"
                 ));
             };
-            match route_values(&values, shard_fn, shards) {
+            match route_values(&values, key_type, shard_fn, shards) {
                 Resolution::Unkeyed => reject(&format!(
                     "INSERT into sharded table {table} does not set shard key {key}"
                 )),
                 Resolution::Mixed => reject(&format!(
                     "INSERT into sharded table {table} mixes literal and parameter shard keys across rows"
                 )),
+                Resolution::Uncoercible => reject(&format!(
+                    "INSERT into sharded table {table} has a shard key {key} value that is not valid for the column type"
+                )),
                 Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
                     shard_function: shard_fn.to_owned(),
+                    key_type,
                     param_indices,
                     write: true,
                 }),
@@ -353,7 +413,11 @@ fn plan_update(s: &UpdateStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     match placement(vschema, &table) {
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
-        Placement::Sharded { key, shard_fn } => {
+        Placement::Sharded {
+            key,
+            key_type,
+            shard_fn,
+        } => {
             if extract::sets_column(&s.target_list, key) {
                 return reject(&format!("shard key {key} of {table} is immutable"));
             }
@@ -372,6 +436,7 @@ fn plan_update(s: &UpdateStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             }
             plan_keyed_write(
                 where_key_values(s.where_clause.as_deref(), key),
+                key_type,
                 shard_fn,
                 shards,
                 &table,
@@ -390,7 +455,11 @@ fn plan_delete(s: &DeleteStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
     match placement(vschema, &table) {
         Placement::Global => Plan::Unsharded,
         Placement::Unknown => reject(&format!("table {table} is not in the sharding schema")),
-        Placement::Sharded { key, shard_fn } => {
+        Placement::Sharded {
+            key,
+            key_type,
+            shard_fn,
+        } => {
             // `DELETE ... USING other` and a WHERE subquery both bring in rows
             // that may live on other shards; neither is routable on one shard.
             if !s.using_clause.is_empty() {
@@ -405,6 +474,7 @@ fn plan_delete(s: &DeleteStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             }
             plan_keyed_write(
                 where_key_values(s.where_clause.as_deref(), key),
+                key_type,
                 shard_fn,
                 shards,
                 &table,
@@ -417,21 +487,26 @@ fn plan_delete(s: &DeleteStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
 
 fn plan_keyed_write(
     values: Vec<KeyVal>,
+    key_type: Option<ScalarType>,
     shard_fn: &str,
     shards: &ShardCatalog,
     table: &TableName,
     key: &str,
     verb: &str,
 ) -> Plan {
-    match route_values(&values, shard_fn, shards) {
+    match route_values(&values, key_type, shard_fn, shards) {
         Resolution::Unkeyed => reject(&format!(
             "{verb} of sharded table {table} must constrain shard key {key}"
         )),
         Resolution::Mixed => reject(&format!(
             "{verb} of sharded table {table} mixes literal and parameter shard keys"
         )),
+        Resolution::Uncoercible => reject(&format!(
+            "{verb} of sharded table {table} has a shard key {key} value that is not valid for the column type"
+        )),
         Resolution::Params(param_indices) => Plan::Parameterized(Parameterized {
             shard_function: shard_fn.to_owned(),
+            key_type,
             param_indices,
             write: true,
         }),
@@ -466,8 +541,13 @@ mod tests {
     }
 
     fn vschema() -> VSchema {
+        vschema_with_key_type(Some(ScalarType::Int))
+    }
+
+    fn vschema_with_key_type(key_type: Option<ScalarType>) -> VSchema {
         let sharded = || TableDef::Sharded {
             shard_key_column: "customer_id".into(),
+            shard_key_type: key_type,
             shard_function: "xxhash64_v1".into(),
             sequences: vec![SequenceBinding {
                 column: "id".into(),
@@ -490,6 +570,22 @@ mod tests {
             .into_iter()
             .next()
             .expect("one statement")
+    }
+
+    fn plan1_with(sql: &str, key_type: Option<ScalarType>) -> Plan {
+        let parsed = pgshard_sql::parse(sql).unwrap();
+        plan_all(&parsed, &vschema_with_key_type(key_type), &catalog())
+            .into_iter()
+            .next()
+            .expect("one statement")
+    }
+
+    /// The shard a text shard key routes to, computed the planner's way.
+    fn text_shard(val: &str) -> ShardId {
+        let f = shard_function("xxhash64_v1").unwrap();
+        catalog()
+            .route(f.keyspace_id(&ScalarValue::Text(val.into())))
+            .clone()
     }
 
     /// The shard an integer shard key routes to, computed the same way the
@@ -567,6 +663,7 @@ mod tests {
             plan1("SELECT * FROM orders WHERE customer_id = $1"),
             Plan::Parameterized(Parameterized {
                 shard_function: "xxhash64_v1".into(),
+                key_type: Some(ScalarType::Int),
                 param_indices: vec![1],
                 write: false,
             })
@@ -576,6 +673,7 @@ mod tests {
     fn param(indices: Vec<u32>, write: bool) -> Parameterized {
         Parameterized {
             shard_function: "xxhash64_v1".into(),
+            key_type: None,
             param_indices: indices,
             write,
         }
@@ -642,6 +740,7 @@ mod tests {
         // A hand-built plan (public fields) with a bad function must not panic.
         let bad = Parameterized {
             shard_function: "md5".into(),
+            key_type: None,
             param_indices: vec![1],
             write: false,
         };
@@ -649,6 +748,35 @@ mod tests {
             resolve_bound(&bad, &[ScalarValue::Int64(1)], &catalog()),
             Plan::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_bound_coerces_bound_values_to_the_key_type() {
+        let cat = catalog();
+        let typed = |write| Parameterized {
+            shard_function: "xxhash64_v1".into(),
+            key_type: Some(ScalarType::Int),
+            param_indices: vec![1],
+            write,
+        };
+        // A text-format bound value coerces to the integer, landing on the same
+        // shard as the bare integer and the integer literal — no asymmetry
+        // between the literal and bind paths.
+        assert_eq!(
+            resolve_bound(&typed(false), &[ScalarValue::Text("2".into())], &cat),
+            Plan::SingleShard(shard_of(2))
+        );
+        assert_eq!(
+            resolve_bound(&typed(false), &[ScalarValue::Int64(2)], &cat),
+            Plan::SingleShard(shard_of(2))
+        );
+        // A bound value that is not valid for the type is rejected, not routed
+        // to a guessed shard.
+        assert!(is_reject(&resolve_bound(
+            &typed(true),
+            &[ScalarValue::Text("abc".into())],
+            &cat
+        )));
     }
 
     #[test]
@@ -700,6 +828,7 @@ mod tests {
             plan1("INSERT INTO orders (customer_id) VALUES ($1)"),
             Plan::Parameterized(Parameterized {
                 shard_function: "xxhash64_v1".into(),
+                key_type: Some(ScalarType::Int),
                 param_indices: vec![1],
                 write: true,
             })
@@ -863,5 +992,77 @@ mod tests {
         ] {
             assert_eq!(plan1(sql), Plan::RouterLocal, "{sql}");
         }
+    }
+
+    #[test]
+    fn quoted_integer_key_routes_like_a_bare_integer() {
+        // The fix: a string literal against an integer key coerces to the
+        // integer, so `'1'` and `1` hit the same shard — read, insert, delete.
+        assert_eq!(
+            plan1("SELECT * FROM orders WHERE customer_id = '1'"),
+            Plan::SingleShard(shard_of(1))
+        );
+        assert_eq!(
+            plan1("INSERT INTO orders (customer_id) VALUES ('7')"),
+            Plan::SingleShard(shard_of(7))
+        );
+        assert_eq!(
+            plan1("DELETE FROM orders WHERE customer_id = '7'"),
+            Plan::SingleShard(shard_of(7))
+        );
+    }
+
+    #[test]
+    fn non_integer_literal_against_an_integer_key_scatters_reads() {
+        // 'abc' is no integer; scatter so PostgreSQL returns its own type error
+        // rather than the planner hashing a shard the row could never be on.
+        assert_eq!(
+            plan1("SELECT * FROM orders WHERE customer_id = 'abc'"),
+            Plan::Scatter(catalog().all())
+        );
+    }
+
+    #[test]
+    fn non_integer_literal_against_an_integer_key_rejects_writes() {
+        assert!(is_reject(&plan1(
+            "INSERT INTO orders (customer_id) VALUES ('abc')"
+        )));
+        assert!(is_reject(&plan1(
+            "DELETE FROM orders WHERE customer_id = 'abc'"
+        )));
+    }
+
+    #[test]
+    fn a_text_key_routes_by_text_and_rejects_bare_integers() {
+        let t = Some(ScalarType::Text);
+        // A string literal routes by its text bytes.
+        assert_eq!(
+            plan1_with("SELECT * FROM orders WHERE customer_id = '42'", t),
+            Plan::SingleShard(text_shard("42"))
+        );
+        // A bare integer has no `text = int` operator in PostgreSQL: a read
+        // scatters and a write is rejected, never guessed.
+        assert_eq!(
+            plan1_with("SELECT * FROM orders WHERE customer_id = 42", t),
+            Plan::Scatter(catalog().all())
+        );
+        assert!(is_reject(&plan1_with(
+            "INSERT INTO orders (customer_id) VALUES (42)",
+            t
+        )));
+    }
+
+    #[test]
+    fn an_untyped_key_hashes_the_literal_as_written() {
+        // With no declared type (a topology from before the field existed), the
+        // literal is hashed in the form written: '1' as text, 1 as an integer.
+        assert_eq!(
+            plan1_with("SELECT * FROM orders WHERE customer_id = '1'", None),
+            Plan::SingleShard(text_shard("1"))
+        );
+        assert_eq!(
+            plan1_with("SELECT * FROM orders WHERE customer_id = 1", None),
+            Plan::SingleShard(shard_of(1))
+        );
     }
 }

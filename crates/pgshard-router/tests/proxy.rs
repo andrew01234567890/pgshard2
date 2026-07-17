@@ -7,7 +7,9 @@ use std::sync::Arc;
 use pgshard_router::Router;
 use pgshard_router::wire::{Backend, Handlers, Proxy};
 use pgshard_testutil::Pg;
-use pgshard_topo::{Instance, ShardEntry, ShardState, TableEntry, TableType, Topology};
+use pgshard_topo::{
+    Instance, ShardEntry, ShardKeyType, ShardState, TableEntry, TableType, Topology,
+};
 use tokio::net::TcpListener;
 
 /// A topology with one serving shard (database `postgres`) over the whole
@@ -35,6 +37,7 @@ fn single_shard_topology(host: &str, port: u16) -> Topology {
             name: "orders".into(),
             table_type: TableType::Sharded,
             shard_key_column: Some("customer_id".into()),
+            shard_key_type: Some(ShardKeyType::Int),
             sequences: Vec::new(),
         }],
         gates: Vec::new(),
@@ -169,6 +172,7 @@ fn two_shard_topology(host: &str, port: u16) -> Topology {
             name: "orders".into(),
             table_type: TableType::Sharded,
             shard_key_column: Some("customer_id".into()),
+            shard_key_type: Some(ShardKeyType::Int),
             sequences: Vec::new(),
         }],
         gates: Vec::new(),
@@ -267,4 +271,66 @@ async fn scatter_reads_concatenate_rows_from_every_shard() {
     // connection): a subsequent query still works.
     let alive = client.simple_query("SELECT 1 AS ok").await;
     assert!(alive.is_ok(), "the connection survived the scatter error");
+}
+
+#[tokio::test]
+async fn quoted_and_bare_integer_keys_route_to_the_same_shard() {
+    let pg = Pg::start().await.expect("start postgres");
+
+    // Two shard databases on the one node, each with an empty orders table.
+    let admin = pg.connect().await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh0").await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh1").await.unwrap();
+    for db in ["sh0", "sh1"] {
+        let conn = format!(
+            "host={} port={} user=postgres password=postgres dbname={db}",
+            pg.host(),
+            pg.port()
+        );
+        let (c, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        c.batch_execute("CREATE TABLE orders (customer_id int, note text)")
+            .await
+            .unwrap();
+    }
+
+    let router =
+        pgshard_router::shared(Router::build(&two_shard_topology(pg.host(), pg.port())).unwrap());
+    let proxy = Arc::new(Proxy::new(
+        router,
+        Backend {
+            user: "postgres".into(),
+            password: "postgres".into(),
+            system_database: "postgres".into(),
+        },
+    ));
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // customer_id = 2 hashes to a different shard as an integer (sh1) than as
+    // text (sh0). Without type-aware coercion the bare-integer write and the
+    // quoted read would land on different shards and the read would miss the
+    // row; coercion makes both route as the integer key.
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (2, 'keyed')")
+        .await
+        .unwrap();
+    let rows = client
+        .simple_query("SELECT note FROM orders WHERE customer_id = '2'")
+        .await
+        .unwrap();
+    let note = rows.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => Some(r.get("note").unwrap().to_owned()),
+        _ => None,
+    });
+    assert_eq!(
+        note.as_deref(),
+        Some("keyed"),
+        "the quoted-int read must route to the same shard as the bare-int write"
+    );
 }

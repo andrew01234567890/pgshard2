@@ -64,6 +64,18 @@ pub struct Sequence {
     pub sequence: String,
 }
 
+/// The declared type of a shard-key column (CRD `shardKeyType`). It lets the
+/// router coerce a literal to the column's type before hashing so that different
+/// spellings of one value (e.g. `1` and `'1'`) route to the same shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShardKeyType {
+    Int,
+    Text,
+    Uuid,
+    Bytea,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableEntry {
@@ -75,6 +87,8 @@ pub struct TableEntry {
     pub table_type: TableType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key_type: Option<ShardKeyType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sequences: Vec<Sequence>,
 }
@@ -248,5 +262,36 @@ mod keyrange_vec_serde {
             .into_iter()
             .map(|b| b.into_range())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_key_type_round_trips_as_a_lowercase_string() {
+        let entry = TableEntry {
+            schema: "public".into(),
+            name: "orders".into(),
+            table_type: TableType::Sharded,
+            shard_key_column: Some("customer_id".into()),
+            shard_key_type: Some(ShardKeyType::Int),
+            sequences: Vec::new(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["shardKeyType"], "int");
+        assert_eq!(serde_json::from_value::<TableEntry>(json).unwrap(), entry);
+    }
+
+    #[test]
+    fn a_topology_without_a_shard_key_type_defaults_to_none() {
+        // Backward compatibility: topology JSON emitted before the field existed
+        // must still deserialize, with the type absent.
+        let entry: TableEntry = serde_json::from_str(
+            r#"{"schema":"public","name":"orders","type":"sharded","shardKeyColumn":"customer_id"}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.shard_key_type, None);
     }
 }

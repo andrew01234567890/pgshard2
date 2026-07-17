@@ -3,6 +3,7 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::ScalarType;
 use crate::shardfn;
 
 /// Fully qualified table name.
@@ -37,6 +38,11 @@ pub struct SequenceBinding {
 pub enum TableDef {
     Sharded {
         shard_key_column: String,
+        /// The shard-key column's type, when the topology declares it. Drives
+        /// literal coercion in the planner so different spellings of one value
+        /// route identically. `None` (an untyped topology) falls back to hashing
+        /// the literal in the form it was written.
+        shard_key_type: Option<ScalarType>,
         shard_function: String,
         sequences: Vec<SequenceBinding>,
     },
@@ -77,6 +83,7 @@ impl VSchema {
             shard_key_column,
             shard_function,
             sequences,
+            ..
         } = &def
         {
             if shard_key_column.is_empty() {
@@ -118,6 +125,7 @@ mod tests {
     fn sharded(function: &str) -> TableDef {
         TableDef::Sharded {
             shard_key_column: "customer_id".into(),
+            shard_key_type: Some(ScalarType::Int),
             shard_function: function.into(),
             sequences: vec![SequenceBinding {
                 column: "id".into(),
