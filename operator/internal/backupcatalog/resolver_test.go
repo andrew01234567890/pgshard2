@@ -86,10 +86,10 @@ func TestBarrierBeforeReshardRestoresOldTopology(t *testing.T) {
 	}
 	a := plan.Shards[0]
 	if a.Set != "20260716-1F" || a.TargetType != "name" ||
-		a.TargetValue != point1 || a.TargetTimeline != 1 {
+		a.TargetValue != point1 || a.TargetTimeline != "1" {
 		t.Fatalf("shard A plan wrong: %+v", a)
 	}
-	if plan.Shards[1].TargetTimeline != 2 {
+	if plan.Shards[1].TargetTimeline != "2" {
 		t.Fatalf("shard B must carry its recorded timeline: %+v", plan.Shards[1])
 	}
 }
@@ -177,5 +177,47 @@ func TestErrorsAreExplicit(t *testing.T) {
 	early := t0.Add(-time.Hour)
 	if _, err := Resolve(catalog, Target{Time: &early}); err == nil {
 		t.Fatal("target before first snapshot must fail")
+	}
+}
+
+func TestTimeTargetFollowsLatestTimeline(t *testing.T) {
+	// A time target can fall after an unrecorded failover, so it must follow
+	// the survivor lineage rather than pinning the base backup's timeline.
+	target := t2.Add(time.Minute)
+	plan, err := Resolve(driftCatalog(), Target{Time: &target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, shard := range plan.Shards {
+		if shard.TargetTimeline != "latest" {
+			t.Fatalf("time target must follow latest timeline: %+v", shard)
+		}
+	}
+}
+
+func TestSwappedStanzaIsRejected(t *testing.T) {
+	catalog := driftCatalog()
+	// b1 names the right shards (A, B) but points each at the OTHER's stanza:
+	// names/counts still cover gen1, so only a topology-authoritative stanza
+	// check catches the silent cross-shard swap.
+	catalog.Barriers[0].Shards[0].Stanza = stanzaB
+	catalog.Barriers[0].Shards[1].Stanza = stanzaA
+	if _, err := Resolve(catalog, Target{BarrierID: "b1"}); err == nil {
+		t.Fatal("barrier with swapped stanzas must be rejected")
+	}
+}
+
+func TestEmptyBackupSetIsRejected(t *testing.T) {
+	catalog := driftCatalog()
+	catalog.Backups[0].Shards[0].Label = ""
+	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+		t.Fatal("backup shard with an empty set label must be rejected")
+	}
+}
+
+func TestExactlyOneSelectorRequired(t *testing.T) {
+	catalog := driftCatalog()
+	if _, err := Resolve(catalog, Target{BarrierID: "b1", Latest: true}); err == nil {
+		t.Fatal("target with two selectors must be rejected")
 	}
 }

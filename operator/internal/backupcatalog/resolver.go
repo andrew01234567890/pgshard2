@@ -2,7 +2,7 @@ package backupcatalog
 
 import (
 	"fmt"
-	"slices"
+	"strconv"
 	"time"
 )
 
@@ -25,9 +25,13 @@ type ShardPlan struct {
 	TargetType string
 	// --target value (restore point name or RFC3339 time); empty for none.
 	TargetValue string
-	// --target-timeline recorded at backup/barrier time; disambiguates
-	// divergent timelines from earlier restores or failovers.
-	TargetTimeline int32
+	// pgBackRest --target-timeline. For name/none targets this is the exact
+	// timeline recorded in the manifest. For a time target it is "latest":
+	// the requested time can fall after a failover that branched a new
+	// timeline, so following the survivor lineage is the only safe choice —
+	// pinning the base backup's timeline would recover the abandoned
+	// pre-failover branch and silently under-restore.
+	TargetTimeline string
 }
 
 // RestorePlan materializes the topology at the target point.
@@ -51,6 +55,22 @@ func errf(format string, args ...any) error {
 
 // Resolve maps a target to a full restore plan against the catalog.
 func Resolve(catalog Catalog, target Target) (RestorePlan, error) {
+	selectors := 0
+	if target.BarrierID != "" {
+		selectors++
+	}
+	if target.Time != nil {
+		selectors++
+	}
+	if target.BackupID != "" {
+		selectors++
+	}
+	if target.Latest {
+		selectors++
+	}
+	if selectors != 1 {
+		return RestorePlan{}, errf("restore target must set exactly one selector, got %d", selectors)
+	}
 	switch {
 	case target.BarrierID != "":
 		return resolveBarrier(catalog, target.BarrierID)
@@ -58,10 +78,8 @@ func Resolve(catalog Catalog, target Target) (RestorePlan, error) {
 		return resolveTime(catalog, *target.Time)
 	case target.BackupID != "":
 		return resolveBackup(catalog, target.BackupID)
-	case target.Latest:
+	default: // target.Latest
 		return resolveLatest(catalog)
-	default:
-		return RestorePlan{}, errf("empty restore target")
 	}
 }
 
@@ -91,7 +109,7 @@ func resolveBarrier(catalog Catalog, id string) (RestorePlan, error) {
 			Set:            backup.Label,
 			TargetType:     "name",
 			TargetValue:    shard.RestorePoint,
-			TargetTimeline: shard.Timeline,
+			TargetTimeline: timelineArg(shard.Timeline),
 		})
 	}
 	return plan, sanity(plan)
@@ -116,34 +134,18 @@ func resolveTime(catalog Catalog, t time.Time) (RestorePlan, error) {
 			Set:            backup.Label,
 			TargetType:     "time",
 			TargetValue:    t.Format(time.RFC3339Nano),
-			TargetTimeline: backup.Timeline,
+			TargetTimeline: "latest",
 		})
 	}
 	return plan, sanity(plan)
 }
 
 func resolveBackup(catalog Catalog, id string) (RestorePlan, error) {
-	for _, backup := range catalog.Backups {
-		if backup.ID != id {
-			continue
-		}
-		topology, err := topologyByGeneration(catalog, backup.TopologyGeneration)
-		if err != nil {
-			return RestorePlan{}, err
-		}
-		plan := RestorePlan{Topology: topology}
-		for _, shard := range backup.Shards {
-			plan.Shards = append(plan.Shards, ShardPlan{
-				Shard:          shard.Name,
-				Stanza:         shard.Stanza,
-				Set:            shard.Label,
-				TargetType:     "none",
-				TargetTimeline: shard.Timeline,
-			})
-		}
-		return plan, sanity(plan)
+	backup, err := findBackup(catalog, id)
+	if err != nil {
+		return RestorePlan{}, err
 	}
-	return RestorePlan{}, errf("backup %s not found", id)
+	return planFromBackup(catalog, backup)
 }
 
 func resolveLatest(catalog Catalog) (RestorePlan, error) {
@@ -152,11 +154,30 @@ func resolveLatest(catalog Catalog) (RestorePlan, error) {
 	}
 	newest := catalog.Backups[0]
 	for _, backup := range catalog.Backups[1:] {
-		if backup.CompletedAt.After(newest.CompletedAt) {
+		if backup.CompletedAt.After(newest.CompletedAt) ||
+			(backup.CompletedAt.Equal(newest.CompletedAt) && backup.ID > newest.ID) {
 			newest = backup
 		}
 	}
-	return resolveBackup(catalog, newest.ID)
+	return planFromBackup(catalog, newest)
+}
+
+func planFromBackup(catalog Catalog, backup BackupManifest) (RestorePlan, error) {
+	topology, err := topologyByGeneration(catalog, backup.TopologyGeneration)
+	if err != nil {
+		return RestorePlan{}, err
+	}
+	plan := RestorePlan{Topology: topology}
+	for _, shard := range backup.Shards {
+		plan.Shards = append(plan.Shards, ShardPlan{
+			Shard:          shard.Name,
+			Stanza:         shard.Stanza,
+			Set:            shard.Label,
+			TargetType:     "none",
+			TargetTimeline: timelineArg(shard.Timeline),
+		})
+	}
+	return plan, sanity(plan)
 }
 
 func findBarrier(catalog Catalog, id string) (BarrierManifest, error) {
@@ -168,6 +189,15 @@ func findBarrier(catalog Catalog, id string) (BarrierManifest, error) {
 	return BarrierManifest{}, errf("barrier %s not found", id)
 }
 
+func findBackup(catalog Catalog, id string) (BackupManifest, error) {
+	for _, backup := range catalog.Backups {
+		if backup.ID == id {
+			return backup, nil
+		}
+	}
+	return BackupManifest{}, errf("backup %s not found", id)
+}
+
 func topologyByGeneration(catalog Catalog, generation int64) (TopologySnapshot, error) {
 	for _, snapshot := range catalog.Topologies {
 		if snapshot.Generation == generation {
@@ -177,18 +207,21 @@ func topologyByGeneration(catalog Catalog, generation int64) (TopologySnapshot, 
 	return TopologySnapshot{}, errf("topology generation %d not in catalog", generation)
 }
 
-// topologyAt: the snapshot whose validity interval contains t. Snapshots
-// are valid from their commit until the next snapshot's commit, so a target
-// inside a cutover window resolves to the PRE-cutover generation.
+// topologyAt: the snapshot whose validity interval contains t. Snapshots are
+// valid from their commit until the next snapshot's commit, so a target inside
+// a cutover window resolves to the PRE-cutover generation. On the (malformed)
+// tie of two snapshots sharing a ValidFrom, the higher generation — the later
+// structural change — wins, keeping the result independent of catalog order.
 func topologyAt(catalog Catalog, t time.Time) (TopologySnapshot, error) {
-	snapshots := append([]TopologySnapshot(nil), catalog.Topologies...)
-	slices.SortFunc(snapshots, func(a, b TopologySnapshot) int {
-		return a.ValidFrom.Compare(b.ValidFrom)
-	})
 	var current *TopologySnapshot
-	for i := range snapshots {
-		if !snapshots[i].ValidFrom.After(t) {
-			current = &snapshots[i]
+	for i := range catalog.Topologies {
+		s := &catalog.Topologies[i]
+		if s.ValidFrom.After(t) {
+			continue
+		}
+		if current == nil || s.ValidFrom.After(current.ValidFrom) ||
+			(s.ValidFrom.Equal(current.ValidFrom) && s.Generation > current.Generation) {
+			current = s
 		}
 	}
 	if current == nil {
@@ -200,38 +233,72 @@ func topologyAt(catalog Catalog, t time.Time) (TopologySnapshot, error) {
 
 func newestBackupBefore(catalog Catalog, stanza string, t time.Time) (BackupShard, bool) {
 	var best BackupShard
-	var bestTime time.Time
 	found := false
 	for _, backup := range catalog.Backups {
 		for _, shard := range backup.Shards {
 			if shard.Stanza != stanza || shard.StopTime.After(t) {
 				continue
 			}
-			if !found || shard.StopTime.After(bestTime) {
-				best, bestTime, found = shard, shard.StopTime, true
+			if !found || shard.StopTime.After(best.StopTime) {
+				best, found = shard, true
 			}
 		}
 	}
 	return best, found
 }
 
-// sanity: every topology shard must have exactly one plan entry.
+func timelineArg(tl int32) string {
+	return strconv.FormatInt(int64(tl), 10)
+}
+
+// sanity validates the plan against its topology generation as the source of
+// truth: exactly one plan entry per topology shard, each restoring from the
+// stanza the topology records for that shard (not a stanza the manifest chose),
+// and no empty restore instructions. This is the chokepoint that turns a
+// manifest/topology disagreement into an error instead of a silent wrong or
+// cross-shard restore.
 func sanity(plan RestorePlan) error {
 	if len(plan.Shards) != len(plan.Topology.Shards) {
 		return errf("plan covers %d shards but topology generation %d has %d",
 			len(plan.Shards), plan.Topology.Generation, len(plan.Topology.Shards))
 	}
+	topoStanza := make(map[string]string, len(plan.Topology.Shards))
+	for _, s := range plan.Topology.Shards {
+		if _, dup := topoStanza[s.Name]; dup {
+			return errf("topology generation %d lists shard %s twice",
+				plan.Topology.Generation, s.Name)
+		}
+		topoStanza[s.Name] = s.Stanza
+	}
 	planned := map[string]bool{}
 	for _, p := range plan.Shards {
+		stanza, inTopo := topoStanza[p.Shard]
+		if !inTopo {
+			return errf("shard %s planned but not in topology generation %d",
+				p.Shard, plan.Topology.Generation)
+		}
 		if planned[p.Shard] {
 			return errf("shard %s planned twice", p.Shard)
 		}
 		planned[p.Shard] = true
+		if p.Stanza != stanza {
+			return errf("shard %s planned from stanza %q but topology generation %d records %q",
+				p.Shard, p.Stanza, plan.Topology.Generation, stanza)
+		}
+		if p.Stanza == "" {
+			return errf("shard %s has no stanza", p.Shard)
+		}
+		if p.Set == "" {
+			return errf("shard %s has no backup set", p.Shard)
+		}
+		if p.TargetType == "name" && p.TargetValue == "" {
+			return errf("shard %s: name target with empty restore point", p.Shard)
+		}
 	}
-	for _, s := range plan.Topology.Shards {
-		if !planned[s.Name] {
+	for name := range topoStanza {
+		if !planned[name] {
 			return errf("shard %s in topology generation %d has no restore plan",
-				s.Name, plan.Topology.Generation)
+				name, plan.Topology.Generation)
 		}
 	}
 	return nil
