@@ -1765,6 +1765,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-router"
+version = "0.0.0"
+dependencies = [
+ "pgshard-core",
+ "pgshard-plan",
+ "pgshard-sql",
+ "pgshard-topo",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pgshard-seq"
 version = "0.0.0"
 dependencies = [
