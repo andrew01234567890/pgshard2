@@ -18,6 +18,8 @@
 //! through the router). A shard with no current primary (mid-failover) resolves
 //! to [`Route::Unavailable`] rather than a wrong endpoint.
 
+pub mod wire;
+
 use std::collections::BTreeMap;
 
 use pgshard_core::{KeyRange, SequenceBinding, TableDef, TableName, VSchema, VSchemaError};
@@ -126,6 +128,18 @@ impl Router {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Any serving shard with a primary, as a connection [`Target`]. Used to run
+    /// tableless/session statements (`SELECT 1`, `SHOW`) that route nowhere in
+    /// particular — they run correctly on any shard database.
+    pub fn any_shard_target(&self) -> Option<Target> {
+        self.primaries.iter().find_map(|(id, primary)| {
+            primary.as_ref().map(|ep| Target {
+                endpoint: ep.clone(),
+                database: id.0.clone(),
+            })
+        })
     }
 
     /// Route a (possibly multi-statement) query, one [`Route`] per statement.
