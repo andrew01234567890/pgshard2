@@ -29,7 +29,7 @@ use pgshard_core::{
     KeyRange, ScalarType, SequenceBinding, TableDef, TableName, VSchema, VSchemaError,
 };
 use pgshard_plan::{Parameterized, Plan, ShardCatalog, ShardId};
-use pgshard_sql::SqlError;
+use pgshard_sql::{Parsed, SqlError};
 use pgshard_topo::{ShardKeyType, ShardState, TableType, Topology};
 use tokio::sync::watch;
 
@@ -150,9 +150,27 @@ impl Router {
 
     /// Route a (possibly multi-statement) query, one [`Route`] per statement.
     pub fn route(&self, sql: &str) -> Result<Vec<Route>, SqlError> {
-        let parsed = pgshard_sql::parse(sql)?;
-        let plans = pgshard_plan::plan_all(&parsed, &self.vschema, &self.catalog);
-        Ok(plans.into_iter().map(|p| self.resolve(p)).collect())
+        Ok(self.route_parsed(&pgshard_sql::parse(sql)?))
+    }
+
+    /// Route an already-parsed query. The caller keeps the [`Parsed`] to also
+    /// drive sequence-id injection, so the statement is parsed only once.
+    pub fn route_parsed(&self, parsed: &Parsed) -> Vec<Route> {
+        pgshard_plan::plan_all(parsed, &self.vschema, &self.catalog)
+            .into_iter()
+            .map(|p| self.resolve(p))
+            .collect()
+    }
+
+    /// The sharding schema, used to detect INSERTs that omit a sequence column.
+    pub fn vschema(&self) -> &VSchema {
+        &self.vschema
+    }
+
+    /// The system (unsharded) database endpoint, if the topology publishes one.
+    /// Sequence blocks are reserved there.
+    pub fn system_endpoint(&self) -> Option<&Endpoint> {
+        self.system.as_ref()
     }
 
     fn resolve(&self, plan: Plan) -> Route {

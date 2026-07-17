@@ -190,6 +190,19 @@ pub fn insert_key_values(ins: &InsertStmt, key_col: &str) -> Option<Vec<KeyVal>>
     Some(out)
 }
 
+/// True when any `VALUES` cell of an `INSERT` contains a sub-select. Such a
+/// subquery runs only on the shard the INSERT routes to, yet may reference rows
+/// on other shards — so a keyed INSERT carrying one must be rejected, not routed.
+pub fn insert_values_have_sublink(ins: &InsertStmt) -> bool {
+    let Some(NodeEnum::SelectStmt(sel)) = ins.select_stmt.as_deref().and_then(as_enum) else {
+        return false;
+    };
+    sel.values_lists.iter().any(|row| {
+        matches!(as_enum(row), Some(NodeEnum::List(list))
+            if list.items.iter().any(|item| contains_sublink(Some(item))))
+    })
+}
+
 /// True when a `SET` target list (UPDATE) assigns to `key_col`.
 pub fn sets_column(target_list: &[Node], key_col: &str) -> bool {
     target_list
@@ -266,6 +279,15 @@ fn node_has_sublink(node: &NodeEnum) -> bool {
         NodeEnum::NullTest(n) => n.arg.as_deref().is_some_and(child_has_sublink),
         NodeEnum::BooleanTest(b) => b.arg.as_deref().is_some_and(child_has_sublink),
         NodeEnum::TypeCast(t) => t.arg.as_deref().is_some_and(child_has_sublink),
+        NodeEnum::CaseExpr(c) => {
+            c.arg.as_deref().is_some_and(child_has_sublink)
+                || c.args.iter().any(child_has_sublink)
+                || c.defresult.as_deref().is_some_and(child_has_sublink)
+        }
+        NodeEnum::CaseWhen(w) => {
+            w.expr.as_deref().is_some_and(child_has_sublink)
+                || w.result.as_deref().is_some_and(child_has_sublink)
+        }
         _ => false,
     }
 }
