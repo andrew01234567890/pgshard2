@@ -21,11 +21,14 @@
 pub mod wire;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use pgshard_core::{KeyRange, SequenceBinding, TableDef, TableName, VSchema, VSchemaError};
 use pgshard_plan::{Parameterized, Plan, ShardCatalog, ShardId};
 use pgshard_sql::SqlError;
 use pgshard_topo::{ShardState, TableType, Topology};
+use tokio::sync::watch;
 
 pub use pgshard_topo::Instance as Endpoint;
 
@@ -193,6 +196,35 @@ impl Router {
             }
         }
         wrap(targets)
+    }
+}
+
+/// A hot-swappable router the wire layer reads once per query.
+pub type SharedRouter = Arc<ArcSwap<Router>>;
+
+/// Wrap a router so it can be swapped as topology epochs advance.
+pub fn shared(router: Router) -> SharedRouter {
+    Arc::new(ArcSwap::from_pointee(router))
+}
+
+/// Rebuild and swap `target` whenever a new topology arrives on `updates` (the
+/// [`pgshard_topo`] watcher only publishes strictly-increasing epochs). A
+/// topology that fails to build — e.g. a transient reshard state whose serving
+/// shards do not yet partition the keyspace — is logged and skipped, keeping the
+/// last good router. Returns when the watcher is dropped.
+pub async fn watch_topology(target: SharedRouter, mut updates: watch::Receiver<Arc<Topology>>) {
+    while updates.changed().await.is_ok() {
+        let topology = updates.borrow_and_update().clone();
+        match Router::build(&topology) {
+            Ok(router) => {
+                let epoch = router.epoch();
+                target.store(Arc::new(router));
+                tracing::info!(epoch, "applied topology update");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "topology update failed to build; keeping current router");
+            }
+        }
     }
 }
 
@@ -470,5 +502,64 @@ mod tests {
                 .unwrap(),
             Route::Shard(target("s0", "s0p"))
         );
+    }
+
+    async fn wait_for_epoch(router: &SharedRouter, epoch: u64) {
+        for _ in 0..200 {
+            if router.load().epoch() == epoch {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!(
+            "router never reached epoch {epoch}; still {}",
+            router.load().epoch()
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_topology_applies_higher_epochs_and_keeps_the_last_good_router() {
+        let pair = || {
+            vec![
+                shard("s0", "-80", Some("s0p")),
+                shard("s1", "80-", Some("s1p")),
+            ]
+        };
+        let base = topology(pair(), vec![orders()]); // epoch 7
+        let router = shared(Router::build(&base).unwrap());
+        assert_eq!(router.load().epoch(), 7);
+
+        let (tx, rx) = watch::channel(Arc::new(base));
+        let handle = tokio::spawn(watch_topology(router.clone(), rx));
+
+        // A higher-epoch valid topology is applied.
+        let mut newer = topology(pair(), vec![orders()]);
+        newer.epoch = 8;
+        tx.send(Arc::new(newer)).unwrap();
+        wait_for_epoch(&router, 8).await;
+
+        // A topology that fails to build (unknown hash function) is skipped; the
+        // last good router stays serving.
+        let mut broken = topology(pair(), vec![orders()]);
+        broken.epoch = 9;
+        broken.hash_function = "md5".into();
+        tx.send(Arc::new(broken)).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            router.load().epoch(),
+            8,
+            "a build error must keep the last good router"
+        );
+
+        // And the watcher survives the error: a later valid epoch still applies.
+        let mut recovered = topology(pair(), vec![orders()]);
+        recovered.epoch = 10;
+        tx.send(Arc::new(recovered)).unwrap();
+        wait_for_epoch(&router, 10).await;
+
+        drop(tx);
+        handle.await.unwrap();
     }
 }

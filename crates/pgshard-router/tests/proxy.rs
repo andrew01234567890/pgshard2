@@ -78,7 +78,9 @@ async fn routes_single_shard_reads_and_writes_through_to_the_backend() {
         .await
         .unwrap();
 
-    let router = Arc::new(Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap());
+    let router = pgshard_router::shared(
+        Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+    );
     let proxy = Arc::new(Proxy::new(
         router,
         Backend {
