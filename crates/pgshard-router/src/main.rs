@@ -2,13 +2,13 @@
 //! to the right shard database using a compiled topology.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use pgshard_router::Router;
 use pgshard_router::wire::{Backend, Handlers, Proxy};
-use pgshard_topo::Topology;
+use pgshard_topo::{FileWatcher, TopologyWatcher};
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
@@ -37,6 +37,10 @@ struct Args {
         default_value = "pgshard_system"
     )]
     system_database: String,
+
+    /// How often to re-read the topology file for a higher epoch, in seconds.
+    #[arg(long, env = "PGSHARD_ROUTER_POLL_SECONDS", default_value = "5")]
+    poll_seconds: u64,
 }
 
 #[tokio::main]
@@ -49,13 +53,20 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let topology_json = std::fs::read_to_string(&args.topology).context("reading topology file")?;
-    let topology: Topology =
-        serde_json::from_str(&topology_json).context("parsing topology JSON")?;
-    let router = Arc::new(Router::build(&topology).context("building router from topology")?);
-    tracing::info!(epoch = router.epoch(), "loaded topology");
+    // Watch the topology file: the initial snapshot must build, and higher
+    // epochs are applied online (see pgshard_router::watch_topology).
+    let watcher = FileWatcher::start(&args.topology, Duration::from_secs(args.poll_seconds))
+        .await
+        .context("starting topology watcher")?;
+    let updates = watcher.subscribe();
+    let initial = updates.borrow().clone();
+    let router = pgshard_router::shared(
+        Router::build(&initial).context("building router from the initial topology")?,
+    );
+    tracing::info!(epoch = router.load().epoch(), "loaded initial topology");
+    tokio::spawn(pgshard_router::watch_topology(router.clone(), updates));
 
-    let proxy = Arc::new(Proxy::new(
+    let proxy = std::sync::Arc::new(Proxy::new(
         router,
         Backend {
             user: args.backend_user,

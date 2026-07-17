@@ -39,7 +39,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-use crate::{Endpoint, Route, Router};
+use crate::{Endpoint, Route, Router, SharedRouter};
 
 /// Credentials the router uses for its own backend connections, plus the name of
 /// the unsharded system database (not yet carried in the topology).
@@ -50,14 +50,16 @@ pub struct Backend {
     pub system_database: String,
 }
 
-/// The wire proxy: one immutable [`Router`] snapshot plus backend credentials.
+/// The wire proxy: a hot-swappable [`Router`] plus backend credentials. Each
+/// query reads the current router snapshot once, so a topology swap mid-session
+/// takes effect on the next query without tearing a query in flight.
 pub struct Proxy {
-    router: Arc<Router>,
+    router: SharedRouter,
     backend: Backend,
 }
 
 impl Proxy {
-    pub fn new(router: Arc<Router>, backend: Backend) -> Self {
+    pub fn new(router: SharedRouter, backend: Backend) -> Self {
         Self { router, backend }
     }
 
@@ -107,8 +109,10 @@ impl SimpleQueryHandler for Proxy {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        let routes = self
-            .router
+        // Read the current routing snapshot once, so the whole query uses one
+        // consistent topology even if a swap lands mid-query.
+        let router = self.router.load_full();
+        let routes = router
             .route(query)
             .map_err(|e| user_error("42601", format!("could not parse query: {e}")))?;
 
@@ -116,7 +120,7 @@ impl SimpleQueryHandler for Proxy {
             // A submitted query with no statements (empty or comment-only) gets an
             // EmptyQueryResponse, as PostgreSQL sends.
             [] => Ok(vec![Response::EmptyQuery]),
-            [route] => self.dispatch(route.clone(), query).await,
+            [route] => self.dispatch(&router, route.clone(), query).await,
             _ => Err(user_error(
                 "0A000",
                 "multi-statement simple queries are not supported yet".to_owned(),
@@ -137,7 +141,12 @@ fn is_transaction_control(query: &str) -> bool {
 }
 
 impl Proxy {
-    async fn dispatch(&self, route: Route, query: &str) -> PgWireResult<Vec<Response>> {
+    async fn dispatch(
+        &self,
+        router: &Router,
+        route: Route,
+        query: &str,
+    ) -> PgWireResult<Vec<Response>> {
         match route {
             Route::Shard(t) => self.run_on(&t.endpoint, &t.database, query).await,
             Route::System(ep) => self.run_on(&ep, &self.backend.system_database, query).await,
@@ -150,7 +159,7 @@ impl Proxy {
                 "0A000",
                 "transactions are not supported by this router version".to_owned(),
             )),
-            Route::Local => match self.router.any_shard_target() {
+            Route::Local => match router.any_shard_target() {
                 Some(t) => self.run_on(&t.endpoint, &t.database, query).await,
                 None => Ok(vec![Response::Execution(Tag::new(&command_tag(query)))]),
             },
