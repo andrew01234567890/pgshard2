@@ -83,12 +83,13 @@ type instanceView struct {
 	observed bool
 }
 
-func evaluateFailover(instances []instanceView) failoverDecision {
+func evaluateFailover(instances []instanceView, committedTarget string) failoverDecision {
 	hasReadyPrimary := false
 	anyClaimsPrimary := false
 	anyRunningUnobserved := false
 	anyReceiverActive := false
-	var maxObservedLSN uint64
+	committedDrivable := false // committed target present, observed, not yet primary
+	var committedLSN, maxObservedLSN uint64
 	candidates := make([]instanceView, 0, len(instances))
 	for _, inst := range instances {
 		if inst.isPrimary {
@@ -112,17 +113,37 @@ func evaluateFailover(instances []instanceView) failoverDecision {
 		if inst.ready && !inst.isPrimary {
 			candidates = append(candidates, inst)
 		}
+		if committedTarget != "" && inst.pod == committedTarget && inst.observed && !inst.isPrimary {
+			committedDrivable = true
+			committedLSN = inst.receivedLSN
+		}
 	}
-	// No failover while a ready primary exists, and no failover when there is
-	// nothing ready to elect — a shard with zero ready replicas is either
-	// still provisioning or fully down, neither of which promoting can resolve.
-	if hasReadyPrimary || len(candidates) == 0 {
+	// No failover while a ready primary exists.
+	if hasReadyPrimary {
 		return failoverDecision{}
 	}
-	// Warranted, but only safe to elect from a no-claimant snapshot in which
-	// every started instance is accounted for and WAL has settled.
+	// Nothing to act on: no ready replica to elect and no committed target still
+	// being driven to promotion (a shard with neither is provisioning or down).
+	if len(candidates) == 0 && !committedDrivable {
+		return failoverDecision{}
+	}
+	// Only safe to promote from a no-claimant snapshot in which every started
+	// instance is accounted for and WAL has settled.
 	if anyClaimsPrimary || anyRunningUnobserved || anyReceiverActive {
 		return failoverDecision{warranted: true, wait: true}
+	}
+	// Sticky/drive: once committed to a target keep driving that same pod while it
+	// is present and observable — even mid-promotion, when it is momentarily not a
+	// ready candidate. This neither abandons it for a newly-preferred pod
+	// (split-brain) nor strands a two-node failover whose only instance is the
+	// not-ready target. It is still held to the WAL guard: a committed target that
+	// has fallen behind an observed peer (e.g. rebuilt from an empty volume) must
+	// not be promoted as a laggard.
+	if committedDrivable {
+		if committedLSN < maxObservedLSN {
+			return failoverDecision{warranted: true, wait: true}
+		}
+		return failoverDecision{warranted: true, targetPrimary: committedTarget}
 	}
 	slices.SortFunc(candidates, func(a, b instanceView) int {
 		// Most advanced first; ties broken by pod name for determinism.
@@ -152,7 +173,10 @@ func (r *PgShardShardReconciler) reconcileFailover(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, views []instanceView,
 ) error {
 	log := logf.FromContext(ctx)
-	decision := evaluateFailover(views)
+	// evaluateFailover applies the sticky/drive rule against the committed target,
+	// so its result already names the pod to keep driving (never a different one
+	// once we have committed, which would double-promote).
+	decision := evaluateFailover(views, shard.Status.TargetPrimary)
 
 	// Not warranted (healthy primary or nothing electable), or warranted but not
 	// yet safe to elect: leave the phase deriveShardStatus computed this cycle —
@@ -161,42 +185,26 @@ func (r *PgShardShardReconciler) reconcileFailover(
 		return nil
 	}
 
-	// Sticky target: once we have committed to a target keep driving that same
-	// pod while it is still present and observable, rather than switching to a
-	// different newly-preferred one. A Promote for the committed target may
-	// already be in flight; switching would leave two agents promoted
-	// (split-brain), and a target that is momentarily not-ready is the normal
-	// mid-promotion window — not a reason to abandon it. We only re-elect once
-	// the committed target is gone (absent) or unpollable (which itself parks the
-	// election above). This is never a data-loss regression: the committed target
-	// was the most advanced at election and no new WAL arrives once the primary
-	// is gone, so any later-preferred candidate is at best tied with it. (A target
-	// that is present but permanently failing to promote parks the failover — the
-	// bounded-lag/fencing cancel path is deferred, as documented above.)
-	target := decision.targetPrimary
-	if cur := shard.Status.TargetPrimary; cur != "" && isObserved(views, cur) {
-		target = cur
-	}
-
 	// Commit the election durably BEFORE instructing any agent. The decision
 	// epoch is the fencing token: persisting the bump first guarantees a crash
 	// or failed status write can never leave the persisted epoch below one an
 	// agent has already applied, which would let the same epoch be reissued to
 	// a different target (two agents both accepting = split-brain). The Promote
 	// is driven on the next reconcile, once the epoch is durable.
-	if shard.Status.TargetPrimary != target {
+	if shard.Status.TargetPrimary != decision.targetPrimary {
 		shard.Status.DecisionEpoch++
-		shard.Status.TargetPrimary = target
+		shard.Status.TargetPrimary = decision.targetPrimary
 		shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
 		log.Info("electing new primary", "shard", shard.Name,
-			"target", target, "epoch", shard.Status.DecisionEpoch)
+			"target", decision.targetPrimary, "epoch", shard.Status.DecisionEpoch)
 		return nil
 	}
 
 	// Target and epoch are durable; drive the promote. It is idempotent under
-	// the agent's epoch guard, so repeating it across polls is safe.
+	// the agent's epoch guard, so repeating it across polls (including while the
+	// target is mid-promotion and not yet ready) is safe.
 	shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
-	host := hostByPod(views, target)
+	host := hostByPod(views, decision.targetPrimary)
 	if host == "" {
 		return nil // target has no reachable address yet; retry next poll
 	}
@@ -205,24 +213,12 @@ func (r *PgShardShardReconciler) reconcileFailover(
 		return err
 	}
 	if _, err := agent.Promote(ctx, &pgshardv1.PromoteRequest{
-		TargetPrimary: target,
+		TargetPrimary: decision.targetPrimary,
 		DecisionEpoch: uint64(shard.Status.DecisionEpoch),
 	}); err != nil {
 		return err
 	}
 	return nil
-}
-
-// isObserved reports whether pod is present in the view set and was polled
-// successfully this cycle. A committed promote target stays pinned while it is
-// observed, even if momentarily not ready (the normal mid-promotion window).
-func isObserved(views []instanceView, pod string) bool {
-	for _, v := range views {
-		if v.pod == pod {
-			return v.observed
-		}
-	}
-	return false
 }
 
 func hostByPod(views []instanceView, pod string) string {

@@ -22,11 +22,12 @@ import (
 
 func TestEvaluateFailover(t *testing.T) {
 	cases := []struct {
-		name          string
-		instances     []instanceView
-		wantWarranted bool
-		wantTarget    string
-		wantWait      bool
+		name            string
+		instances       []instanceView
+		committedTarget string
+		wantWarranted   bool
+		wantTarget      string
+		wantWait        bool
 	}{
 		{
 			name: "healthy primary: no failover",
@@ -34,6 +35,41 @@ func TestEvaluateFailover(t *testing.T) {
 				{pod: "p0", ready: true, isPrimary: true, observed: true},
 				{pod: "p1", ready: true, observed: true},
 			},
+		},
+		{
+			name: "drive a committed target still mid-promotion: not stranded even as the only instance",
+			instances: []instanceView{
+				{pod: "p1", host: "10.0.0.3", observed: true}, // committed, promoting, not-ready
+			},
+			committedTarget: "p1",
+			wantWarranted:   true,
+			wantTarget:      "p1",
+		},
+		{
+			name: "no committed target and only a not-ready instance: nothing to elect",
+			instances: []instanceView{
+				{pod: "p1", host: "10.0.0.3", observed: true}, // not-ready, not committed
+			},
+		},
+		{
+			name: "sticky: keep the committed target over a tied, name-earlier ready replica",
+			instances: []instanceView{
+				{pod: "p1", ready: true, receivedLSN: 500, observed: true}, // sorts first
+				{pod: "p2", ready: true, receivedLSN: 500, observed: true}, // committed
+			},
+			committedTarget: "p2",
+			wantWarranted:   true,
+			wantTarget:      "p2",
+		},
+		{
+			name: "committed target has fallen behind an observed peer: wait, never promote a laggard",
+			instances: []instanceView{
+				{pod: "p1", ready: true, receivedLSN: 100, observed: true},  // committed, rebuilt/behind
+				{pod: "p2", ready: false, receivedLSN: 300, observed: true}, // more advanced, not-ready
+			},
+			committedTarget: "p1",
+			wantWarranted:   true,
+			wantWait:        true,
 		},
 		{
 			name: "old primary relinquished the role: elect most-advanced ready replica",
@@ -131,7 +167,7 @@ func TestEvaluateFailover(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := evaluateFailover(tc.instances)
+			got := evaluateFailover(tc.instances, tc.committedTarget)
 			if got.warranted != tc.wantWarranted {
 				t.Fatalf("warranted = %v, want %v", got.warranted, tc.wantWarranted)
 			}

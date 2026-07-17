@@ -305,6 +305,74 @@ var _ = Describe("PgShardShard failover", func() {
 		got := get()
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
+
+	It("keeps driving a mid-promotion target in a two-node shard rather than stranding it", func() {
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(primaryAgent.Stop)
+		replicaAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(replicaAgent.Stop)
+
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		replicaAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return primaryAgent.Client()
+			}
+			return replicaAgent.Client()
+		}
+		r := &PgShardShardReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		const shardName = "twonode"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: shardName, Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardShard {
+			var got pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardName, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("twonode-0", primaryPodIP)
+		stampPodIP("twonode-1", "127.0.0.3")
+
+		reconcile() // healthy
+		Expect(get().Status.CurrentPrimary).To(Equal("twonode-0"))
+
+		// Primary is gone; twonode-1 is the sole ready candidate and is elected.
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		primaryAgent.SetReady(false)
+		reconcile() // election pass
+		Expect(get().Status.TargetPrimary).To(Equal("twonode-1"))
+		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0))) // not promoted yet
+
+		// The elected target goes not-ready before its promote lands — the only
+		// other instance (the dead primary) is also not-ready, so there is no
+		// fresh candidate. It must still be driven, not stranded.
+		replicaAgent.SetReady(false)
+		reconcile() // drive pass
+		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
+		Expect(replicaAgent.AppliedEpoch()).To(BeNumerically(">=", uint64(1)))
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
 })
 
 func stampPodIP(name, ip string) {
