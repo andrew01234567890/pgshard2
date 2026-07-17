@@ -3,13 +3,25 @@
 //! clients. A closed gate parks matching sessions in FIFO order instead of
 //! erroring; opening replays them against the new topology.
 //!
-//! Safety rule: every gate carries an absolute deadline. If no explicit
-//! open arrives in time, the gate auto-expires and parked sessions replay
-//! against the CURRENT topology — fail-safe means "abort the cutover",
-//! never "wait forever" and never "switch blindly".
+//! Safety rules:
+//!   - Every gate carries an ABSOLUTE deadline. If no explicit open arrives in
+//!     time, the gate auto-expires and parked sessions replay against the
+//!     CURRENT topology — fail-safe means "abort the cutover", never "wait
+//!     forever" and never "switch blindly".
+//!   - A gate opens only once the router has applied a topology at or beyond
+//!     its `min_topology_generation`; opening earlier would replay buffered
+//!     writes against the stale (pre-cutover) shard map. `open` before the
+//!     generation lands just arms the gate; `topology_applied` releases it.
+//!
+//! Recheck contract: a session may match more than one gate (e.g. an overlap of
+//! a failover gate and a DDL gate). `check` parks a session behind ONE matching
+//! gate at a time; a `Release` (Replan or Expired) means "re-plan the statement
+//! and check again", not "proceed". Callers therefore loop `check` until it
+//! returns `None`, so a session transitively waits for every gate that matches
+//! it. `Rejected` is terminal.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pgshard_core::{KeyRange, KeyspaceId};
@@ -73,7 +85,7 @@ pub struct GateSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
     /// Gate opened after a topology change: re-plan the statement, then
-    /// execute against the new topology.
+    /// re-check gates (it may match another) before executing.
     Replan { topology_generation: u64 },
     /// Gate expired without an open: re-plan against current topology
     /// (coordinator treats the cutover as aborted).
@@ -84,7 +96,11 @@ pub enum Release {
 
 #[derive(Debug, Clone)]
 pub struct GateLimits {
+    /// Sessions parked behind a single gate before new arrivals are rejected.
     pub max_sessions: usize,
+    /// Sessions parked across ALL gates before new arrivals are rejected,
+    /// bounding total buffer memory independent of how many gates exist.
+    pub max_total_sessions: usize,
     pub max_wait: Duration,
 }
 
@@ -92,6 +108,7 @@ impl Default for GateLimits {
     fn default() -> Self {
         GateLimits {
             max_sessions: 5000,
+            max_total_sessions: 50000,
             max_wait: Duration::from_secs(20),
         }
     }
@@ -105,6 +122,17 @@ struct Parked {
 struct GateState {
     spec: GateSpec,
     parked: VecDeque<Parked>,
+    /// Set once `open` is requested but the applied topology generation has not
+    /// yet reached `min_topology_generation`; `topology_applied` releases it.
+    open_requested: bool,
+}
+
+impl GateState {
+    /// Drops parked sessions whose client already disconnected (the receiver
+    /// was dropped), so they neither hold memory nor count toward capacity.
+    fn prune_dead(&mut self) {
+        self.parked.retain(|p| !p.waker.is_closed());
+    }
 }
 
 #[derive(Default)]
@@ -115,10 +143,23 @@ struct EngineState {
     applied_generation: u64,
 }
 
-/// The gate engine. Cheap to check on the hot path: one mutex lock only
-/// when gates exist (the common case is an empty gate set, checked via an
-/// atomic-free fast read of a generation counter — kept simple with a
-/// Mutex for now; measured before optimizing).
+impl EngineState {
+    fn total_parked(&self) -> usize {
+        self.gates.iter().map(|g| g.parked.len()).sum()
+    }
+
+    /// Removes `gates[idx]` and releases its parked sessions with `release`.
+    fn drain_gate(&mut self, idx: usize, release: Release) {
+        let gate = self.gates.swap_remove(idx);
+        for parked in gate.parked {
+            let _ = parked.waker.send(release);
+        }
+    }
+}
+
+/// The gate engine. `check` acquires the mutex on every statement; there is no
+/// lock-free fast path yet (measured before optimizing). The common case is an
+/// empty gate set, so the critical section is a single vector scan.
 pub struct GateEngine {
     state: Mutex<EngineState>,
     limits: GateLimits,
@@ -132,66 +173,100 @@ impl GateEngine {
         })
     }
 
-    /// Records the topology generation the router just applied and wakes
-    /// any sessions whose gate opened pending that generation.
+    /// Locks the state, recovering from a poisoned mutex: a panic elsewhere
+    /// must not wedge the gate engine and strand every parked session forever.
+    fn lock(&self) -> MutexGuard<'_, EngineState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Records the highest topology generation the router has applied and
+    /// releases any gate whose open was requested before its
+    /// `min_topology_generation` had landed.
     pub fn topology_applied(&self, generation: u64) {
-        let mut state = self.state.lock().expect("gate lock");
+        let mut state = self.lock();
         if generation > state.applied_generation {
             state.applied_generation = generation;
+        }
+        let applied = state.applied_generation;
+        let mut idx = 0;
+        while idx < state.gates.len() {
+            let gate = &state.gates[idx];
+            if gate.open_requested && gate.spec.min_topology_generation <= applied {
+                info!(gate = %gate.spec.id, sessions = gate.parked.len(),
+                    "gate open now satisfied by applied topology; replaying");
+                state.drain_gate(
+                    idx,
+                    Release::Replan {
+                        topology_generation: applied,
+                    },
+                );
+            } else {
+                idx += 1;
+            }
         }
     }
 
     /// Installs or replaces a gate (level-triggered from topology or via
-    /// admin RPC — same spec either way, idempotent by id).
+    /// admin RPC — same spec either way, idempotent by id). Re-closing keeps
+    /// parked sessions and clears any pending open.
     pub fn close(&self, spec: GateSpec) {
-        let mut state = self.state.lock().expect("gate lock");
+        let mut state = self.lock();
         if let Some(existing) = state.gates.iter_mut().find(|g| g.spec.id == spec.id) {
             existing.spec = spec;
+            existing.open_requested = false;
             return;
         }
         info!(gate = %spec.id, "gate closed");
         state.gates.push(GateState {
             spec,
             parked: VecDeque::new(),
+            open_requested: false,
         });
     }
 
-    /// Opens a gate: parked sessions replay once the applied topology
-    /// generation reaches the gate's minimum. Callers therefore invoke
-    /// `topology_applied` first when the flip and the open race.
+    /// Opens a gate. If the applied topology generation has not yet reached the
+    /// gate's minimum, the open is armed and the gate keeps parking until
+    /// `topology_applied` catches up — replaying earlier would route buffered
+    /// writes against the pre-cutover shard map. A gate whose deadline has
+    /// already passed is expired instead (an aborted cutover, not a switch).
     pub fn open(&self, gate_id: &str) {
-        let mut state = self.state.lock().expect("gate lock");
+        let mut state = self.lock();
         let applied = state.applied_generation;
         let Some(idx) = state.gates.iter().position(|g| g.spec.id == gate_id) else {
             return;
         };
-        let gate = state.gates.swap_remove(idx);
-        if gate.spec.min_topology_generation > applied {
-            warn!(gate = %gate.spec.id, want = gate.spec.min_topology_generation,
-                applied, "gate opened before topology applied; replaying anyway with current topology");
+        let spec = &state.gates[idx].spec;
+        if spec.deadline <= Instant::now() {
+            warn!(gate = %spec.id, "open arrived after the deadline; expiring (aborted cutover)");
+            state.drain_gate(idx, Release::Expired);
+            return;
         }
-        info!(gate = %gate.spec.id, sessions = gate.parked.len(), "gate opened; replaying");
-        for parked in gate.parked {
-            let _ = parked.waker.send(Release::Replan {
+        if spec.min_topology_generation > applied {
+            warn!(gate = %spec.id, want = spec.min_topology_generation, applied,
+                "gate open requested before topology applied; holding until it lands");
+            state.gates[idx].open_requested = true;
+            return;
+        }
+        info!(gate = %spec.id, sessions = state.gates[idx].parked.len(), "gate opened; replaying");
+        state.drain_gate(
+            idx,
+            Release::Replan {
                 topology_generation: applied,
-            });
-        }
+            },
+        );
     }
 
     /// Expires overdue gates; returns how many were expired. The router
     /// runs this from a timer tick.
     pub fn expire_due(&self, now: Instant) -> usize {
-        let mut state = self.state.lock().expect("gate lock");
+        let mut state = self.lock();
         let mut expired = 0;
         let mut idx = 0;
         while idx < state.gates.len() {
             if state.gates[idx].spec.deadline <= now {
-                let gate = state.gates.swap_remove(idx);
-                warn!(gate = %gate.spec.id, sessions = gate.parked.len(),
+                warn!(gate = %state.gates[idx].spec.id, sessions = state.gates[idx].parked.len(),
                     "gate deadline expired; fail-safe replay against current topology");
-                for parked in gate.parked {
-                    let _ = parked.waker.send(Release::Expired);
-                }
+                state.drain_gate(idx, Release::Expired);
                 expired += 1;
             } else {
                 idx += 1;
@@ -201,13 +276,18 @@ impl GateEngine {
     }
 
     /// Hot-path check. Returns a future to await when parked; None means
-    /// proceed immediately.
+    /// proceed immediately. On release, callers re-plan and call `check` again
+    /// (see the recheck contract in the module docs).
     pub fn check(&self, scope: &StatementScope) -> Option<oneshot::Receiver<Release>> {
-        let mut state = self.state.lock().expect("gate lock");
-        let gate = state.gates.iter_mut().find(|g| {
+        let mut state = self.lock();
+        let total = state.total_parked();
+        let idx = state.gates.iter().position(|g| {
             (g.spec.mode == GateMode::All || scope.is_write) && g.spec.matcher.matches(scope)
         })?;
-        if gate.parked.len() >= self.limits.max_sessions {
+        let over_total = total >= self.limits.max_total_sessions;
+        let gate = &mut state.gates[idx];
+        gate.prune_dead();
+        if over_total || gate.parked.len() >= self.limits.max_sessions {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Release::Rejected);
             debug!(gate = %gate.spec.id, "gate buffer full; rejecting");
@@ -224,10 +304,11 @@ impl GateEngine {
     /// Rejects sessions parked longer than max_wait (run from the same
     /// timer tick as expire_due); returns how many were rejected.
     pub fn reject_overdue_sessions(&self, now: Instant) -> usize {
-        let mut state = self.state.lock().expect("gate lock");
+        let mut state = self.lock();
         let max_wait = self.limits.max_wait;
         let mut rejected = 0;
         for gate in &mut state.gates {
+            gate.prune_dead();
             while let Some(front) = gate.parked.front() {
                 if now.duration_since(front.enqueued) > max_wait {
                     let parked = gate.parked.pop_front().expect("front exists");
@@ -243,7 +324,7 @@ impl GateEngine {
 
     /// Snapshot for RouterAdminService.GateStatus.
     pub fn status(&self) -> Vec<(String, usize)> {
-        let state = self.state.lock().expect("gate lock");
+        let state = self.lock();
         state
             .gates
             .iter()
