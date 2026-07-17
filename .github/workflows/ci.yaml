@@ -24,6 +24,18 @@ jobs:
       - name: Install libclang for bindgen
         run: sudo apt-get update -q && sudo apt-get install -y -q libclang-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Pre-pull the testcontainers image with retries so a transient registry
+      # hiccup ("bytes remaining on stream") fails here and retries, instead of
+      # flaking a test mid-run. testcontainers then reuses the local image.
+      - name: Pre-pull test container image
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if docker pull postgres:18-bookworm; then exit 0; fi
+            echo "pull attempt $attempt failed; retrying in 10s"
+            sleep 10
+          done
+          echo "::error::could not pull postgres:18-bookworm after 5 attempts"
+          exit 1
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
