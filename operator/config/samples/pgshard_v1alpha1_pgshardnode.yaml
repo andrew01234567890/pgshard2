@@ -1,0 +1,11 @@
+apiVersion: pgshard.dev/v1alpha1
+kind: PgShardNode
+metadata:
+  labels:
+    app.kubernetes.io/name: pgshard
+    app.kubernetes.io/managed-by: kustomize
+  name: pgshardnode-sample
+spec:
+  replicas: 2
+  storage:
+    size: 2Gi

@@ -4,6 +4,7 @@
 resources:
 - bases/pgshard.dev_pgshardclusters.yaml
 - bases/pgshard.dev_pgshardshards.yaml
+- bases/pgshard.dev_pgshardnodes.yaml
 - bases/pgshard.dev_pgshardroutings.yaml
 - bases/pgshard.dev_pgshardtableconfigs.yaml
 # +kubebuilder:scaffold:crdkustomizeresource

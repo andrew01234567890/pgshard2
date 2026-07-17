@@ -40,6 +40,7 @@ rules:
   - pgshard.dev
   resources:
   - pgshardclusters
+  - pgshardnodes
   - pgshardshards
   verbs:
   - create
@@ -53,6 +54,7 @@ rules:
   - pgshard.dev
   resources:
   - pgshardclusters/finalizers
+  - pgshardnodes/finalizers
   - pgshardshards/finalizers
   verbs:
   - update
@@ -60,6 +62,7 @@ rules:
   - pgshard.dev
   resources:
   - pgshardclusters/status
+  - pgshardnodes/status
   - pgshardshards/status
   verbs:
   - get

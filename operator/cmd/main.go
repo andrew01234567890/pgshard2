@@ -202,6 +202,18 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgshardshard")
 		os.Exit(1)
 	}
+	if err := (&controller.PgShardNodeReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Images: controller.ShardImages{Postgres: postgresImage, Agent: agentImage},
+		// TODO(mTLS): dial agents over mTLS. Until agent certificates are
+		// provisioned the operator explicitly opts into an insecure pool — a
+		// conscious choice made here, never a hidden default in the controller.
+		Agents: agentclient.NewInsecurePool(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgshardnode")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

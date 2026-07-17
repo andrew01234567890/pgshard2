@@ -1,0 +1,288 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardnodes.pgshard.dev
+spec:
+  group: pgshard.dev
+  names:
+    kind: PgShardNode
+    listKind: PgShardNodeList
+    plural: pgshardnodes
+    singular: pgshardnode
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.currentPrimary
+      name: Primary
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PgShardNode is one physical PostgreSQL instance group (operator-managed).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardNodeSpec is the desired state of one physical PostgreSQL instance
+              group (a primary plus replicas) — the HA, storage, and backup unit. A node
+              hosts one or more shard databases; which shards land on it is a placement
+              decision recorded on the PgShardShards, not here, so a single node can serve
+              several clusters' shards (dense/shared placement) or exactly one (dedicated).
+            properties:
+              fenced:
+                description: 'Fenced freezes the node: agents keep PostgreSQL down
+                  until lifted.'
+                type: boolean
+              image:
+                type: string
+              postgresConfigHash:
+                description: |-
+                  Content hash of the node's rendered PostgreSQL configuration; a change
+                  drives the rolling-restart/reload flow.
+                type: string
+              replicas:
+                description: Instances including the primary.
+                format: int32
+                maximum: 9
+                minimum: 1
+                type: integer
+              resources:
+                description: ResourceRequirements describes the compute resource requirements.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              storage:
+                description: StorageSpec describes per-instance persistent storage.
+                properties:
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  storageClass:
+                    type: string
+                  walSeparate:
+                    description: WalSeparate provisions a dedicated WAL volume.
+                    type: boolean
+                required:
+                - size
+                type: object
+            required:
+            - replicas
+            type: object
+          status:
+            description: |-
+              PgShardNodeStatus is the observed state of one node. The
+              targetPrimary/currentPrimary pair is the CNPG-style failover handshake:
+              the operator sets the target; the elected agent promotes (guarded by the
+              node's Kubernetes Lease) and the operator records currentPrimary once the
+              promotion is confirmed. The operator polls the in-pod agents and is the sole
+              writer of this status; agents never write it.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentPrimary:
+                type: string
+              decisionEpoch:
+                description: |-
+                  Monotonic failover-decision epoch carried on agent Promote/Fence calls;
+                  agents reject anything older than the highest they have seen.
+                format: int64
+                type: integer
+              instances:
+                items:
+                  description: |-
+                    InstanceState is the operator's aggregated view of one instance,
+                    populated by polling the in-pod agent (agents do not write status).
+                  properties:
+                    pod:
+                      type: string
+                    ready:
+                      type: boolean
+                    replayLagSeconds:
+                      type: string
+                    role:
+                      description: InstanceRole of a PostgreSQL instance within the
+                        shard.
+                      enum:
+                      - primary
+                      - replica
+                      type: string
+                    syncState:
+                      type: string
+                    walReplayLsn:
+                      type: string
+                    walWriteLsn:
+                      description: Current WAL positions in PostgreSQL X/X text form.
+                      type: string
+                  required:
+                  - pod
+                  type: object
+                type: array
+              phase:
+                enum:
+                - Provisioning
+                - Ready
+                - FailingOver
+                - Degraded
+                type: string
+              stanzaInitialized:
+                type: boolean
+              targetPrimary:
+                type: string
+              targetPrimaryTimestamp:
+                format: date-time
+                type: string
+              timeline:
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: node name must be a lowercase RFC 1035 label (start with a letter;
+            letters, digits, hyphens) so it is a valid Service name on every Kubernetes
+            version
+          rule: self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')
+        - message: node name must be at most 58 characters so derived Service names
+            fit the 63-character limit
+          rule: size(self.metadata.name) <= 58
+    served: true
+    storage: true
+    subresources:
+      status: {}
