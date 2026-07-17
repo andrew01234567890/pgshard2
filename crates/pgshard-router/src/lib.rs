@@ -24,10 +24,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use pgshard_core::{KeyRange, SequenceBinding, TableDef, TableName, VSchema, VSchemaError};
+use pgshard_core::{
+    KeyRange, ScalarType, SequenceBinding, TableDef, TableName, VSchema, VSchemaError,
+};
 use pgshard_plan::{Parameterized, Plan, ShardCatalog, ShardId};
 use pgshard_sql::SqlError;
-use pgshard_topo::{ShardState, TableType, Topology};
+use pgshard_topo::{ShardKeyType, ShardState, TableType, Topology};
 use tokio::sync::watch;
 
 pub use pgshard_topo::Instance as Endpoint;
@@ -241,6 +243,7 @@ fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {
                     .ok_or_else(|| BuildError::MissingShardKey(name.clone()))?;
                 TableDef::Sharded {
                     shard_key_column,
+                    shard_key_type: t.shard_key_type.map(map_shard_key_type),
                     shard_function: topo.hash_function.clone(),
                     sequences: t
                         .sequences
@@ -256,6 +259,15 @@ fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {
         vschema.insert(name, def)?;
     }
     Ok(vschema)
+}
+
+fn map_shard_key_type(t: ShardKeyType) -> ScalarType {
+    match t {
+        ShardKeyType::Int => ScalarType::Int,
+        ShardKeyType::Text => ScalarType::Text,
+        ShardKeyType::Uuid => ScalarType::Uuid,
+        ShardKeyType::Bytea => ScalarType::Bytea,
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +308,7 @@ mod tests {
             name: "orders".into(),
             table_type: TableType::Sharded,
             shard_key_column: Some("customer_id".into()),
+            shard_key_type: Some(ShardKeyType::Int),
             sequences: vec![Sequence {
                 column: "id".into(),
                 sequence: "orders_id".into(),
@@ -309,6 +322,7 @@ mod tests {
             name: "settings".into(),
             table_type: TableType::Global,
             shard_key_column: None,
+            shard_key_type: None,
             sequences: Vec::new(),
         }
     }

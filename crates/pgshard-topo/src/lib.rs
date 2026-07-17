@@ -15,8 +15,8 @@ use tokio::sync::watch;
 
 pub use file::FileWatcher;
 pub use model::{
-    GateMatch, GateMode, GateSpec, Instance, Sequence, ShardEntry, ShardState, TableEntry,
-    TableType, Topology,
+    GateMatch, GateMode, GateSpec, Instance, Sequence, ShardEntry, ShardKeyType, ShardState,
+    TableEntry, TableType, Topology,
 };
 
 #[derive(Debug, thiserror::Error)]
