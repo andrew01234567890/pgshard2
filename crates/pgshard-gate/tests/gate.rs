@@ -148,6 +148,36 @@ async fn open_before_generation_holds_until_topology_applied() {
 }
 
 #[tokio::test]
+async fn armed_open_expires_if_deadline_beats_the_generation() {
+    let engine = GateEngine::new(GateLimits::default());
+    engine.topology_applied(1);
+    // Deadline 5ms out; keyrange_gate requires generation 2.
+    engine.close(keyrange_gate("g", "-", Duration::from_millis(5)));
+    let parked = engine.check(&write_scope("t", 1)).unwrap();
+    // Open arms the gate (generation 2 not yet applied, deadline not yet passed).
+    engine.open("g");
+    assert_eq!(engine.status(), vec![("g".to_string(), 1)]);
+    // The deadline passes before generation 2 lands: the late generation must
+    // NOT replay against a cutover that already aborted.
+    std::thread::sleep(Duration::from_millis(10));
+    engine.topology_applied(2);
+    assert_eq!(parked.await.unwrap(), Release::Expired);
+}
+
+#[tokio::test]
+async fn reclose_preserves_an_armed_open() {
+    let engine = GateEngine::new(GateLimits::default());
+    engine.topology_applied(1);
+    engine.close(keyrange_gate("g", "-", Duration::from_secs(60)));
+    let parked = engine.check(&write_scope("t", 1)).unwrap();
+    engine.open("g"); // armed: generation 2 not yet applied
+    // A level-triggered re-assertion of the same gate must not cancel the open.
+    engine.close(keyrange_gate("g", "-", Duration::from_secs(60)));
+    engine.topology_applied(2);
+    assert!(matches!(parked.await.unwrap(), Release::Replan { .. }));
+}
+
+#[tokio::test]
 async fn open_after_deadline_expires_instead_of_replaying() {
     let engine = GateEngine::new(GateLimits::default());
     engine.topology_applied(2);

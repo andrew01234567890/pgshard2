@@ -155,6 +155,21 @@ impl EngineState {
             let _ = parked.waker.send(release);
         }
     }
+
+    /// Releases `gates[idx]` as an opened gate. The absolute deadline is
+    /// authoritative: a gate whose deadline has already passed is an aborted
+    /// cutover (Expired), even if the generation that would have opened it lands
+    /// in the same instant — never a blind Replan after the deadline.
+    fn open_gate(&mut self, idx: usize, applied: u64, now: Instant) {
+        let release = if self.gates[idx].spec.deadline <= now {
+            Release::Expired
+        } else {
+            Release::Replan {
+                topology_generation: applied,
+            }
+        };
+        self.drain_gate(idx, release);
+    }
 }
 
 /// The gate engine. `check` acquires the mutex on every statement; there is no
@@ -188,18 +203,15 @@ impl GateEngine {
             state.applied_generation = generation;
         }
         let applied = state.applied_generation;
+        let now = Instant::now();
         let mut idx = 0;
         while idx < state.gates.len() {
             let gate = &state.gates[idx];
             if gate.open_requested && gate.spec.min_topology_generation <= applied {
                 info!(gate = %gate.spec.id, sessions = gate.parked.len(),
-                    "gate open now satisfied by applied topology; replaying");
-                state.drain_gate(
-                    idx,
-                    Release::Replan {
-                        topology_generation: applied,
-                    },
-                );
+                    "gate open now satisfied by applied topology; releasing");
+                // Deadline-authoritative: past the deadline this is Expired.
+                state.open_gate(idx, applied, now);
             } else {
                 idx += 1;
             }
@@ -208,12 +220,13 @@ impl GateEngine {
 
     /// Installs or replaces a gate (level-triggered from topology or via
     /// admin RPC — same spec either way, idempotent by id). Re-closing keeps
-    /// parked sessions and clears any pending open.
+    /// parked sessions and preserves any pending open: a level-triggered
+    /// re-assertion of the same gate must not silently cancel an in-flight open
+    /// (which would strand the parked sessions until the deadline).
     pub fn close(&self, spec: GateSpec) {
         let mut state = self.lock();
         if let Some(existing) = state.gates.iter_mut().find(|g| g.spec.id == spec.id) {
             existing.spec = spec;
-            existing.open_requested = false;
             return;
         }
         info!(gate = %spec.id, "gate closed");
@@ -280,13 +293,16 @@ impl GateEngine {
     /// (see the recheck contract in the module docs).
     pub fn check(&self, scope: &StatementScope) -> Option<oneshot::Receiver<Release>> {
         let mut state = self.lock();
-        let total = state.total_parked();
         let idx = state.gates.iter().position(|g| {
             (g.spec.mode == GateMode::All || scope.is_write) && g.spec.matcher.matches(scope)
         })?;
-        let over_total = total >= self.limits.max_total_sessions;
+        // Prune disconnected sessions across all gates BEFORE measuring capacity,
+        // so dead clients neither hold a per-gate nor an engine-wide slot.
+        for gate in &mut state.gates {
+            gate.prune_dead();
+        }
+        let over_total = state.total_parked() >= self.limits.max_total_sessions;
         let gate = &mut state.gates[idx];
-        gate.prune_dead();
         if over_total || gate.parked.len() >= self.limits.max_sessions {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Release::Rejected);
