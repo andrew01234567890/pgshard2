@@ -322,12 +322,17 @@ fn is_concatenable_scatter(query: &str) -> bool {
     else {
         return false;
     };
-    select.sort_clause.is_empty()
+    // A set operation (UNION/INTERSECT/EXCEPT) keeps its operands in larg/rarg
+    // and leaves target_list empty (which would vacuously pass the check below),
+    // and its cross-shard semantics need real merging — exclude it.
+    select.op == pg_query::protobuf::SetOperation::SetopNone as i32
+        && select.sort_clause.is_empty()
         && select.group_clause.is_empty()
         && select.distinct_clause.is_empty()
         && !select.group_distinct
         && select.limit_count.is_none()
         && select.limit_offset.is_none()
+        && !select.target_list.is_empty()
         && select.target_list.iter().all(is_plain_column_target)
 }
 
