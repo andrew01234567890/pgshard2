@@ -71,14 +71,16 @@ func Compile(in CompileInputs) (pgshardv1alpha1.PgShardRoutingSpec, error) {
 	// compared byte-for-byte (specEquivalent) and index-aligned (structuralChange),
 	// so any input-order dependence would churn the epoch / topologyGeneration.
 	gates := slices.Clone(in.Gates)
+	gateIDs := make(map[string]bool, len(gates))
+	for _, g := range gates {
+		if gateIDs[g.ID] {
+			return pgshardv1alpha1.PgShardRoutingSpec{}, fmt.Errorf("duplicate gate id %q", g.ID)
+		}
+		gateIDs[g.ID] = true
+	}
+	// Gate IDs are unique (enforced above), so ID alone is a total order.
 	slices.SortFunc(gates, func(a, b pgshardv1alpha1.RoutingGate) int {
-		// Tie-break beyond ID so two distinct gates that share an ID still order
-		// deterministically.
-		return cmp.Or(
-			cmp.Compare(a.ID, b.ID),
-			cmp.Compare(a.Mode, b.Mode),
-			a.Deadline.Compare(b.Deadline.Time),
-		)
+		return cmp.Compare(a.ID, b.ID)
 	})
 	spec := pgshardv1alpha1.PgShardRoutingSpec{
 		WriteLeaseSeconds: writeLease,

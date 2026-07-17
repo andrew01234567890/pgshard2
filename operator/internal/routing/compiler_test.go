@@ -135,6 +135,18 @@ func TestCompileDetectsDuplicateTablesAcrossConfigs(t *testing.T) {
 	}
 }
 
+func TestCompileRejectsDuplicateGateIDs(t *testing.T) {
+	in := CompileInputs{
+		Cluster:   cluster(),
+		Shards:    []pgshardv1alpha1.PgShardShard{shard("all", "", "", true, "p1", pgshardv1alpha1.ShardRoleData)},
+		Endpoints: endpoints("p1"),
+		Gates:     []pgshardv1alpha1.RoutingGate{{ID: "g1"}, {ID: "g1"}},
+	}
+	if _, err := Compile(in); err == nil {
+		t.Fatal("duplicate gate id must be rejected (would make gate order nondeterministic)")
+	}
+}
+
 func TestCompileExcludesNonReplicaInstances(t *testing.T) {
 	s := shard("c-min-max", "", "", true, "p1", pgshardv1alpha1.ShardRoleData)
 	// A Ready instance with an empty role must not be published as a replica.
