@@ -28,22 +28,22 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
 )
 
-// evaluateFailover decides, from the polled instance statuses and the pod the
-// operator currently expects to be primary, whether a failover is warranted
-// and which replica to elect. It is a pure function so the decision is
-// unit-testable without a live cluster.
+// evaluateFailover decides, from the polled instance statuses, whether a
+// failover is warranted and which replica to elect. It is a pure function so
+// the decision is unit-testable without a live cluster.
 //
-// Rules (CNPG-derived), ordered by safety. A failover is warranted when the
-// shard has instances but none is a ready primary and there is a ready replica
-// to promote. We elect only from a snapshot that is safe to act on:
+// A failover is warranted when the shard has instances but none is a ready
+// primary and there is a ready replica to promote. We elect only from a
+// snapshot that is safe to act on:
 //   - no instance still claims the primary role — a settling or wedged but
 //     reachable primary may still accept writes, so promoting a second one is
 //     split-brain;
-//   - the pod we still expect to be primary is not merely unreachable — an
-//     unpollable expected primary may be alive and serving on the far side of a
-//     partition, so we cannot promote a replacement. A never-primary replica
-//     that is Pending or briefly unreachable, by contrast, must NOT veto the
-//     election;
+//   - no instance that has a pod IP is unobservable this poll. An instance that
+//     was assigned an IP (so it has run) but could not be polled is treated as
+//     possibly-live: it may be a primary serving on the far side of a partition
+//     (split-brain) or hold acknowledged WAL that only it has (lost write). An
+//     instance with no IP has never started and can be neither, so it does not
+//     block;
 //   - every WAL receiver is quiet — an active receiver's received LSN is not
 //     yet final;
 //   - and the most-advanced ready candidate is not behind any observed
@@ -54,18 +54,19 @@ import (
 // The elected target is the ready replica with the highest received WAL
 // position, ties broken by pod name for determinism.
 //
-// Two limits are deliberately left to the fencing/switchover controller:
-// actively fencing (STONITH) an unreachable expected primary — so a primary pod
-// force-deleted while still alive on a partition is not detected here — and a
-// bounded-lag timeout so a permanently not-ready most-advanced standby cannot
-// park the failover indefinitely. Until then this controller prefers waiting
-// (no split-brain, no lost writes) over promoting into ambiguity.
+// Limits deliberately left to the fencing/switchover controller: actively
+// fencing (STONITH) an unreachable instance — so a pod force-deleted while
+// still alive on a partition is not detected here, and a persistently
+// unreachable instance parks the failover rather than being shot; a durable
+// acknowledged-WAL watermark that would let a candidate be proven safe when a
+// more-advanced replica's pod is gone entirely; and a bounded-lag timeout.
+// Until then this controller prefers waiting (no split-brain, no lost writes)
+// over promoting into ambiguity.
 type failoverDecision struct {
 	warranted     bool
 	targetPrimary string
 	// wait is true when a failover is warranted but the snapshot is not yet
-	// safe to elect from. The caller keeps the expected-primary identity and
-	// retries.
+	// safe to elect from; the caller holds and retries.
 	wait bool
 }
 
@@ -82,10 +83,10 @@ type instanceView struct {
 	observed bool
 }
 
-func evaluateFailover(instances []instanceView, expectedPrimary string) failoverDecision {
+func evaluateFailover(instances []instanceView) failoverDecision {
 	hasReadyPrimary := false
 	anyClaimsPrimary := false
-	expectedPrimaryUnobserved := false
+	anyRunningUnobserved := false
 	anyReceiverActive := false
 	var maxObservedLSN uint64
 	candidates := make([]instanceView, 0, len(instances))
@@ -99,12 +100,11 @@ func evaluateFailover(instances []instanceView, expectedPrimary string) failover
 		if inst.observed && inst.receivedLSN > maxObservedLSN {
 			maxObservedLSN = inst.receivedLSN
 		}
-		// Only the pod we still expect to be primary blocks the election when
-		// unreachable — it may be a live primary we cannot see. A never-primary
-		// replica that is Pending or briefly unreachable must not veto an
-		// otherwise-safe promotion.
-		if !inst.observed && inst.pod == expectedPrimary {
-			expectedPrimaryUnobserved = true
+		// A pod that has an IP has run and may be a live primary or hold WAL only
+		// it has; if we could not poll it this cycle we must not elect around it.
+		// A pod with no IP has never started and cannot block.
+		if !inst.observed && inst.host != "" {
+			anyRunningUnobserved = true
 		}
 		if inst.walReceiver {
 			anyReceiverActive = true
@@ -119,9 +119,9 @@ func evaluateFailover(instances []instanceView, expectedPrimary string) failover
 	if hasReadyPrimary || len(candidates) == 0 {
 		return failoverDecision{}
 	}
-	// Warranted, but only safe to elect from a no-claimant snapshot whose
-	// expected primary is accounted for and whose WAL has settled.
-	if anyClaimsPrimary || expectedPrimaryUnobserved || anyReceiverActive {
+	// Warranted, but only safe to elect from a no-claimant snapshot in which
+	// every started instance is accounted for and WAL has settled.
+	if anyClaimsPrimary || anyRunningUnobserved || anyReceiverActive {
 		return failoverDecision{warranted: true, wait: true}
 	}
 	slices.SortFunc(candidates, func(a, b instanceView) int {
@@ -140,43 +140,37 @@ func evaluateFailover(instances []instanceView, expectedPrimary string) failover
 	return failoverDecision{warranted: true, targetPrimary: candidates[0].pod}
 }
 
-// reconcileFailover runs the target/current handshake for one shard.
-// targetPrimary durably records the pod the operator expects to hold the
-// primary role: in steady state it tracks the observed primary, and during a
-// failover it is the elected replacement. Recording it means a transient loss
-// of contact with the primary does not look like "no primary" and trigger a
-// spurious promotion. Once a new target is durable the operator instructs that
-// agent to promote; the agent reports the new role, which the status poll
-// records as currentPrimary. decisionEpoch increments on every new election and
-// guards the Promote so a delayed call from an older failover is rejected.
+// reconcileFailover runs the target/current handshake for one shard. When a
+// failover is elected, targetPrimary records the chosen replacement and the
+// operator, once that is durable, instructs its agent to promote; the agent
+// reports the new role, which the status poll records as currentPrimary.
+// decisionEpoch increments on every new election and guards the Promote so a
+// delayed call from an older failover is rejected. Phase is set to FailingOver
+// only while actively electing/promoting, so a genuine multi-primary split-brain
+// (which deriveShardStatus reports as Degraded) is not masked.
 func (r *PgShardShardReconciler) reconcileFailover(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, views []instanceView,
 ) error {
 	log := logf.FromContext(ctx)
-	// The durable expected primary, read before we mutate it below.
-	expectedPrimary := shard.Status.TargetPrimary
-	decision := evaluateFailover(views, expectedPrimary)
+	decision := evaluateFailover(views)
 
-	if !decision.warranted {
-		switch {
-		case shard.Status.CurrentPrimary != "":
-			// Healthy: track the confirmed primary as the failover target.
-			shard.Status.TargetPrimary = shard.Status.CurrentPrimary
-		case shard.Status.TargetPrimary != "":
-			// No confirmed primary and nothing electable this poll, but a
-			// failover is in flight (we expect a primary that is not live):
-			// hold FailingOver so the phase does not flap to the Degraded that
-			// deriveShardStatus, run earlier this cycle, would otherwise set.
-			shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
-		}
+	// Not warranted (healthy primary or nothing electable), or warranted but not
+	// yet safe to elect: leave the phase deriveShardStatus computed this cycle —
+	// Degraded while a split-brain or a quorum loss persists is the honest signal.
+	if !decision.warranted || decision.wait {
 		return nil
 	}
 
-	// Warranted but not yet safe to elect: keep the expected-primary identity
-	// (do not lose track of who we are waiting on) and hold in FailingOver.
-	if decision.wait {
-		shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
-		return nil
+	// Sticky target: once we have committed to a target keep driving that same
+	// pod as long as it is still a ready candidate, rather than switching to a
+	// different newly-preferred one. A Promote for the old target may already be
+	// in flight; switching would leave two agents promoted (split-brain). This is
+	// never a data-loss regression — the committed target was the most advanced
+	// at election and no new WAL can arrive once the primary is gone, so any
+	// later-preferred candidate is at best tied with it.
+	target := decision.targetPrimary
+	if cur := shard.Status.TargetPrimary; cur != "" && isReadyCandidate(views, cur) {
+		target = cur
 	}
 
 	// Commit the election durably BEFORE instructing any agent. The decision
@@ -185,19 +179,19 @@ func (r *PgShardShardReconciler) reconcileFailover(
 	// agent has already applied, which would let the same epoch be reissued to
 	// a different target (two agents both accepting = split-brain). The Promote
 	// is driven on the next reconcile, once the epoch is durable.
-	if shard.Status.TargetPrimary != decision.targetPrimary {
+	if shard.Status.TargetPrimary != target {
 		shard.Status.DecisionEpoch++
-		shard.Status.TargetPrimary = decision.targetPrimary
+		shard.Status.TargetPrimary = target
 		shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
 		log.Info("electing new primary", "shard", shard.Name,
-			"target", decision.targetPrimary, "epoch", shard.Status.DecisionEpoch)
+			"target", target, "epoch", shard.Status.DecisionEpoch)
 		return nil
 	}
 
 	// Target and epoch are durable; drive the promote. It is idempotent under
 	// the agent's epoch guard, so repeating it across polls is safe.
 	shard.Status.Phase = pgshardv1alpha1.ShardFailingOver
-	host := hostByPod(views, decision.targetPrimary)
+	host := hostByPod(views, target)
 	if host == "" {
 		return nil // target has no reachable address yet; retry next poll
 	}
@@ -206,12 +200,23 @@ func (r *PgShardShardReconciler) reconcileFailover(
 		return err
 	}
 	if _, err := agent.Promote(ctx, &pgshardv1.PromoteRequest{
-		TargetPrimary: decision.targetPrimary,
+		TargetPrimary: target,
 		DecisionEpoch: uint64(shard.Status.DecisionEpoch),
 	}); err != nil {
 		return err
 	}
 	return nil
+}
+
+// isReadyCandidate reports whether pod is currently an observed, ready, non-
+// primary instance — i.e. still a valid promotion target.
+func isReadyCandidate(views []instanceView, pod string) bool {
+	for _, v := range views {
+		if v.pod == pod {
+			return v.observed && v.ready && !v.isPrimary
+		}
+	}
+	return false
 }
 
 func hostByPod(views []instanceView, pod string) string {

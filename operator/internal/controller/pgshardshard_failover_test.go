@@ -185,19 +185,18 @@ var _ = Describe("PgShardShard failover", func() {
 		stampPodIP("blip-0", primaryPodIP)
 		stampPodIP("blip-1", "127.0.0.3")
 
-		// Healthy: primary recorded and tracked as the target.
+		// Healthy: the primary is recorded.
 		reconcile()
 		Expect(get().Status.CurrentPrimary).To(Equal("blip-0"))
-		Expect(get().Status.TargetPrimary).To(Equal("blip-0"))
 
-		// The primary's agent becomes unreachable (its pod stays present) — a
-		// transient partition, NOT a demotion. No replica may be promoted.
+		// The primary's agent becomes unreachable (its pod stays present, so it
+		// keeps its IP) — a transient partition, NOT a demotion. It may still be
+		// serving on the far side, so no replica may be promoted.
 		primaryAgent.Stop()
 		reconcile()
 		blipped := get()
 		Expect(blipped.Status.CurrentPrimary).To(BeEmpty()) // -rw withheld (fail-safe)
-		Expect(blipped.Status.TargetPrimary).To(Equal("blip-0"))
-		Expect(blipped.Status.Phase).To(Equal(pgshardv1alpha1.ShardFailingOver))
+		Expect(blipped.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
 		Expect(replicaAgent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
 		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0)))
 
@@ -219,6 +218,89 @@ var _ = Describe("PgShardShard failover", func() {
 		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0)))
 
 		Expect(k8sClient.Delete(ctx, &back)).To(Succeed())
+	})
+
+	It("does not abandon an in-flight promote for a tied replica that becomes ready later", func() {
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(primaryAgent.Stop)
+		earlyName, err := fakes.NewFakeAgent() // sorts first by pod name (sticky-2)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(earlyName.Stop)
+		firstElected, err := fakes.NewFakeAgent() // sorts last, but ready first
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(firstElected.Stop)
+
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		earlyName.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		firstElected.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			switch host {
+			case primaryPodIP:
+				return primaryAgent.Client()
+			case "127.0.0.3": // sticky-1 (earlyName, sorts first)
+				return earlyName.Client()
+			default: // 127.0.0.4 sticky-2 (firstElected, sorts last)
+				return firstElected.Client()
+			}
+		}
+		r := &PgShardShardReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		const shardName = "sticky"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 3,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: shardName, Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardShard {
+			var got pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardName, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("sticky-0", primaryPodIP)
+		stampPodIP("sticky-1", "127.0.0.3")
+		stampPodIP("sticky-2", "127.0.0.4")
+		// Both standbys hold the same LSN; sticky-1 sorts first by name. sticky-1
+		// is initially not-ready, so only sticky-2 is electable this cycle.
+		earlyName.SetReceivedLSN(500)
+		earlyName.SetReady(false)
+		firstElected.SetReceivedLSN(500)
+
+		reconcile() // healthy
+		Expect(get().Status.CurrentPrimary).To(Equal("sticky-0"))
+
+		// Primary relinquishes; sticky-2 is the only ready candidate, so it wins.
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		primaryAgent.SetReady(false)
+		reconcile() // election pass -> TargetPrimary=sticky-2
+		Expect(get().Status.TargetPrimary).To(Equal("sticky-2"))
+
+		// The tied, name-earlier replica becomes ready before sticky-2's promote
+		// lands. It must NOT steal the election — only sticky-2 is promoted.
+		earlyName.SetReady(true)
+		reconcile() // promote pass
+		Expect(firstElected.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
+		Expect(earlyName.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY))
+		Expect(earlyName.AppliedEpoch()).To(Equal(uint64(0)))
+		Expect(get().Status.TargetPrimary).To(Equal("sticky-2"))
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 })
 
