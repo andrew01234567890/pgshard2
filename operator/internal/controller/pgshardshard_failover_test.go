@@ -290,8 +290,11 @@ var _ = Describe("PgShardShard failover", func() {
 		reconcile() // election pass -> TargetPrimary=sticky-2
 		Expect(get().Status.TargetPrimary).To(Equal("sticky-2"))
 
-		// The tied, name-earlier replica becomes ready before sticky-2's promote
-		// lands. It must NOT steal the election — only sticky-2 is promoted.
+		// The committed target goes not-ready (its normal mid-promotion window)
+		// exactly as the tied, name-earlier replica becomes ready. The elected
+		// target must stay pinned — a not-ready committed target must NOT be
+		// abandoned for the newly-ready tied one, or both would be promoted.
+		firstElected.SetReady(false)
 		earlyName.SetReady(true)
 		reconcile() // promote pass
 		Expect(firstElected.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))

@@ -162,14 +162,19 @@ func (r *PgShardShardReconciler) reconcileFailover(
 	}
 
 	// Sticky target: once we have committed to a target keep driving that same
-	// pod as long as it is still a ready candidate, rather than switching to a
-	// different newly-preferred one. A Promote for the old target may already be
-	// in flight; switching would leave two agents promoted (split-brain). This is
-	// never a data-loss regression — the committed target was the most advanced
-	// at election and no new WAL can arrive once the primary is gone, so any
-	// later-preferred candidate is at best tied with it.
+	// pod while it is still present and observable, rather than switching to a
+	// different newly-preferred one. A Promote for the committed target may
+	// already be in flight; switching would leave two agents promoted
+	// (split-brain), and a target that is momentarily not-ready is the normal
+	// mid-promotion window — not a reason to abandon it. We only re-elect once
+	// the committed target is gone (absent) or unpollable (which itself parks the
+	// election above). This is never a data-loss regression: the committed target
+	// was the most advanced at election and no new WAL arrives once the primary
+	// is gone, so any later-preferred candidate is at best tied with it. (A target
+	// that is present but permanently failing to promote parks the failover — the
+	// bounded-lag/fencing cancel path is deferred, as documented above.)
 	target := decision.targetPrimary
-	if cur := shard.Status.TargetPrimary; cur != "" && isReadyCandidate(views, cur) {
+	if cur := shard.Status.TargetPrimary; cur != "" && isObserved(views, cur) {
 		target = cur
 	}
 
@@ -208,12 +213,13 @@ func (r *PgShardShardReconciler) reconcileFailover(
 	return nil
 }
 
-// isReadyCandidate reports whether pod is currently an observed, ready, non-
-// primary instance — i.e. still a valid promotion target.
-func isReadyCandidate(views []instanceView, pod string) bool {
+// isObserved reports whether pod is present in the view set and was polled
+// successfully this cycle. A committed promote target stays pinned while it is
+// observed, even if momentarily not ready (the normal mid-promotion window).
+func isObserved(views []instanceView, pod string) bool {
 	for _, v := range views {
 		if v.pod == pod {
-			return v.observed && v.ready && !v.isPrimary
+			return v.observed
 		}
 	}
 	return false
