@@ -222,6 +222,37 @@ message DropSlotRequest {
 
 message DropSlotResponse {}
 
+// Create the Postgres DATABASE that hosts a placed shard on this node.
+// Idempotent: a database that already exists (or is created concurrently) is a
+// success. CREATE DATABASE has no IF NOT EXISTS and cannot run in a
+// transaction, so the agent checks pg_database and issues the statement over
+// the simple-query path, treating a duplicate-database error as success.
+message CreateDatabaseRequest {
+  // Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+  // NAMEDATALEN-1; a longer name would be silently truncated and could resolve
+  // to a different database). The agent quotes it as an identifier.
+  string name = 1;
+  // Role that owns the new database; empty leaves it owned by the connecting
+  // (bootstrap) role. At most 63 bytes when set. Only applied at creation —
+  // ownership of an already existing database is not reconciled here.
+  string owner = 2;
+}
+
+message CreateDatabaseResponse {}
+
+// Drop the Postgres DATABASE for a placed (decommissioned) shard. Idempotent:
+// a database that is already absent is a success. Existing sessions are
+// terminated (WITH FORCE) so the database can be removed without waiting for
+// clients to disconnect.
+message DropDatabaseRequest {
+  // Database name. Required, nonempty, at most 63 bytes (PostgreSQL's
+  // NAMEDATALEN-1; a longer name would be silently truncated and could drop a
+  // different database). The agent quotes it as an identifier.
+  string name = 1;
+}
+
+message DropDatabaseResponse {}
+
 message ExecSchemaRequest {
   string sql = 1;
   // Idempotency key; required, nonempty. The agent atomically claims the id
@@ -282,4 +313,6 @@ service AgentService {
   rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
   rpc ExecSchema(ExecSchemaRequest) returns (ExecSchemaResponse);
   rpc MigrationStep(MigrationStepRequest) returns (MigrationStepResponse);
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
 }

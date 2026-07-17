@@ -45,6 +45,15 @@ pub trait Instance: Send + Sync + 'static {
 
     /// Execute a schema/DDL statement (idempotency is handled by the caller).
     async fn exec_sql(&self, sql: &str) -> anyhow::Result<()>;
+
+    /// Ensure a Postgres DATABASE named `name` exists, owned by `owner` when it
+    /// is nonempty. Idempotent: succeeds when the database already exists.
+    async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()>;
+
+    /// Ensure the Postgres DATABASE named `name` does not exist, terminating any
+    /// sessions still connected to it. Idempotent: succeeds when the database is
+    /// already absent.
+    async fn drop_database(&self, name: &str) -> anyhow::Result<()>;
 }
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
@@ -52,6 +61,7 @@ pub trait Instance: Send + Sync + 'static {
 #[cfg(test)]
 pub mod fake {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -59,7 +69,10 @@ pub mod fake {
         state: Mutex<Snapshot>,
         promote_fails: std::sync::atomic::AtomicBool,
         exec_fails: std::sync::atomic::AtomicBool,
+        db_fails: std::sync::atomic::AtomicBool,
         executed: Mutex<Vec<String>>,
+        /// Databases that exist, name -> owner (empty owner = bootstrap role).
+        databases: Mutex<BTreeMap<String, String>>,
     }
 
     impl FakeInstance {
@@ -97,8 +110,18 @@ pub mod fake {
             self.exec_fails
                 .store(fails, std::sync::atomic::Ordering::SeqCst);
         }
+        pub fn set_db_fails(&self, fails: bool) {
+            self.db_fails
+                .store(fails, std::sync::atomic::Ordering::SeqCst);
+        }
         pub fn executed(&self) -> Vec<String> {
             self.executed.lock().unwrap().clone()
+        }
+        pub fn databases(&self) -> Vec<String> {
+            self.databases.lock().unwrap().keys().cloned().collect()
+        }
+        pub fn owner_of(&self, name: &str) -> Option<String> {
+            self.databases.lock().unwrap().get(name).cloned()
         }
     }
 
@@ -132,6 +155,24 @@ pub mod fake {
                 anyhow::bail!("exec failed");
             }
             self.executed.lock().unwrap().push(sql.to_owned());
+            Ok(())
+        }
+        async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()> {
+            if self.db_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("create database failed");
+            }
+            self.databases
+                .lock()
+                .unwrap()
+                .entry(name.to_owned())
+                .or_insert_with(|| owner.to_owned());
+            Ok(())
+        }
+        async fn drop_database(&self, name: &str) -> anyhow::Result<()> {
+            if self.db_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("drop database failed");
+            }
+            self.databases.lock().unwrap().remove(name);
             Ok(())
         }
     }

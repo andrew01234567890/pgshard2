@@ -60,6 +60,32 @@ fn internal(err: anyhow::Error) -> Status {
     Status::internal(err.to_string())
 }
 
+/// PostgreSQL's `NAMEDATALEN - 1`: identifiers longer than this are silently
+/// truncated. A truncated database name could resolve to a *different* existing
+/// database (and a create could then falsely succeed via a duplicate-database
+/// error, or a drop delete the wrong database), so reject overlong identifiers
+/// up front rather than let PostgreSQL truncate them.
+const MAX_IDENT_BYTES: usize = 63;
+
+/// Validate a database identifier: `required` names must be nonempty, and any
+/// value must fit in [`MAX_IDENT_BYTES`] so PostgreSQL does not truncate it. An
+/// empty optional value (e.g. no owner) passes.
+fn check_ident(what: &str, value: &str, required: bool) -> Result<(), Status> {
+    if value.is_empty() {
+        return if required {
+            Err(Status::invalid_argument(format!("{what} is required")))
+        } else {
+            Ok(())
+        };
+    }
+    if value.len() > MAX_IDENT_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{what} exceeds PostgreSQL's {MAX_IDENT_BYTES}-byte identifier limit"
+        )));
+    }
+    Ok(())
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -300,6 +326,31 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     ) -> Result<Response<v1::MigrationStepResponse>, Status> {
         Err(Status::unimplemented("migration_step"))
     }
+    async fn create_database(
+        &self,
+        request: Request<v1::CreateDatabaseRequest>,
+    ) -> Result<Response<v1::CreateDatabaseResponse>, Status> {
+        let req = request.into_inner();
+        check_ident("database name", &req.name, true)?;
+        check_ident("owner", &req.owner, false)?;
+        self.instance
+            .create_database(&req.name, &req.owner)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::CreateDatabaseResponse {}))
+    }
+    async fn drop_database(
+        &self,
+        request: Request<v1::DropDatabaseRequest>,
+    ) -> Result<Response<v1::DropDatabaseResponse>, Status> {
+        let req = request.into_inner();
+        check_ident("database name", &req.name, true)?;
+        self.instance
+            .drop_database(&req.name)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::DropDatabaseResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +515,110 @@ mod tests {
         s.instance.set_exec_fails(false);
         s.exec_schema(req()).await.unwrap();
         assert_eq!(s.instance.executed(), vec!["CREATE TABLE t()".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_database_is_idempotent_and_records_owner() {
+        let s = svc(FakeInstance::primary());
+        let req = |name: &str, owner: &str| {
+            Request::new(v1::CreateDatabaseRequest {
+                name: name.into(),
+                owner: owner.into(),
+            })
+        };
+        s.create_database(req("mycl-x40-x80", "app")).await.unwrap();
+        // A repeat is a success and leaves the original owner untouched.
+        s.create_database(req("mycl-x40-x80", "other"))
+            .await
+            .unwrap();
+        assert_eq!(s.instance.databases(), vec!["mycl-x40-x80".to_string()]);
+        assert_eq!(s.instance.owner_of("mycl-x40-x80").as_deref(), Some("app"));
+    }
+
+    #[tokio::test]
+    async fn create_database_rejects_an_empty_name() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .create_database(Request::new(v1::CreateDatabaseRequest {
+                name: String::new(),
+                owner: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn database_ops_reject_overlong_identifiers() {
+        let s = svc(FakeInstance::primary());
+        let too_long = "a".repeat(64); // PostgreSQL truncates beyond 63 bytes.
+        // An overlong name is rejected on both create and drop, and nothing is
+        // executed against the instance (no truncated collision).
+        assert_eq!(
+            s.create_database(Request::new(v1::CreateDatabaseRequest {
+                name: too_long.clone(),
+                owner: String::new(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            s.drop_database(Request::new(v1::DropDatabaseRequest {
+                name: too_long.clone(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        // An overlong owner is rejected too.
+        assert_eq!(
+            s.create_database(Request::new(v1::CreateDatabaseRequest {
+                name: "ok".into(),
+                owner: too_long,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert!(s.instance.databases().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drop_database_is_idempotent() {
+        let s = svc(FakeInstance::primary());
+        s.create_database(Request::new(v1::CreateDatabaseRequest {
+            name: "shard-a".into(),
+            owner: String::new(),
+        }))
+        .await
+        .unwrap();
+        let drop = || {
+            Request::new(v1::DropDatabaseRequest {
+                name: "shard-a".into(),
+            })
+        };
+        s.drop_database(drop()).await.unwrap();
+        // Dropping an already-absent database still succeeds.
+        s.drop_database(drop()).await.unwrap();
+        assert!(s.instance.databases().is_empty());
+    }
+
+    #[tokio::test]
+    async fn database_op_failure_maps_to_internal() {
+        let instance = FakeInstance::primary();
+        instance.set_db_fails(true);
+        let s = svc(instance);
+        let err = s
+            .create_database(Request::new(v1::CreateDatabaseRequest {
+                name: "shard-a".into(),
+                owner: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
     }
 }
