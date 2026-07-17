@@ -98,6 +98,9 @@ var _ = Describe("PgShardNode lifecycle", func() {
 	It("rejects a node name that would build invalid Service names", func() {
 		bad := newNode("has.dots")
 		Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed(), "dotted name is not a DNS label")
+		digitLed := newNode("tmp")
+		digitLed.Name = "3node"
+		Expect(k8sClient.Create(ctx, digitLed)).NotTo(Succeed(), "digit-leading name is not a valid Service name on every k8s version")
 		long := newNode("tmp")
 		long.Name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 60 chars
 		Expect(k8sClient.Create(ctx, long)).NotTo(Succeed(), "over-long name overflows the 63-char Service limit")

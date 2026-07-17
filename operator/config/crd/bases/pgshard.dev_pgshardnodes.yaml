@@ -275,9 +275,10 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: node name must be a lowercase RFC 1123 label (letters, digits,
-            hyphens)
-          rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: node name must be a lowercase RFC 1035 label (start with a letter;
+            letters, digits, hyphens) so it is a valid Service name on every Kubernetes
+            version
+          rule: self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')
         - message: node name must be at most 58 characters so derived Service names
             fit the 63-character limit
           rule: size(self.metadata.name) <= 58

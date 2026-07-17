@@ -108,7 +108,7 @@ type PgShardNodeStatus struct {
 // it must be a DNS-1123 label short enough that "<name>-pods" stays within the
 // 63-character Service-name limit — otherwise the node reconciles forever
 // against invalid derived objects.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="node name must be a lowercase RFC 1123 label (letters, digits, hyphens)"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="node name must be a lowercase RFC 1035 label (start with a letter; letters, digits, hyphens) so it is a valid Service name on every Kubernetes version"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 58",message="node name must be at most 58 characters so derived Service names fit the 63-character limit"
 
 // PgShardNode is one physical PostgreSQL instance group (operator-managed).
