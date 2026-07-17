@@ -116,6 +116,14 @@ impl Instance for PgInstance {
     async fn rejoin(&self, _upstream: &str, _allow_rewind: bool) -> anyhow::Result<bool> {
         anyhow::bail!("standby rejoin requires the process-supervising agent (not yet implemented)")
     }
+
+    async fn exec_sql(&self, sql: &str) -> anyhow::Result<()> {
+        // Simple-query protocol so statements that cannot run inside a
+        // transaction block (CREATE DATABASE, CREATE INDEX CONCURRENTLY) are not
+        // implicitly wrapped in one.
+        self.connect().await?.batch_execute(sql).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

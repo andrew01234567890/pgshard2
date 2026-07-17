@@ -15,6 +15,7 @@ use v1::agent_service_server::AgentService;
 
 use crate::epoch::{EpochError, EpochGuard, Outcome};
 use crate::instance::Instance;
+use crate::schema::{Claim, SchemaError, SchemaLog};
 use crate::status::to_status;
 
 pub struct AgentSvc<I: Instance> {
@@ -23,6 +24,7 @@ pub struct AgentSvc<I: Instance> {
     /// target is refused.
     pod: String,
     epoch: EpochGuard,
+    schema: SchemaLog,
 }
 
 impl<I: Instance> AgentSvc<I> {
@@ -31,7 +33,17 @@ impl<I: Instance> AgentSvc<I> {
             instance,
             pod,
             epoch: EpochGuard::new(),
+            schema: SchemaLog::new(),
         }
+    }
+}
+
+fn schema_status(err: SchemaError) -> Status {
+    match err {
+        SchemaError::EmptyId | SchemaError::DifferentSql(_) => {
+            Status::invalid_argument(err.to_string())
+        }
+        SchemaError::InFlight(_) => Status::already_exists(err.to_string()),
     }
 }
 
@@ -252,9 +264,28 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn exec_schema(
         &self,
-        _r: Request<v1::ExecSchemaRequest>,
+        request: Request<v1::ExecSchemaRequest>,
     ) -> Result<Response<v1::ExecSchemaResponse>, Status> {
-        Err(Status::unimplemented("exec_schema"))
+        let req = request.into_inner();
+        match self
+            .schema
+            .claim(&req.operation_id, &req.sql)
+            .map_err(schema_status)?
+        {
+            Claim::Execute => match self.instance.exec_sql(&req.sql).await {
+                Ok(()) => {
+                    self.schema.mark_done(&req.operation_id);
+                    Ok(Response::new(v1::ExecSchemaResponse {}))
+                }
+                // Release the claim so the operator's retry re-executes rather
+                // than replaying a success that never happened.
+                Err(e) => {
+                    self.schema.rollback(&req.operation_id);
+                    Err(internal(e))
+                }
+            },
+            Claim::Replay => Ok(Response::new(v1::ExecSchemaResponse {})),
+        }
     }
     async fn migration_step(
         &self,
@@ -380,5 +411,51 @@ mod tests {
         let status = st.into_inner().status.unwrap();
         assert!(status.fenced);
         assert!(!status.ready, "a fenced instance is not ready");
+    }
+
+    #[tokio::test]
+    async fn exec_schema_is_idempotent_by_operation_id() {
+        let s = svc(FakeInstance::primary());
+        let req = |op: &str, sql: &str| {
+            Request::new(v1::ExecSchemaRequest {
+                operation_id: op.into(),
+                sql: sql.into(),
+            })
+        };
+        s.exec_schema(req("op1", "CREATE TABLE t()")).await.unwrap();
+        // A retry with the same id + sql replays without re-executing.
+        s.exec_schema(req("op1", "CREATE TABLE t()")).await.unwrap();
+        assert_eq!(s.instance.executed(), vec!["CREATE TABLE t()".to_string()]);
+        // The same id with different sql, and an empty id, are rejected.
+        assert_eq!(
+            s.exec_schema(req("op1", "DROP TABLE t"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            s.exec_schema(req("", "SELECT 1")).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_schema_failure_retries_instead_of_replaying() {
+        let instance = FakeInstance::primary();
+        instance.set_exec_fails(true);
+        let s = svc(instance);
+        let req = || {
+            Request::new(v1::ExecSchemaRequest {
+                operation_id: "op1".into(),
+                sql: "CREATE TABLE t()".into(),
+            })
+        };
+        assert!(s.exec_schema(req()).await.is_err());
+        // The failed op was not recorded done; once the instance recovers, the
+        // same id re-executes rather than replaying a phantom success.
+        s.instance.set_exec_fails(false);
+        s.exec_schema(req()).await.unwrap();
+        assert_eq!(s.instance.executed(), vec!["CREATE TABLE t()".to_string()]);
     }
 }

@@ -9,5 +9,6 @@
 pub mod epoch;
 pub mod instance;
 pub mod pg;
+pub mod schema;
 pub mod service;
 pub mod status;
