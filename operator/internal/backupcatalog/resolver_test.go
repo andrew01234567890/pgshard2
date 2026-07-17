@@ -23,6 +23,7 @@ const (
 	stanzaF = "c-F-g1"
 	point1  = "pgshard_b1"
 	point2  = "pgshard_b2"
+	backup1 = "bk1"
 )
 
 var (
@@ -61,7 +62,7 @@ func driftCatalog() Catalog {
 			}},
 		},
 		Backups: []BackupManifest{
-			{ID: "bk1", CompletedAt: t1, TopologyGeneration: 1, Shards: []BackupShard{
+			{ID: backup1, CompletedAt: t1, TopologyGeneration: 1, Shards: []BackupShard{
 				{Name: "A", Stanza: stanzaA, Label: "20260716-1F", Timeline: 1, StopTime: t1},
 				{Name: "B", Stanza: stanzaB, Label: "20260716-2F", Timeline: 2, StopTime: t1},
 			}},
@@ -85,7 +86,7 @@ func TestBarrierBeforeReshardRestoresOldTopology(t *testing.T) {
 			plan.Topology.Generation, len(plan.Shards))
 	}
 	a := plan.Shards[0]
-	if a.Set != "20260716-1F" || a.TargetType != "name" ||
+	if a.Set != "20260716-1F" || a.TargetType != targetTypeName ||
 		a.TargetValue != point1 || a.TargetTimeline != "1" {
 		t.Fatalf("shard A plan wrong: %+v", a)
 	}
@@ -104,7 +105,7 @@ func TestTimeInsideCutoverWindowRoundsToPreCutoverGeneration(t *testing.T) {
 		t.Fatalf("t just before the reshard commit must resolve to gen1, got gen%d",
 			plan.Topology.Generation)
 	}
-	if plan.Shards[0].TargetType != "time" {
+	if plan.Shards[0].TargetType != targetTypeTime {
 		t.Fatalf("expected time target: %+v", plan.Shards[0])
 	}
 }
@@ -146,11 +147,11 @@ func TestDecommissionedShardsRemainRestorable(t *testing.T) {
 }
 
 func TestBackupAndLatestTargets(t *testing.T) {
-	plan, err := Resolve(driftCatalog(), Target{BackupID: "bk1"})
+	plan, err := Resolve(driftCatalog(), Target{BackupID: backup1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Topology.Generation != 1 || plan.Shards[0].TargetType != "none" {
+	if plan.Topology.Generation != 1 || plan.Shards[0].TargetType != targetTypeNone {
 		t.Fatalf("backup target plan wrong: %+v", plan)
 	}
 	latest, err := Resolve(driftCatalog(), Target{Latest: true})
@@ -210,7 +211,7 @@ func TestSwappedStanzaIsRejected(t *testing.T) {
 func TestEmptyBackupSetIsRejected(t *testing.T) {
 	catalog := driftCatalog()
 	catalog.Backups[0].Shards[0].Label = ""
-	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+	if _, err := Resolve(catalog, Target{BackupID: backup1}); err == nil {
 		t.Fatal("backup shard with an empty set label must be rejected")
 	}
 }
@@ -229,7 +230,7 @@ func TestSharedTopologyStanzaIsRejected(t *testing.T) {
 	// the topology's own duplicate-stanza check can catch it.
 	catalog.Topologies[0].Shards[1].Stanza = stanzaA
 	catalog.Backups[0].Shards[1].Stanza = stanzaA
-	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+	if _, err := Resolve(catalog, Target{BackupID: backup1}); err == nil {
 		t.Fatal("topology mapping two shards to one stanza must be rejected")
 	}
 }
@@ -238,7 +239,7 @@ func TestDuplicateManifestIDIsRejected(t *testing.T) {
 	catalog := driftCatalog()
 	catalog.Backups = append(catalog.Backups, catalog.Backups[0])
 	// Rejected for an explicit id AND for Latest, which never looks up by id.
-	if _, err := Resolve(catalog, Target{BackupID: "bk1"}); err == nil {
+	if _, err := Resolve(catalog, Target{BackupID: backup1}); err == nil {
 		t.Fatal("two backup manifests sharing an id must be rejected as ambiguous")
 	}
 	if _, err := Resolve(catalog, Target{Latest: true}); err == nil {

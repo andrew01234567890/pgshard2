@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// pgBackRest --type values.
+const (
+	targetTypeName = "name"
+	targetTypeTime = "time"
+	targetTypeNone = "none"
+)
+
 // Target selects the restore point. Exactly one field is set.
 type Target struct {
 	BarrierID string
@@ -113,7 +120,7 @@ func resolveBarrier(catalog Catalog, id string) (RestorePlan, error) {
 			Shard:          shard.Name,
 			Stanza:         shard.Stanza,
 			Set:            backup.Label,
-			TargetType:     "name",
+			TargetType:     targetTypeName,
 			TargetValue:    shard.RestorePoint,
 			TargetTimeline: timelineArg(shard.Timeline),
 		})
@@ -138,7 +145,7 @@ func resolveTime(catalog Catalog, t time.Time) (RestorePlan, error) {
 			Shard:          shard.Name,
 			Stanza:         shard.Stanza,
 			Set:            backup.Label,
-			TargetType:     "time",
+			TargetType:     targetTypeTime,
 			TargetValue:    t.Format(time.RFC3339Nano),
 			TargetTimeline: "latest",
 		})
@@ -179,7 +186,7 @@ func planFromBackup(catalog Catalog, backup BackupManifest) (RestorePlan, error)
 			Shard:          shard.Name,
 			Stanza:         shard.Stanza,
 			Set:            shard.Label,
-			TargetType:     "none",
+			TargetType:     targetTypeNone,
 			TargetTimeline: timelineArg(shard.Timeline),
 		})
 	}
@@ -335,7 +342,7 @@ func sanity(plan RestorePlan) error {
 		if p.Set == "" {
 			return errf("shard %s has no backup set", p.Shard)
 		}
-		if p.TargetType == "name" && p.TargetValue == "" {
+		if p.TargetType == targetTypeName && p.TargetValue == "" {
 			return errf("shard %s: name target with empty restore point", p.Shard)
 		}
 	}
