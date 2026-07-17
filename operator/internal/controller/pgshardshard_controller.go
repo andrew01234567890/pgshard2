@@ -127,14 +127,16 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
-	if err := r.pruneExcessInstances(ctx, &shard); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	if err := r.aggregateStatus(ctx, &shard); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.syncRoleLabels(ctx, &shard); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Prune AFTER polling so it acts on this reconcile's fresh instance states —
+	// never deleting a just-promoted or temporarily-unpollable writer.
+	if err := r.pruneExcessInstances(ctx, &shard); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -287,6 +289,17 @@ func (r *PgShardShardReconciler) ensurePVC(
 func (r *PgShardShardReconciler) pruneExcessInstances(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
 ) error {
+	// Only prune an excess ordinal that THIS reconcile positively confirmed is a
+	// ready replica (from the just-completed poll, role replica, not the
+	// primary). A just-promoted or temporarily-unpollable excess pod is left in
+	// place so scale-down never deletes the writer.
+	confirmedReplica := map[string]bool{}
+	for _, s := range shard.Status.Instances {
+		if s.Ready && s.Role == roleLabelReplica && s.Pod != shard.Status.CurrentPrimary {
+			confirmedReplica[s.Pod] = true
+		}
+	}
+
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(shard.Namespace),
@@ -300,17 +313,14 @@ func (r *PgShardShardReconciler) pruneExcessInstances(
 		if !ok || ord < shard.Spec.Replicas {
 			continue
 		}
-		if !metav1.IsControlledBy(pod, shard) {
-			// A name/label-matching pod this shard does not own is not ours to
-			// delete.
+		// Own it AND have confirmed it a ready replica this reconcile.
+		if !metav1.IsControlledBy(pod, shard) || !confirmedReplica[pod.Name] {
 			continue
 		}
-		if pod.Name == shard.Status.CurrentPrimary {
-			// Deleting the primary would drop writes with no switchover; leave
-			// it until failover/rollout moves the primary onto a kept ordinal.
-			continue
-		}
-		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		// UID precondition: never delete a same-name pod recreated between the
+		// list and the delete.
+		uid := pod.UID
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("pruning pod %s: %w", pod.Name, err)
 		}
 	}
@@ -465,6 +475,11 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	instances := make([]pgshardv1alpha1.InstanceState, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, shard) {
+			// A foreign pod that merely matches our labels must not be polled
+			// into status (it could otherwise be preserved as CurrentPrimary).
+			continue
+		}
 		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -569,6 +584,9 @@ func (r *PgShardShardReconciler) syncRoleLabels(
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, shard) {
+			continue
+		}
 		want := roleLabelReplica
 		if pod.Name == shard.Status.CurrentPrimary {
 			want = roleLabelPrimary
