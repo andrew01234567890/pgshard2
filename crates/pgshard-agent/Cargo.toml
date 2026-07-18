@@ -9,7 +9,9 @@ repository.workspace = true
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 pgshard-proto = { version = "0.0.0", path = "../pgshard-proto" }
+pgshard-repl = { version = "0.0.0", path = "../pgshard-repl" }
 prost = "0.14.4"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "time", "sync"] }

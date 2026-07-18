@@ -6,6 +6,7 @@ use tonic::transport::Server;
 
 use pgshard_agent::pg::PgInstance;
 use pgshard_agent::service::AgentSvc;
+use pgshard_agent::workflow::WorkflowConfig;
 use pgshard_proto::v1::agent_service_server::AgentServiceServer;
 
 #[derive(Parser)]
@@ -40,6 +41,13 @@ enum Command {
         /// requests aimed at another pod uid are refused.
         #[arg(long, env = "PGSHARD_POD_UID", default_value = "")]
         pod_uid: String,
+        /// Replication user for pulling from seeding sources. The workflow
+        /// runner stays disabled until both replication credentials are set.
+        #[arg(long, env = "PGSHARD_REPL_USER")]
+        repl_user: Option<String>,
+        /// Password for the replication user.
+        #[arg(long, env = "PGSHARD_REPL_PASSWORD")]
+        repl_password: Option<String>,
     },
 }
 
@@ -52,8 +60,22 @@ async fn main() -> anyhow::Result<()> {
             pg_conn,
             pod,
             pod_uid,
+            repl_user,
+            repl_password,
         } => {
-            let svc = AgentSvc::with_pod_uid(Arc::new(PgInstance::new(pg_conn)), pod, pod_uid);
+            let mut svc =
+                AgentSvc::with_pod_uid(Arc::new(PgInstance::new(pg_conn.clone())), pod, pod_uid);
+            if let (Some(user), Some(password)) = (repl_user, repl_password) {
+                // The runner connects to the LOCAL instance per target
+                // database; the base conninfo is the agent's own.
+                let target: tokio_postgres::Config = pg_conn.parse()?;
+                svc = svc.with_workflows(WorkflowConfig {
+                    target,
+                    source_user: user,
+                    source_password: password,
+                });
+                tracing::info!("seeding-workflow runner enabled");
+            }
             tracing::info!(%listen, "pgshard-agent serving");
             Server::builder()
                 .add_service(AgentServiceServer::new(svc))

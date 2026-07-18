@@ -17,8 +17,16 @@ enum WorkflowKind {
 message TableMapping {
   TableRef source = 1;
   TableRef target = 2;
-  // Source column -> target column. Empty means identity mapping.
+  // Source column -> target column. Empty means identity mapping. Non-empty
+  // mappings are not implemented in M1 (the runner rejects them).
   map<string, string> column_map = 3;
+  // The table's shard-key column and its declared type (wire values int |
+  // text | uuid | bytea, matching the router's ShardKeyType). Required when
+  // the workflow filter is a key range: both the snapshot copy and the
+  // stream filter hash this column to decide keep-or-skip, and hashing under
+  // the wrong type would route rows to the wrong shard.
+  string shard_key_column = 4;
+  string shard_key_type = 5;
 }
 
 message KeyRangeFilter {
@@ -34,6 +42,8 @@ message RowFilter {
 }
 
 // A replication worker runs on the TARGET agent and pulls from the source.
+// Source credentials come from the target agent's own replication-user
+// configuration (not the wire) until agent<->agent auth lands with mTLS.
 message WorkflowSpec {
   string id = 1;
   WorkflowKind kind = 2;
@@ -45,6 +55,9 @@ message WorkflowSpec {
   string publication = 8;
   repeated TableMapping tables = 9;
   RowFilter filter = 10;
+  // The local database the worker seeds and applies into (the placed shard's
+  // database on this agent's node). Required.
+  string target_database = 11;
 }
 
 enum WorkflowPhase {
