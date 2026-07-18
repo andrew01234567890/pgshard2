@@ -11,6 +11,8 @@
 //! general SQL client. TLS is a follow-up (M1 clusters are reached over the pod
 //! network); connect over plain TCP for now.
 
+use std::time::Duration;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pgshard_core::Lsn;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
@@ -52,6 +54,29 @@ pub enum ClientError {
 }
 
 type Result<T> = std::result::Result<T, ClientError>;
+
+/// Reject any server message whose length header exceeds this. Real PostgreSQL
+/// bounds messages near 1 GiB; a larger claim is an adversarial length that would
+/// otherwise drive an unbounded buffer growth or a stalled read.
+const MAX_MESSAGE_LEN: usize = 1 << 30;
+
+/// How long a handshake or command read may block before it is treated as a dead
+/// or hostile peer. The streaming read ([`ReplicationClient::next`]) is exempt —
+/// it legitimately waits for the next WAL record.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether `name` is safe to interpolate into a replication command. Slot and
+/// publication names reach the wire as simple-query text, and replication mode
+/// also accepts SQL, so an unvalidated name is an injection vector. Accept only a
+/// conservative identifier charset (a superset of PostgreSQL's slot-name rule of
+/// lower-case letters, digits, and underscore).
+fn is_safe_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
 
 /// One chunk of the logical-replication stream: an `XLogData` message whose
 /// `data` is a pgoutput payload to feed to a [`crate::pgoutput::PgOutputDecoder`].
@@ -106,10 +131,10 @@ impl ReplicationClient {
 
         // Drain parameter statuses / backend key data until the server is ready.
         loop {
-            let (tag, _body) = self.read_message().await?;
+            let (tag, _body) = self.read_control().await?;
             match tag {
-                b'Z' => return Ok(()),            // ReadyForQuery
-                b'S' | b'K' | b'N' => continue,   // ParameterStatus / BackendKeyData / Notice
+                b'Z' => return Ok(()),      // ReadyForQuery
+                b'S' | b'K' => continue,    // ParameterStatus / BackendKeyData
                 b'E' => return Err(server_error(&_body)),
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -117,7 +142,7 @@ impl ReplicationClient {
     }
 
     async fn authenticate(&mut self, config: &Config) -> Result<()> {
-        let (tag, mut body) = self.read_message().await?;
+        let (tag, mut body) = self.read_control().await?;
         if tag == b'E' {
             return Err(server_error(&body));
         }
@@ -125,11 +150,24 @@ impl ReplicationClient {
             return Err(ClientError::Unexpected(tag));
         }
         match read_i32(&mut body)? {
-            0 => return Ok(()), // AuthenticationOk (trust) — no password exchange
-            10 => {}            // AuthenticationSASL
+            // AuthenticationOk with no challenge. A server that skips SCRAM has not
+            // proven it knows the password, so accepting this while a password is
+            // configured is a trust downgrade a spoofed endpoint could exploit —
+            // refuse it. Trust is only honoured for a passwordless config.
+            0 => {
+                if config.password.is_empty() {
+                    return Ok(());
+                }
+                return Err(ClientError::Auth(
+                    "server requested no authentication but a password is configured; \
+                     refusing the trust downgrade"
+                        .to_owned(),
+                ));
+            }
+            10 => {} // AuthenticationSASL
             other => {
                 return Err(ClientError::Auth(format!(
-                    "unsupported authentication method {other} (only SCRAM-SHA-256 and trust)"
+                    "unsupported authentication method {other} (only SCRAM-SHA-256)"
                 )));
             }
         }
@@ -147,7 +185,7 @@ impl ReplicationClient {
         self.stream.write_all(&buf).await?;
 
         // AuthenticationSASLContinue.
-        let (tag, mut body) = self.read_message().await?;
+        let (tag, mut body) = self.read_control().await?;
         if tag == b'E' {
             return Err(server_error(&body));
         }
@@ -163,7 +201,7 @@ impl ReplicationClient {
         self.stream.write_all(&buf).await?;
 
         // AuthenticationSASLFinal.
-        let (tag, mut body) = self.read_message().await?;
+        let (tag, mut body) = self.read_control().await?;
         if tag == b'E' {
             return Err(server_error(&body));
         }
@@ -175,7 +213,7 @@ impl ReplicationClient {
             .map_err(|e| ClientError::Auth(e.to_string()))?;
 
         // AuthenticationOk.
-        let (tag, mut body) = self.read_message().await?;
+        let (tag, mut body) = self.read_control().await?;
         if tag == b'E' {
             return Err(server_error(&body));
         }
@@ -190,15 +228,20 @@ impl ReplicationClient {
     /// consumers). Runs to `ReadyForQuery`; the slot's contents are consumed by a
     /// later [`Self::start_replication`].
     pub async fn create_logical_slot(&mut self, name: &str, temporary: bool) -> Result<()> {
+        if !is_safe_ident(name) {
+            return Err(ClientError::Malformed(format!(
+                "unsafe replication slot name {name:?}"
+            )));
+        }
         let temp = if temporary { "TEMPORARY " } else { "" };
         let sql = format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput NOEXPORT_SNAPSHOT");
         self.send_query(&sql).await?;
         // RowDescription / DataRow / CommandComplete, ending at ReadyForQuery.
         loop {
-            let (tag, body) = self.read_message().await?;
+            let (tag, body) = self.read_control().await?;
             match tag {
                 b'Z' => return Ok(()),
-                b'T' | b'D' | b'C' | b'N' | b'S' => continue,
+                b'T' | b'D' | b'C' | b'S' => continue,
                 b'E' => return Err(server_error(&body)),
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -208,16 +251,21 @@ impl ReplicationClient {
     /// Begin streaming `slot` for `publication` at protocol v4. After this the
     /// connection is in `CopyBoth` mode; use [`Self::next`].
     pub async fn start_replication(&mut self, slot: &str, publication: &str) -> Result<()> {
+        if !is_safe_ident(slot) || !is_safe_ident(publication) {
+            return Err(ClientError::Malformed(format!(
+                "unsafe slot {slot:?} or publication {publication:?} name"
+            )));
+        }
         let sql = format!(
             "START_REPLICATION SLOT {slot} LOGICAL 0/0 \
              (proto_version '4', publication_names '\"{publication}\"')"
         );
         self.send_query(&sql).await?;
         loop {
-            let (tag, body) = self.read_message().await?;
+            let (tag, body) = self.read_control().await?;
             match tag {
                 b'W' => return Ok(()), // CopyBothResponse: streaming has begun
-                b'N' | b'S' => continue,
+                b'S' => continue,
                 b'E' => return Err(server_error(&body)),
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -227,6 +275,10 @@ impl ReplicationClient {
     /// The next `XLogData` from the stream, or `None` when the server ends the
     /// copy. Primary keepalives are answered internally (a standby status update
     /// when the server asks for a reply) rather than surfaced.
+    ///
+    /// This awaits the next record with no deadline — an idle-but-live server
+    /// still sends periodic keepalives, but a silent connection blocks here, so a
+    /// caller that needs bounded waiting should wrap this in a timeout.
     pub async fn next(&mut self) -> Result<Option<XLogData>> {
         loop {
             let (tag, body) = self.read_message().await?;
@@ -282,12 +334,31 @@ impl ReplicationClient {
     }
 
     async fn send_copy_data(&mut self, payload: &[u8]) -> Result<()> {
+        let len = i32::try_from(4 + payload.len())
+            .map_err(|_| ClientError::Malformed("copy-data payload too large".to_owned()))?;
         let mut buf = BytesMut::with_capacity(5 + payload.len());
         buf.put_u8(b'd');
-        buf.put_i32((4 + payload.len()) as i32);
+        buf.put_i32(len);
         buf.put_slice(payload);
         self.stream.write_all(&buf).await?;
         Ok(())
+    }
+
+    /// Read one control-path message: a handshake/command reply. Bounded by
+    /// [`CONTROL_TIMEOUT`] so a silent or hostile peer fails fast, and skips an
+    /// asynchronous `NoticeResponse` a server may interleave.
+    async fn read_control(&mut self) -> Result<(u8, BytesMut)> {
+        loop {
+            let msg = tokio::time::timeout(CONTROL_TIMEOUT, self.read_message())
+                .await
+                .map_err(|_| {
+                    ClientError::Malformed("timed out waiting for a server reply".to_owned())
+                })??;
+            if msg.0 == b'N' {
+                continue; // NoticeResponse: informational, not part of the exchange
+            }
+            return Ok(msg);
+        }
     }
 
     /// Read one backend message, returning its type byte and body (the bytes
@@ -305,7 +376,7 @@ impl ReplicationClient {
         ]);
         let len = usize::try_from(len)
             .ok()
-            .filter(|&l| l >= 4)
+            .filter(|&l| (4..=MAX_MESSAGE_LEN).contains(&l))
             .ok_or_else(|| ClientError::Malformed(format!("bad message length {len}")))?;
         let total = 1 + len;
         while self.read_buf.len() < total {
