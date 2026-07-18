@@ -670,18 +670,15 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		views = append(views, view)
 	}
 
-	shard.Status.Instances = instances
-	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
-	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
-	// writes to a stale primary).
-	shard.Status.CurrentPrimary, shard.Status.Phase =
-		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
-
-	// Latch the data lineage identity and fence divergent instances out of the
-	// election — the same guard as the node controller (this is the legacy
-	// physical path for un-placed shards).
+	// Latch the data-lineage identity and maintain the recorded primary
+	// timeline from a TRUSTED claimant only, then fence divergent instances —
+	// the same guard as the node controller (this is the legacy physical path
+	// for un-placed shards).
+	trusted := func(pod string) bool {
+		return pod != "" && (pod == before.CurrentPrimary || pod == before.TargetPrimary)
+	}
 	for _, v := range views {
-		if v.isPrimary && v.observed {
+		if v.isPrimary && v.observed && trusted(v.pod) {
 			if v.systemID != 0 && shard.Status.SystemID == "" {
 				shard.Status.SystemID = strconv.FormatUint(v.systemID, 10)
 			}
@@ -690,17 +687,46 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			}
 		}
 	}
-	expectedID, _ := strconv.ParseUint(shard.Status.SystemID, 10, 64)
-	views, excluded := partitionByIdentity(views, expectedID, shard.Status.Timeline)
-	if len(excluded) > 0 {
-		logf.FromContext(ctx).Info("instances fenced from election: identity mismatch",
-			"shard", shard.Name, "pods", excluded)
+	expectedID, parseErr := parseLatchedID(shard.Status.SystemID)
+	assessment := assessIdentity(views, identityInputs{
+		systemID:  expectedID,
+		timeline:  shard.Status.Timeline,
+		current:   before.CurrentPrimary,
+		committed: before.TargetPrimary,
+	})
+	// A rogue claimant's role is never recognized: publishing it would put
+	// CurrentPrimary — and with it the -rw write service — on data this
+	// lineage does not own.
+	for i := range views {
+		if assessment.rogue(views[i].pod) {
+			instances[i].Role = ""
+		}
+	}
+	if len(assessment.fenced) > 0 {
+		logf.FromContext(ctx).Info("instances fenced from election or recognition",
+			"shard", shard.Name, "instances", assessment.fenced)
 	}
 
-	// Drive the target/current-primary handshake: track the healthy primary, or
-	// elect and promote a replacement when it is gone.
-	if err := r.reconcileFailover(ctx, shard, views); err != nil {
-		return nil, err
+	shard.Status.Instances = instances
+	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
+	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
+	// writes to a stale primary).
+	shard.Status.CurrentPrimary, shard.Status.Phase =
+		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
+
+	if cond := identityConsistentCondition(
+		&assessment, shard.Status.SystemID != "", parseErr, shard.Generation); cond != nil {
+		apimeta.SetStatusCondition(&shard.Status.Conditions, *cond)
+	}
+
+	// Drive the target/current-primary handshake: track the healthy primary,
+	// or elect and promote a replacement when it is gone. A pre-latch identity
+	// conflict or an unparseable latch disables the election entirely (fail
+	// closed) until a human resolves it; the condition above says why.
+	if parseErr == nil && !assessment.conflict {
+		if err := r.reconcileFailover(ctx, shard, assessment.kept); err != nil {
+			return nil, err
+		}
 	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a

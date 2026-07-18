@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -446,6 +447,13 @@ var _ = Describe("PgShardShard failover", func() {
 		reconcile() // observe: commitment cleared once refail-1 is a ready primary
 		Expect(get().Status.CurrentPrimary).To(Equal("refail-1"))
 		Expect(get().Status.TargetPrimary).To(BeEmpty())
+		// The legacy shard path latches identity and reports it, exactly like
+		// the node path.
+		latched := get()
+		Expect(latched.Status.SystemID).To(Equal("4242"))
+		idCond := apimeta.FindStatusCondition(latched.Status.Conditions, "IdentityConsistent")
+		Expect(idCond).NotTo(BeNil())
+		Expect(string(idCond.Status)).To(Equal("True"))
 
 		// Second failover: the new primary's pod is removed (node failure). The
 		// caught-up refail-2 must be elected — not parked forever on the stale,

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -469,20 +468,17 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 		views = append(views, view)
 	}
 
-	node.Status.Instances = instances
-	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
-	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
-	// writes to a stale primary).
-	node.Status.CurrentPrimary, node.Status.Phase =
-		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
-
-	// Latch the data lineage identity from the confirmed primary (never
-	// overwritten once set) and keep the primary timeline current, then fence
-	// divergent instances out of the election: a foreign system id is another
-	// database's data, and a divergent timeline makes WAL positions
-	// incomparable.
+	// Latch the data-lineage identity (never overwritten once set) and keep
+	// the recorded primary timeline current — but only from a TRUSTED
+	// claimant: the pod this controller's own handshake already recognizes as
+	// primary or is promoting. An unsolicited claimant must not latch (a
+	// reused volume could imprint a foreign lineage forever) and must not
+	// launder its own timeline into the recorded one.
+	trusted := func(pod string) bool {
+		return pod != "" && (pod == before.CurrentPrimary || pod == before.TargetPrimary)
+	}
 	for _, v := range views {
-		if v.isPrimary && v.observed {
+		if v.isPrimary && v.observed && trusted(v.pod) {
 			if v.systemID != 0 && node.Status.SystemID == "" {
 				node.Status.SystemID = strconv.FormatUint(v.systemID, 10)
 			}
@@ -491,34 +487,46 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 			}
 		}
 	}
-	expectedID, _ := strconv.ParseUint(node.Status.SystemID, 10, 64)
-	views, excluded := partitionByIdentity(views, expectedID, node.Status.Timeline)
-	if len(excluded) > 0 {
-		logf.FromContext(ctx).Info("instances fenced from election: identity mismatch",
-			"node", node.Name, "pods", excluded)
+	expectedID, parseErr := parseLatchedID(node.Status.SystemID)
+	assessment := assessIdentity(views, identityInputs{
+		systemID:  expectedID,
+		timeline:  node.Status.Timeline,
+		current:   before.CurrentPrimary,
+		committed: before.TargetPrimary,
+	})
+	// A rogue claimant's role is never recognized: publishing it would put
+	// CurrentPrimary — and with it the -rw write service — on data this
+	// lineage does not own.
+	for i := range views {
+		if assessment.rogue(views[i].pod) {
+			instances[i].Role = ""
+		}
 	}
-	if node.Status.SystemID != "" {
-		cond := metav1.Condition{
-			Type:               "IdentityConsistent",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Latched",
-			Message:            "all observed instances match the latched system identity",
-			ObservedGeneration: node.Generation,
-		}
-		if len(excluded) > 0 {
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = "ForeignInstance"
-			cond.Message = fmt.Sprintf(
-				"instances fenced from election (foreign system id or divergent timeline): %s",
-				strings.Join(excluded, ", "))
-		}
-		apimeta.SetStatusCondition(&node.Status.Conditions, cond)
+	if len(assessment.fenced) > 0 {
+		logf.FromContext(ctx).Info("instances fenced from election or recognition",
+			"node", node.Name, "instances", assessment.fenced)
 	}
 
-	// Drive the target/current-primary handshake: track the healthy primary, or
-	// elect and promote a replacement when it is gone.
-	if err := r.reconcileFailover(ctx, node, views); err != nil {
-		return nil, err
+	node.Status.Instances = instances
+	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
+	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
+	// writes to a stale primary).
+	node.Status.CurrentPrimary, node.Status.Phase =
+		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
+
+	if cond := identityConsistentCondition(
+		&assessment, node.Status.SystemID != "", parseErr, node.Generation); cond != nil {
+		apimeta.SetStatusCondition(&node.Status.Conditions, *cond)
+	}
+
+	// Drive the target/current-primary handshake: track the healthy primary,
+	// or elect and promote a replacement when it is gone. A pre-latch identity
+	// conflict or an unparseable latch disables the election entirely (fail
+	// closed) until a human resolves it; the condition above says why.
+	if parseErr == nil && !assessment.conflict {
+		if err := r.reconcileFailover(ctx, node, assessment.kept); err != nil {
+			return nil, err
+		}
 	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a

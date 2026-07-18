@@ -364,7 +364,12 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		stampPodIP("idnode-1", replicaPodIP)
 		stampPodIP("idnode-2", "127.0.0.4")
 
-		// The confirmed primary latches the lineage identity and timeline.
+		// The confirmed primary latches the lineage identity and timeline: one
+		// poll confirms it as CurrentPrimary, the next latches from the
+		// now-trusted claimant (an unsolicited claimant must never latch).
+		reconcile()
+		Expect(get().Status.SystemID).To(BeEmpty(),
+			"an unconfirmed claimant must not latch the lineage identity")
 		reconcile()
 		got := get()
 		Expect(got.Status.SystemID).To(Equal("4242"))
@@ -390,6 +395,74 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		foreignAgent.SetTimeline(9)
 		reconcile()
 		Expect(get().Status.TargetPrimary).To(Equal("idnode-1"))
+
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
+	})
+
+	It("never publishes a sole foreign claimant as CurrentPrimary", func() {
+		const rogueNode = "roguenode"
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(primaryAgent.Stop)
+		rogueAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(rogueAgent.Stop)
+
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		rogueAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return primaryAgent.Client()
+			}
+			return rogueAgent.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: rogueNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: rogueNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rogueNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP(rogueNode+"-0", primaryPodIP)
+		stampPodIP(rogueNode+"-1", replicaPodIP)
+		reconcile() // confirm the legitimate primary
+		reconcile() // latch its identity from the now-trusted claimant
+		Expect(get().Status.SystemID).To(Equal("4242"))
+
+		// The legitimate primary vanishes and the OTHER pod claims primary on a
+		// foreign lineage (a reused volume that booted primary): it must never
+		// be recognized — with the audit's original code it would become the
+		// sole confirmed primary and take -rw.
+		primaryAgent.SetEmptyStatus(true)
+		rogueAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		rogueAgent.SetSystemID(9999)
+		for range 3 {
+			reconcile()
+			got := get()
+			Expect(got.Status.CurrentPrimary).NotTo(Equal(rogueNode+"-1"),
+				"a foreign claimant must never be published as CurrentPrimary")
+			Expect(got.Status.TargetPrimary).NotTo(Equal(rogueNode + "-1"))
+		}
+		cond := apimeta.FindStatusCondition(get().Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(string(cond.Status)).To(Equal("False"))
+		Expect(cond.Message).To(ContainSubstring(rogueNode + "-1"))
 
 		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
 	})
