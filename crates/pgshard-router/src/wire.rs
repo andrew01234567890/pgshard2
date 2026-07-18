@@ -34,13 +34,14 @@ use pgshard_sql::Parsed;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use tokio_postgres::{NoTls, SimpleQueryMessage};
 
+use crate::backend::{BackendConnection, BackendResult, PgWireBackend, TokioPostgresBackend};
 use crate::sequence::PgBlockReserver;
 use crate::{Endpoint, Route, Router, SharedRouter, Target};
 
@@ -62,7 +63,14 @@ pub struct Backend {
 /// takes effect on the next query without tearing a query in flight.
 pub struct Proxy {
     router: SharedRouter,
+    /// Backend credentials plus the system database name. Retained for the
+    /// system-database routing decision; the connection itself goes through
+    /// `conn`.
     backend: Backend,
+    /// How a routed query reaches a shard's PostgreSQL. Defaults to the proven
+    /// text-mode tokio-postgres backend; [`Proxy::verbatim`] swaps in the
+    /// type-aware pgwire backend.
+    conn: Arc<dyn BackendConnection>,
     /// Allocates global-sequence ids for INSERTs that omit a sequence column.
     /// `None` disables injection (such an INSERT then errors rather than routing
     /// a row with a missing id).
@@ -72,6 +80,7 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(router: SharedRouter, backend: Backend) -> Self {
         Self {
+            conn: Arc::new(TokioPostgresBackend::new(backend.clone())),
             router,
             backend,
             seq: None,
@@ -82,32 +91,19 @@ impl Proxy {
     /// through `seq`.
     pub fn with_sequences(router: SharedRouter, backend: Backend, seq: SequenceAllocator) -> Self {
         Self {
+            conn: Arc::new(TokioPostgresBackend::new(backend.clone())),
             router,
             backend,
             seq: Some(seq),
         }
     }
 
-    /// Open a fresh backend connection, run `query`, and return its raw messages.
-    async fn connect_and_query(
-        &self,
-        endpoint: &Endpoint,
-        database: &str,
-        query: &str,
-    ) -> PgWireResult<Vec<SimpleQueryMessage>> {
-        let conn = format!(
-            "host={} port={} user={} password={} dbname={}",
-            endpoint.host, endpoint.port, self.backend.user, self.backend.password, database
-        );
-        let (client, connection) = tokio_postgres::connect(&conn, NoTls)
-            .await
-            .map_err(backend_error)?;
-        // The connection task drives the protocol; it ends when `client` drops.
-        let driver = tokio::spawn(connection);
-        let result = client.simple_query(query).await.map_err(backend_error);
-        drop(client);
-        let _ = driver.await;
-        result
+    /// Route backend traffic through the verbatim (type-aware) backend instead of
+    /// the default text-mode one: results then carry real column type OIDs and
+    /// the backend's verbatim command tag.
+    pub fn verbatim(mut self) -> Self {
+        self.conn = Arc::new(PgWireBackend::new(self.backend.clone()));
+        self
     }
 
     async fn run_on(
@@ -116,8 +112,8 @@ impl Proxy {
         database: &str,
         query: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let messages = self.connect_and_query(endpoint, database, query).await?;
-        translate(query, messages)
+        let results = self.conn.run(endpoint, database, query).await?;
+        Ok(results.into_iter().map(response_from).collect())
     }
 
     /// Allocate ids for any sequence columns the INSERT omits and rewrite it to
@@ -182,34 +178,44 @@ impl Proxy {
     async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
         let fetches = targets
             .iter()
-            .map(|t| self.connect_and_query(&t.endpoint, &t.database, query));
+            .map(|t| self.conn.run(&t.endpoint, &t.database, query));
         let results = futures::future::join_all(fetches).await;
 
         let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut rows: Vec<DataRow> = Vec::new();
         for result in results {
             // First shard error fails the whole scatter — a partial result set
             // would be silently wrong.
-            let (shard_schema, shard_rows, _) = extract(result?);
-            match (&schema, shard_schema) {
-                (None, s) => schema = s,
-                // Shards must agree on the result shape. A column-count/name
-                // mismatch (e.g. a non-atomic broadcast DDL still rolling out)
-                // would otherwise encode rows under the wrong schema or panic the
-                // encoder — fail the scatter instead.
-                (Some(first), Some(this)) if !schemas_match(first, &this) => {
-                    return Err(user_error(
-                        "0A000",
-                        "shards returned different result schemas; a schema change may be mid-rollout"
-                            .to_owned(),
-                    ));
+            for shard_result in result? {
+                let BackendResult::Rows {
+                    schema: shard_schema,
+                    rows: shard_rows,
+                } = shard_result
+                else {
+                    // A plain scatter read is a single SELECT; a no-row result is
+                    // not expected, but ignoring it is safe for concatenation.
+                    continue;
+                };
+                match &schema {
+                    None => schema = Some(shard_schema),
+                    // Shards must agree on the result shape. A column-count/name
+                    // mismatch (e.g. a non-atomic broadcast DDL still rolling out)
+                    // would otherwise encode rows under the wrong schema — fail the
+                    // scatter instead.
+                    Some(first) if !schemas_match(first, &shard_schema) => {
+                        return Err(user_error(
+                            "0A000",
+                            "shards returned different result schemas; a schema change may be mid-rollout"
+                                .to_owned(),
+                        ));
+                    }
+                    _ => {}
                 }
-                _ => {}
+                rows.extend(shard_rows);
             }
-            rows.extend(shard_rows);
         }
         match schema {
-            Some(schema) => Ok(vec![rows_response(schema, rows)?]),
+            Some(schema) => Ok(vec![rows_response(schema, rows)]),
             // A scatter only comes from a SELECT, which always describes its
             // columns; guard defensively rather than panic.
             None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
@@ -327,83 +333,32 @@ impl Proxy {
     }
 }
 
-type Extracted = (Option<Arc<Vec<FieldInfo>>>, Vec<Vec<Option<String>>>, u64);
-
-/// Pull the (text) schema, rows, and affected-row count out of a single
-/// statement's `simple_query` messages.
-fn extract(messages: Vec<SimpleQueryMessage>) -> Extracted {
-    let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    let mut affected: u64 = 0;
-    for msg in messages {
-        match msg {
-            SimpleQueryMessage::RowDescription(cols) => {
-                // v1 forwards a single statement, so there is one result set. If a
-                // second description ever arrives, start fresh so rows always match
-                // the current schema (never index a stale one out of bounds).
-                rows.clear();
-                schema = Some(Arc::new(
-                    cols.iter()
-                        .map(|c| {
-                            FieldInfo::new(
-                                c.name().to_owned(),
-                                None,
-                                None,
-                                Type::VARCHAR,
-                                FieldFormat::Text,
-                            )
-                        })
-                        .collect(),
-                ));
-            }
-            SimpleQueryMessage::Row(r) => {
-                rows.push((0..r.len()).map(|i| r.get(i).map(str::to_owned)).collect());
-            }
-            SimpleQueryMessage::CommandComplete(n) => affected = n,
-            _ => {}
-        }
-    }
-    (schema, rows, affected)
-}
-
-/// Whether two result schemas describe the same columns (count and names).
+/// Whether two result schemas describe the same columns: count, name, type, and
+/// wire format. The type is load-bearing on the verbatim backend, which reports
+/// real OIDs — two shards with a same-named column of different types (e.g. a
+/// non-atomic DDL still rolling out) must not have one shard's rows emitted under
+/// the other's type.
 fn schemas_match(a: &[FieldInfo], b: &[FieldInfo]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name() == y.name())
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.name() == y.name() && x.datatype() == y.datatype() && x.format() == y.format()
+        })
 }
 
-/// A row-returning response from a schema plus already-collected text rows.
-fn rows_response(
-    schema: Arc<Vec<FieldInfo>>,
-    rows: Vec<Vec<Option<String>>>,
-) -> PgWireResult<Response> {
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let mut encoded = Vec::with_capacity(rows.len());
-    for row in &rows {
-        for value in row {
-            encoder.encode_field(&value.as_deref())?;
-        }
-        encoded.push(encoder.take_row());
-    }
-    let row_stream = stream::iter(encoded.into_iter().map(Ok));
-    Ok(Response::Query(QueryResponse::new(schema, row_stream)))
+/// A row-returning response from a schema plus already-encoded rows.
+fn rows_response(schema: Arc<Vec<FieldInfo>>, rows: Vec<DataRow>) -> Response {
+    let row_stream = stream::iter(rows.into_iter().map(Ok));
+    Response::Query(QueryResponse::new(schema, row_stream))
 }
 
-/// Turn a single statement's messages into a wire response: rows (a
-/// `QueryResponse`) or a command tag (an `Execution`).
-fn translate(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<Vec<Response>> {
-    let (schema, rows, affected) = extract(messages);
-    if let Some(schema) = schema {
-        Ok(vec![rows_response(schema, rows)?])
-    } else {
-        let command = command_tag(query);
-        // Only INSERT carries the `oid rows` tag shape (`INSERT 0 n`); UPDATE and
-        // DELETE are `verb n`. Getting INSERT's zero oid right keeps libpq's
-        // PQcmdTuples (psycopg2 rowcount) working.
-        let mut tag = Tag::new(&command).with_rows(affected as usize);
-        if command == "INSERT" {
-            tag = tag.with_oid(0);
-        }
-        Ok(vec![Response::Execution(tag)])
+/// Turn one backend statement result into a wire response: rows (a
+/// `QueryResponse` carrying the backend's schema), a command tag (an
+/// `Execution` with the tag string), or an empty-query response.
+fn response_from(result: BackendResult) -> Response {
+    match result {
+        BackendResult::Rows { schema, rows } => rows_response(schema, rows),
+        BackendResult::Command { tag } => Response::Execution(Tag::new(&tag)),
+        BackendResult::Empty => Response::EmptyQuery,
     }
 }
 
@@ -481,18 +436,6 @@ fn user_error(code: &str, message: String) -> PgWireError {
         code.to_owned(),
         message,
     )))
-}
-
-fn backend_error(e: tokio_postgres::Error) -> PgWireError {
-    // Surface the backend's SQLSTATE when it has one, else a generic failure.
-    match e.as_db_error() {
-        Some(db) => PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            db.code().code().to_owned(),
-            db.message().to_owned(),
-        ))),
-        None => user_error("08006", format!("backend connection failed: {e}")),
-    }
 }
 
 /// Wraps a [`Proxy`] as the pgwire server handler set. Extended-query and copy
