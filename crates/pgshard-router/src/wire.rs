@@ -561,18 +561,6 @@ fn is_plain_column_target(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
-/// The command tag for a statement with no rows. v1 derives it from the leading
-/// keyword; a verbatim relay of the backend's own tag is a follow-up (it needs
-/// the raw backend protocol rather than tokio-postgres, which drops the tag).
-fn command_tag(query: &str) -> String {
-    query
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
-        .next()
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_uppercase())
-        .unwrap_or_else(|| "OK".to_owned())
-}
 
 fn user_error(code: &str, message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -606,17 +594,8 @@ impl PgWireServerHandlers for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScatterPlan, classify_scatter, command_tag};
+    use super::{ScatterPlan, classify_scatter};
     use crate::merge::{SortColumn, SortKey};
-
-    #[test]
-    fn command_tag_uses_the_leading_keyword() {
-        assert_eq!(command_tag("  insert into t values (1)"), "INSERT");
-        assert_eq!(command_tag("SET search_path = app"), "SET");
-        assert_eq!(command_tag("begin;"), "BEGIN");
-        assert_eq!(command_tag("CREATE(x"), "CREATE");
-        assert_eq!(command_tag("   "), "OK");
-    }
 
     #[test]
     fn plain_projections_concatenate() {
