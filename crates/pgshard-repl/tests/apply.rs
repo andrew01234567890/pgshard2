@@ -107,6 +107,9 @@ async fn applies_a_transaction_exactly_once_across_a_slot_replay() -> anyhow::Re
     // the same slot so it re-streams the committed transaction, and apply with a
     // fresh applier that loads the persisted checkpoint.
     drop(client);
+    // Release the crashed worker's stream lease before its replacement starts;
+    // the replacement's bounded lock wait rides out the async session teardown.
+    drop(applier);
     let mut client = ReplicationClient::connect(&config).await?;
     client.start_replication("apply_slot", "orders_pub").await?;
     let mut applier = Applier::new(connect_db(&pg, "target").await?, "consumer-1").await?;
@@ -257,9 +260,106 @@ async fn replica_role_suppresses_target_triggers() -> anyhow::Result<()> {
     );
     assert_eq!(applier.ack_lsn(), end_lsn);
 
-    // And it is persisted: a fresh applier loads the same ack position.
+    // And it is persisted: a fresh applier loads the same ack position. The
+    // live applier must hand its stream lease over first.
+    drop(applier);
     let reloaded = Applier::new(connect_db(&pg, "trig_target").await?, "trig-consumer").await?;
     assert_eq!(reloaded.checkpoint(), commit_lsn);
     assert_eq!(reloaded.ack_lsn(), end_lsn);
+    Ok(())
+}
+
+/// The checkpoint write is a monotonic compare-and-set: a worker whose
+/// in-memory checkpoint is stale (durable progress already moved past it)
+/// must abort its transaction — rolling back its row changes — rather than
+/// regressing rows and progress.
+#[tokio::test]
+async fn stale_worker_cannot_regress_progress() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION cas_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE cas_target").await?;
+    let checker = connect_db(&pg, "cas_target").await?;
+    checker
+        .batch_execute("CREATE TABLE orders (id int PRIMARY KEY, note text)")
+        .await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    let mut client = ReplicationClient::connect(&config).await?;
+    client.create_logical_slot("cas_slot", true).await?;
+    client.start_replication("cas_slot", "cas_pub").await?;
+
+    let mut applier = Applier::new(connect_db(&pg, "cas_target").await?, "cas-consumer").await?;
+    let mut decoder = PgOutputDecoder::new(4);
+
+    // First transaction applies normally and creates the progress row.
+    source
+        .batch_execute("INSERT INTO orders VALUES (1, 'a')")
+        .await?;
+    apply_one_txn(&mut client, &mut decoder, &mut applier).await?;
+
+    // A replacement worker races ahead: durable progress jumps far past this
+    // worker's in-memory checkpoint.
+    checker
+        .execute(
+            "UPDATE pgshard.repl_progress SET lsn = $1, end_lsn = $1 WHERE consumer = 'cas-consumer'",
+            &[&i64::MAX],
+        )
+        .await?;
+
+    // The stale worker tries to apply the next transaction: the CAS must fence
+    // it and roll its changes back.
+    source
+        .batch_execute("INSERT INTO orders VALUES (2, 'b')")
+        .await?;
+    let err = apply_one_txn(&mut client, &mut decoder, &mut applier).await;
+    assert!(err.is_err(), "a stale worker must be fenced, not applied");
+
+    let count: i64 = checker
+        .query_one("SELECT count(*) FROM orders", &[])
+        .await?
+        .get(0);
+    assert_eq!(count, 1, "the fenced transaction's rows must roll back");
+    let lsn: i64 = checker
+        .query_one(
+            "SELECT lsn FROM pgshard.repl_progress WHERE consumer = 'cas-consumer'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(lsn, i64::MAX, "progress must never move backward");
+    Ok(())
+}
+
+/// The stream lease: while one applier lives, a second applier for the same
+/// consumer cannot start — its bounded lock wait fails loudly.
+#[tokio::test]
+async fn second_applier_is_fenced_by_the_stream_lease() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let admin = pg.connect().await?;
+    admin.batch_execute("CREATE DATABASE lease_target").await?;
+    let holder = Applier::new(connect_db(&pg, "lease_target").await?, "lease-consumer").await?;
+
+    let second = Applier::new(connect_db(&pg, "lease_target").await?, "lease-consumer").await;
+    assert!(
+        second.is_err(),
+        "a second applier for a live consumer must be fenced"
+    );
+
+    // A different consumer is unaffected.
+    let other = Applier::new(connect_db(&pg, "lease_target").await?, "other-consumer").await;
+    assert!(other.is_ok());
+    drop(holder);
     Ok(())
 }

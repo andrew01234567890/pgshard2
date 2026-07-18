@@ -14,6 +14,12 @@
 //! table's replica-identity key). Truncate and streamed/two-phase transactions
 //! are rejected (fail closed) rather than silently skipped, so the target never
 //! diverges; those, plus replication origins for loop prevention, are follow-ups.
+//!
+//! Concurrent appliers for one consumer are fenced twice over: a session
+//! advisory lock (the stream lease) keeps a second worker from starting while
+//! one lives, and the checkpoint write is a monotonic compare-and-set inside
+//! the apply transaction, so even a worker that somehow slipped past the lease
+//! cannot regress rows or progress — its transaction aborts instead.
 
 use std::collections::HashMap;
 
@@ -40,6 +46,8 @@ pub enum ApplyError {
     InvalidUtf8,
     #[error("a change affected {affected} target rows, expected exactly 1 (target diverged)")]
     RowCountMismatch { affected: u64 },
+    #[error("fenced by a concurrent applier: {0}")]
+    Fenced(String),
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
 }
@@ -140,6 +148,28 @@ impl Applier {
                      ADD COLUMN IF NOT EXISTS end_lsn bigint NOT NULL DEFAULT 0",
             )
             .await?;
+
+        // The stream lease: one live applier per consumer per target. A
+        // session-level advisory lock keyed by the consumer id is held for this
+        // connection's lifetime, so a replacement worker cannot start applying
+        // while a delayed predecessor still can. The wait is bounded — a healthy
+        // handover only waits for the old session's teardown — and a timeout
+        // fails loudly here rather than risking two writers. The checkpoint CAS
+        // in `commit` is the second, independent guard.
+        target.batch_execute("SET lock_timeout = '5s'").await?;
+        let lease = target
+            .execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                &[&consumer],
+            )
+            .await;
+        target.batch_execute("SET lock_timeout = 0").await?;
+        if let Err(e) = lease {
+            return Err(ApplyError::Fenced(format!(
+                "could not acquire the stream lease for consumer {consumer:?}: {e}"
+            )));
+        }
+
         let (checkpoint, ack) = match target
             .query_opt(
                 "SELECT lsn, end_lsn FROM pgshard.repl_progress WHERE consumer = $1",
@@ -314,12 +344,27 @@ impl Applier {
         }
         // Advance the checkpoint in the SAME transaction as the changes: either
         // both land or neither does, which is what makes the apply exactly-once.
-        txn.execute(
-            "INSERT INTO pgshard.repl_progress (consumer, lsn, end_lsn) VALUES ($1, $2, $3) \
-             ON CONFLICT (consumer) DO UPDATE SET lsn = EXCLUDED.lsn, end_lsn = EXCLUDED.end_lsn",
-            &[&self.consumer, &(commit_lsn.0 as i64), &(end_lsn.0 as i64)],
-        )
-        .await?;
+        // The WHERE is a monotonic compare-and-set: it refuses to move the row
+        // backward, so a delayed worker whose in-memory checkpoint is stale (a
+        // replacement already advanced past it) updates zero rows and this whole
+        // transaction — its row changes included — aborts instead of regressing
+        // both the data and the progress. Independent of the stream lease.
+        let advanced = txn
+            .execute(
+                "INSERT INTO pgshard.repl_progress (consumer, lsn, end_lsn) VALUES ($1, $2, $3) \
+                 ON CONFLICT (consumer) DO UPDATE \
+                 SET lsn = EXCLUDED.lsn, end_lsn = EXCLUDED.end_lsn \
+                 WHERE repl_progress.lsn < EXCLUDED.lsn",
+                &[&self.consumer, &(commit_lsn.0 as i64), &(end_lsn.0 as i64)],
+            )
+            .await?;
+        if advanced != 1 {
+            // Dropping `txn` rolls the applied changes back with the checkpoint.
+            return Err(ApplyError::Fenced(format!(
+                "durable progress for consumer {:?} is already past commit {commit_lsn:?}",
+                self.consumer
+            )));
+        }
         txn.commit().await?;
 
         self.checkpoint = commit_lsn;
