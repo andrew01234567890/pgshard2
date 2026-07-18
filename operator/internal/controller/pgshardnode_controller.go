@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -128,14 +129,23 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureServices(ctx, &node); err != nil {
 		return ctrl.Result{}, err
 	}
+	// EVERY ordinal is checked before acting on foreign volumes: stopping at
+	// the first would leave a later ordinal's pod — possibly a labeled,
+	// serving primary on foreign data — routed until the earlier one is
+	// remediated.
+	var foreigns []*foreignPVCError
 	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
 		if err := r.ensureInstance(ctx, &node, ordinal); err != nil {
 			var foreign *foreignPVCError
 			if errors.As(err, &foreign) {
-				return r.degradeForeignStorage(ctx, &node, foreign)
+				foreigns = append(foreigns, foreign)
+				continue
 			}
 			return ctrl.Result{}, err
 		}
+	}
+	if len(foreigns) > 0 {
+		return r.degradeForeignStorage(ctx, &node, foreigns)
 	}
 	if err := r.clearStorageProvenance(ctx, &node); err != nil {
 		return ctrl.Result{}, err
@@ -316,39 +326,43 @@ func tagForeignPod(err error, pod string) error {
 	return err
 }
 
-// degradeForeignStorage records that a retained volume from another node
-// identity blocked instance reconciliation: the pod that would mount it is
-// never created, and one ALREADY RUNNING (the volume turned foreign under it
-// — a relabel, or a pre-provenance upgrade) is pulled out of read/write
-// routing by stripping its role label. Recovery is an explicit human action —
-// relabel the PVC to this node's UID to adopt its data deliberately, or
-// delete the pod and PVC for a fresh volume — retried at the poll cadence,
-// not by hot-looping an error.
+// degradeForeignStorage records that retained volumes from another node
+// identity blocked instance reconciliation: pods that would mount them are
+// never created, and any ALREADY RUNNING (the volume turned foreign under it
+// — a relabel, or a pre-provenance upgrade) are pulled out of read/write
+// routing by stripping their role labels. Recovery is an explicit human
+// action — relabel the PVC to this node's UID to adopt its data
+// deliberately, or delete the pod and PVC for a fresh volume — retried at
+// the poll cadence, not by hot-looping an error.
 func (r *PgShardNodeReconciler) degradeForeignStorage(
-	ctx context.Context, node *pgshardv1alpha1.PgShardNode, foreign *foreignPVCError,
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, foreigns []*foreignPVCError,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	log.Info("foreign PVC blocks instance reconciliation",
-		"node", node.Name, "pvc", foreign.pvc, "pod", foreign.pod, "foundUID", foreign.foundUID)
-	var pod corev1.Pod
-	err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: foreign.pod}, &pod)
-	switch {
-	case err == nil && metav1.IsControlledBy(&pod, node) && pod.Labels[labelRole] != "":
-		patched := pod.DeepCopy()
-		delete(patched.Labels, labelRole)
-		if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
+	reasons := make([]string, 0, len(foreigns))
+	for _, foreign := range foreigns {
+		log.Info("foreign PVC blocks instance reconciliation",
+			"node", node.Name, "pvc", foreign.pvc, "pod", foreign.pod, "foundUID", foreign.foundUID)
+		reasons = append(reasons, foreign.Error())
+		var pod corev1.Pod
+		err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: foreign.pod}, &pod)
+		switch {
+		case err == nil && metav1.IsControlledBy(&pod, node) && pod.Labels[labelRole] != "":
+			patched := pod.DeepCopy()
+			delete(patched.Labels, labelRole)
+			if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
+				return ctrl.Result{}, err
+			}
+		case err != nil && !apierrors.IsNotFound(err):
 			return ctrl.Result{}, err
 		}
-	case err != nil && !apierrors.IsNotFound(err):
-		return ctrl.Result{}, err
 	}
 	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
 		Type:   storageProvenanceCondition,
 		Status: metav1.ConditionFalse,
 		Reason: "ForeignData",
 		Message: fmt.Sprintf(
-			"%s; relabel it with %s=%s to adopt its data deliberately, or delete the pod and PVC for a fresh volume",
-			foreign.Error(), labelNodeUID, node.UID),
+			"%s; relabel with %s=%s to adopt the data deliberately, or delete the pods and PVCs for fresh volumes",
+			strings.Join(reasons, "; "), labelNodeUID, node.UID),
 		ObservedGeneration: node.Generation,
 	})
 	node.Status.Phase = pgshardv1alpha1.NodeDegraded

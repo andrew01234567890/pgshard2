@@ -198,13 +198,23 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 		// stop the shard from mirroring its node's health.
 		r.reconcileShardDatabase(ctx, shard, &node)
 		// The compiled routing view reads CurrentPrimary: a placed shard is
-		// routable only once ITS database on this node is verified. A refused
-		// same-named database (another placement's stale data) would otherwise
-		// be served verbatim the moment routing compiled this shard.
-		if !apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) {
+		// routable only once ITS database on THIS node incarnation is
+		// verified — the condition alone is not enough, because a True left
+		// over from a previous node would keep routing a replacement whose
+		// re-verification is still failing. A refused database (another
+		// placement's stale data) reads Degraded; an unverified one is merely
+		// not Ready yet — either way the cluster must not count a shard with
+		// no writer route as Ready.
+		verified := apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) &&
+			shard.Status.DatabaseNode == node.Name &&
+			shard.Status.DatabaseNodeUID == string(node.UID)
+		if !verified {
 			shard.Status.CurrentPrimary = ""
-			if apimeta.IsStatusConditionFalse(shard.Status.Conditions, shardDatabaseReadyCondition) {
+			switch {
+			case apimeta.IsStatusConditionFalse(shard.Status.Conditions, shardDatabaseReadyCondition):
 				shard.Status.Phase = pgshardv1alpha1.ShardDegraded
+			case shard.Status.Phase == pgshardv1alpha1.ShardReady:
+				shard.Status.Phase = pgshardv1alpha1.ShardProvisioning
 			}
 		}
 	}
@@ -225,10 +235,12 @@ const shardDatabaseReadyCondition = "DatabaseReady"
 // terminal condition instead of an endless retry.
 const maxDatabaseNameBytes = 63
 
-// adoptDatabaseAnnotation ("true") authorizes taking over an existing
-// same-named database whose provenance marker does not match this shard — a
-// deliberate restore/adopt action. Without it a foreign or unmarked database
-// is fenced (DatabaseReady False/ForeignDatabase) and never served.
+// adoptDatabaseAnnotation authorizes taking over an existing same-named
+// database whose provenance marker does not match this shard — a deliberate
+// restore/adopt action. Its VALUE must be the UID of the PgShardNode the
+// takeover was granted for: a bare capability would silently adopt whatever
+// stale database the shard's NEXT node happens to hold (a NodeRef move, or a
+// crash between adoption and consuming the annotation). Consumed on success.
 const adoptDatabaseAnnotation = "pgshard.dev/adopt-database"
 
 // shardDatabaseName is the Postgres DATABASE a placed shard lives in. Shard
@@ -297,7 +309,7 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		log.Error(err, "dialing agent for database provisioning")
 		return
 	}
-	adopt := shard.Annotations[adoptDatabaseAnnotation] == "true"
+	adopt := shard.Annotations[adoptDatabaseAnnotation] == string(node.UID)
 	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{
 		Name: name,
 		// The shard UID binds the database to this placement: deterministic
@@ -316,8 +328,8 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		case codes.FailedPrecondition:
 			r.setDatabaseCondition(shard, metav1.ConditionFalse, "ForeignDatabase",
 				err.Error()+fmt.Sprintf(
-					" (annotate the shard with %s=true to adopt it deliberately)",
-					adoptDatabaseAnnotation))
+					" (annotate the shard with %s=%s to adopt it on this node deliberately)",
+					adoptDatabaseAnnotation, node.UID))
 		default:
 			log.Error(err, "creating shard database", "database", name)
 		}

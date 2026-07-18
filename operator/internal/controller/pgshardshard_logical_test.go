@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -68,9 +69,11 @@ var _ = Describe("PgShardShard placed on a node", func() {
 
 		var got pgshardv1alpha1.PgShardShard
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardNm, Namespace: ns}, &got)).To(Succeed())
-		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady), "phase mirrors the node")
-		// Routing reads CurrentPrimary: it stays withheld until the shard's OWN
-		// database on this node is verified (no agent here, so never).
+		// The node is healthy, but the shard's own database is unverified (no
+		// agent here, so never): a shard with no writer route must not read
+		// Ready — the cluster would count it as such — nor publish a primary.
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardProvisioning),
+			"unverified database: not Ready, not Degraded (nothing refused)")
 		Expect(got.Status.CurrentPrimary).To(BeEmpty(),
 			"a placed shard is not routable before its database is verified")
 
@@ -90,7 +93,8 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: shardNm, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardNm, Namespace: ns}, &got)).To(Succeed())
-		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady), "a fenced placed shard still mirrors its node")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardProvisioning),
+			"a fenced placed shard still reconciles (and still has no verified database)")
 	})
 
 	It("provisions its Postgres database on the node's primary once ready", func() {
@@ -172,6 +176,21 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		fresh.Status.Phase = pgshardv1alpha1.NodeReady
 		fresh.Status.CurrentPrimary = dbNode + "-0"
 		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+		// While re-verification FAILS (the agent is unreachable), the stale
+		// DatabaseReady=True from the previous incarnation must not keep the
+		// replacement routable.
+		workingDial := r.dialAgent
+		r.dialAgent = func(string, int32) (pgshardv1.AgentServiceClient, error) {
+			return nil, fmt.Errorf("agent unreachable")
+		}
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		var unverified pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &unverified)).To(Succeed())
+		Expect(unverified.Status.CurrentPrimary).To(BeEmpty(),
+			"a stale True condition must not route an unverified replacement node")
+
+		r.dialAgent = workingDial
 		callsBefore = len(agent.Calls)
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -243,8 +262,20 @@ var _ = Describe("PgShardShard placed on a node", func() {
 			"a shard whose database was refused must not be routable")
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
 
-		// Explicit adoption: a deliberate human/restore action, never routine.
+		// A bare "true" grant is refused: adoption is scoped to the exact node
+		// it was granted for, else a NodeRef move (or a crash before the
+		// annotation is consumed) would silently adopt a DIFFERENT node's
+		// stale database.
 		got.Annotations = map[string]string{adoptDatabaseAnnotation: "true"}
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: staleShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, shardDatabaseReadyCondition)).To(BeFalse(),
+			"an unscoped adoption grant must not adopt")
+
+		// Explicit adoption, scoped to this node: a deliberate human/restore
+		// action, never routine.
+		got.Annotations[adoptDatabaseAnnotation] = string(node.UID)
 		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
 		reconcile()
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: staleShard, Namespace: ns}, &got)).To(Succeed())
