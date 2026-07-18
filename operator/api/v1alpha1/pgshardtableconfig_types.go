@@ -47,16 +47,20 @@ const (
 
 // TableEntry declares one table's sharding configuration. Identifier fields
 // flow into PostgreSQL DDL, so they are constrained at admission to
-// unquoted-identifier syntax (letters/digits/underscore/$, not starting with
-// a digit, ≤63 bytes) to keep untrusted app-team input from injecting DDL.
+// unquoted-identifier syntax (≤63 bytes) to keep untrusted app-team input from
+// injecting DDL — and to LOWERCASE only: PostgreSQL folds unquoted SQL
+// identifiers to lowercase, and the router matches these names byte-exactly
+// against the parser's folded form, so a mixed-case config name (`Orders`)
+// could never match any query and would silently misconfigure routing.
+// Case-sensitive quoted identifiers are not supported in M1.
 type TableEntry struct {
 	// +kubebuilder:default=public
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	Schema string `json:"schema,omitempty"`
 
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
@@ -66,7 +70,7 @@ type TableEntry struct {
 
 	// Column hashed to the keyspace id. Required for sharded tables and
 	// must be part of the primary key (enforced by the schema apply flow).
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
@@ -82,7 +86,7 @@ type TableEntry struct {
 
 // SequenceEntry declares a global sequence hosted on the system shard.
 type SequenceEntry struct {
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 

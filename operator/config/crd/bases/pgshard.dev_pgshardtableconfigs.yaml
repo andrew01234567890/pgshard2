@@ -74,7 +74,7 @@ spec:
                       type: integer
                     name:
                       maxLength: 63
-                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      pattern: ^[a-z_][a-z0-9_$]*$
                       type: string
                   required:
                   - name
@@ -86,17 +86,21 @@ spec:
                   description: |-
                     TableEntry declares one table's sharding configuration. Identifier fields
                     flow into PostgreSQL DDL, so they are constrained at admission to
-                    unquoted-identifier syntax (letters/digits/underscore/$, not starting with
-                    a digit, ≤63 bytes) to keep untrusted app-team input from injecting DDL.
+                    unquoted-identifier syntax (≤63 bytes) to keep untrusted app-team input from
+                    injecting DDL — and to LOWERCASE only: PostgreSQL folds unquoted SQL
+                    identifiers to lowercase, and the router matches these names byte-exactly
+                    against the parser's folded form, so a mixed-case config name (`Orders`)
+                    could never match any query and would silently misconfigure routing.
+                    Case-sensitive quoted identifiers are not supported in M1.
                   properties:
                     name:
                       maxLength: 63
-                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      pattern: ^[a-z_][a-z0-9_$]*$
                       type: string
                     schema:
                       default: public
                       maxLength: 63
-                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      pattern: ^[a-z_][a-z0-9_$]*$
                       type: string
                     sequences:
                       items:
@@ -120,7 +124,7 @@ spec:
                         Column hashed to the keyspace id. Required for sharded tables and
                         must be part of the primary key (enforced by the schema apply flow).
                       maxLength: 63
-                      pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                      pattern: ^[a-z_][a-z0-9_$]*$
                       type: string
                     shardKeyType:
                       description: |-

@@ -154,6 +154,16 @@ var _ = Describe("API validation", func() {
 				ShardKeyColumn: `id"); DROP TABLE x; --`, ShardKeyType: pgshardv1alpha1.ShardKeyInt,
 			},
 		}))).NotTo(Succeed())
+		// A mixed-case identifier is rejected: PostgreSQL folds unquoted SQL
+		// identifiers to lowercase and the router matches config names
+		// byte-exactly against the folded form, so `Orders` could never match
+		// any query — it would silently misconfigure routing.
+		Expect(k8sClient.Create(ctx, tc("tc-case", []pgshardv1alpha1.TableEntry{
+			{
+				Name: "Orders", Type: pgshardv1alpha1.TableSharded,
+				ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt,
+			},
+		}))).NotTo(Succeed())
 		// A sequence-only config (no tables) is admitted — the CEL rule must
 		// not dereference an absent tables list.
 		seqOnly := &pgshardv1alpha1.PgShardTableConfig{
