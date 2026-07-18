@@ -73,9 +73,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 fn is_safe_ident(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// One chunk of the logical-replication stream: an `XLogData` message whose
@@ -133,8 +131,8 @@ impl ReplicationClient {
         loop {
             let (tag, _body) = self.read_control().await?;
             match tag {
-                b'Z' => return Ok(()),      // ReadyForQuery
-                b'S' | b'K' => continue,    // ParameterStatus / BackendKeyData
+                b'Z' => return Ok(()),   // ReadyForQuery
+                b'S' | b'K' => continue, // ParameterStatus / BackendKeyData
                 b'E' => return Err(server_error(&_body)),
                 other => return Err(ClientError::Unexpected(other)),
             }
@@ -234,7 +232,8 @@ impl ReplicationClient {
             )));
         }
         let temp = if temporary { "TEMPORARY " } else { "" };
-        let sql = format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput NOEXPORT_SNAPSHOT");
+        let sql =
+            format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput NOEXPORT_SNAPSHOT");
         self.send_query(&sql).await?;
         // RowDescription / DataRow / CommandComplete, ending at ReadyForQuery.
         loop {

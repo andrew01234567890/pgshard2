@@ -56,8 +56,12 @@ async fn streams_a_real_insert_end_to_end() -> anyhow::Result<()> {
         database: "postgres".to_owned(),
     };
     let mut client = ReplicationClient::connect(&config).await?;
-    client.create_logical_slot("pgshard_test_slot", true).await?;
-    client.start_replication("pgshard_test_slot", "orders_pub").await?;
+    client
+        .create_logical_slot("pgshard_test_slot", true)
+        .await?;
+    client
+        .start_replication("pgshard_test_slot", "orders_pub")
+        .await?;
 
     // Insert after streaming has started so the change is captured.
     setup
