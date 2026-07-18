@@ -77,6 +77,9 @@ impl Freshness {
     /// ordering guard in [`Freshness::install`] would silently ignore a stamp
     /// older than construction time.
     pub fn new() -> Self {
+        // A clock failure stores ZERO, which can never read fresh: age() then
+        // reports max(full uptime, wall age) — far beyond any lease — or
+        // Duration::MAX while the clock keeps failing. Fail closed either way.
         Self(Arc::new(std::sync::RwLock::new((
             boot_now().unwrap_or_default(),
             std::time::SystemTime::now(),
@@ -85,9 +88,22 @@ impl Freshness {
 
     /// A freshness seeded from an existing validation's own stamps —
     /// unconditionally, unlike [`Freshness::install`], because the seed IS the
-    /// first confirmation and construction time is irrelevant to it.
+    /// first confirmation and construction time is irrelevant to it. The
+    /// caller must have checked the validation confirms the view it guards
+    /// (its epoch): seeding from a validation of some OTHER view would grant a
+    /// lease nothing has earned.
     pub fn seeded(v: &SourceValidation) -> Self {
         Self(Arc::new(std::sync::RwLock::new((v.boot, v.wall))))
+    }
+
+    /// A freshness with no confirmation at all: maximal age until the first
+    /// [`Freshness::install`]. For a consumer whose view has not yet been
+    /// confirmed by anything — fail closed until it is.
+    pub fn unconfirmed() -> Self {
+        Self(Arc::new(std::sync::RwLock::new((
+            std::time::Duration::ZERO,
+            std::time::SystemTime::UNIX_EPOCH,
+        ))))
     }
 
     /// Install a source-captured confirmation: the stamp is the moment the

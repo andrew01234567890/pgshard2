@@ -82,8 +82,17 @@ async fn main() -> anyhow::Result<()> {
     }
     // Seed from the initial validation's own stamps: construction time here
     // could be arbitrarily later than the read that produced the snapshot,
-    // and install()'s ordering guard would ignore the older (real) stamp.
-    let freshness = pgshard_topo::Freshness::seeded(&watcher.subscribe_validated().borrow());
+    // and install()'s ordering guard would ignore the older (real) stamp. The
+    // seed must confirm the epoch THIS router serves — a poll may already have
+    // validated a newer source the router has not (or cannot) build — so a
+    // mismatched epoch starts unconfirmed and the leased watch loop earns the
+    // first confirmation instead.
+    let initial_validation = *watcher.subscribe_validated().borrow();
+    let freshness = if initial_validation.epoch == router.load().epoch() {
+        pgshard_topo::Freshness::seeded(&initial_validation)
+    } else {
+        pgshard_topo::Freshness::unconfirmed()
+    };
     tokio::spawn(pgshard_router::watch_topology_leased(
         router.clone(),
         updates,
