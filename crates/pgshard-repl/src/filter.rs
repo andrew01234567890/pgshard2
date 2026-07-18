@@ -61,10 +61,12 @@ pub fn shard_key_index(relation: &Relation, shard_key_column: &str) -> Result<us
 ///   (`'abc   '`) — so a `bpchar` `Text` key would hash differently here and be
 ///   seeded to the wrong shard. The operator must not declare a `char(n)` column
 ///   as `shardKeyType: text`.
-/// - `Bytea` assumes the source's `bytea_output = hex` (the default): pgoutput
-///   then ships `\x…`, which matches the router's own `\x` literal form. Under
-///   `bytea_output = escape` a bytea key fails closed (`Uncoercible`) — rejected,
-///   never misplaced.
+/// - `Bytea` relies on the source shipping `\x…`, which matches the router's own
+///   `\x` literal form. The replication client pins `bytea_output = hex` on its
+///   walsender session (see `client::ReplicationClient::startup`), so this holds
+///   regardless of the source's database/cluster default. Were a stored value
+///   ever to arrive in `escape` form, `coerce_bytea` fails closed (`Uncoercible`)
+///   — rejected, never misplaced.
 pub fn cell_keyspace_id(
     cell: &TupleColumn,
     shard_key_type: ScalarType,
