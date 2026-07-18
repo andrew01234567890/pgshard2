@@ -329,6 +329,13 @@ spec:
                   never been verified, and a name-only latch would keep vouching for a
                   database nobody checked.
                 type: string
+              databasePodUID:
+                description: |-
+                  DatabasePodUID pins the verification to the exact PRIMARY POD it ran
+                  against: a failover promotes a standby whose copy of the database (and
+                  of a just-stamped adoption marker) may not have replicated, so every
+                  primary change re-verifies before the shard is routable again.
+                type: string
               decisionEpoch:
                 description: |-
                   Monotonic failover-decision epoch carried on agent Promote/Fence

@@ -234,6 +234,13 @@ type PgShardShardStatus struct {
 	// +optional
 	DatabaseNodeUID string `json:"databaseNodeUID,omitempty"`
 
+	// DatabasePodUID pins the verification to the exact PRIMARY POD it ran
+	// against: a failover promotes a standby whose copy of the database (and
+	// of a just-stamped adoption marker) may not have replicated, so every
+	// primary change re-verifies before the shard is routable again.
+	// +optional
+	DatabasePodUID string `json:"databasePodUID,omitempty"`
+
 	// +optional
 	TargetPrimary string `json:"targetPrimary,omitempty"`
 

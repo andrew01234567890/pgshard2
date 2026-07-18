@@ -262,6 +262,20 @@ func (r *PgShardNodeReconciler) ensureInstance(
 		if !metav1.IsControlledBy(&pod, node) {
 			return fmt.Errorf("pod %s exists but is not controlled by node %s", name, node.Name)
 		}
+		// Service selectors pin the node UID; a controlled pod created before
+		// that label existed (operator upgrade) is provably this incarnation's
+		// — its owner UID says so — and is backfilled rather than silently
+		// dropped from every service.
+		if pod.Labels[labelNodeUID] != string(node.UID) {
+			patched := pod.DeepCopy()
+			if patched.Labels == nil {
+				patched.Labels = map[string]string{}
+			}
+			patched.Labels[labelNodeUID] = string(node.UID)
+			if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
+				return fmt.Errorf("backfilling node-uid label on pod %s: %w", name, err)
+			}
+		}
 		// A config/image/storage change (including toggling walSeparate on an
 		// existing instance) is rolled out separately — replicas first, primary
 		// last via switchover — never by blind recreation here.
@@ -350,9 +364,21 @@ func (r *PgShardNodeReconciler) preflightStorage(
 		client.MatchingLabels(nodeSelector(node))); err != nil {
 		return nil, err
 	}
+	// Claims are derived from what each existing pod ACTUALLY mounts (its
+	// volume list), not from the current desired layout: toggling
+	// walSeparate off leaves the old pod's WAL claim mounted, and checking
+	// only the desired names would let that claim go unverified.
+	claimsByPod := map[string][]string{}
 	for i := range pods.Items {
-		if metav1.IsControlledBy(&pods.Items[i], node) {
-			instances[pods.Items[i].Name] = true
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, node) {
+			continue
+		}
+		instances[pod.Name] = true
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil {
+				claimsByPod[pod.Name] = append(claimsByPod[pod.Name], vol.PersistentVolumeClaim.ClaimName)
+			}
 		}
 	}
 	names := make([]string, 0, len(instances))
@@ -362,10 +388,15 @@ func (r *PgShardNodeReconciler) preflightStorage(
 	slices.Sort(names)
 	var foreigns []*foreignPVCError
 	for _, name := range names {
-		claims := []string{name + "-data"}
-		if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
-			claims = append(claims, name+"-wal")
+		claims := claimsByPod[name]
+		if len(claims) == 0 {
+			// No pod yet: verify the claims the desired layout will mount.
+			claims = []string{name + "-data"}
+			if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
+				claims = append(claims, name+"-wal")
+			}
 		}
+		slices.Sort(claims)
 		for _, claim := range claims {
 			if err := r.ensurePVC(ctx, node, claim); err != nil {
 				var foreign *foreignPVCError

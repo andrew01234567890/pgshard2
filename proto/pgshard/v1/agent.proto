@@ -258,7 +258,8 @@ message CreateDatabaseRequest {
   // reusable: a request routed to a reassigned address could otherwise land
   // on a different node incarnation — with `adopt`, silently re-stamping the
   // wrong instance's database. When set, an agent whose own pod UID (from
-  // the downward API) differs answers FAILED_PRECONDITION. Empty skips the
+  // the downward API) differs answers ABORTED — a routing accident to retry
+  // against a re-resolved address, never a data verdict. Empty skips the
   // check (legacy caller, or an agent without the downward-API wiring).
   string target_pod_uid = 5;
 }

@@ -111,6 +111,85 @@ var _ = Describe("PgShardNode storage provenance", func() {
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 
+	It("verifies the claims a pod actually mounts, not just the desired layout", func() {
+		const nodeName = "walnode"
+		r := &PgShardNodeReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardNodeSpec{
+				Replicas: 1,
+				Storage: &pgshardv1alpha1.StorageSpec{
+					Size: resource.MustParse("1Gi"), WalSeparate: true,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: nodeName, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile() // pod mounts data AND wal claims
+
+		// The desired layout drops the separate WAL volume, but the running
+		// pod still MOUNTS it: the mounted claim turning foreign must still
+		// degrade the node — checking only the desired names would miss it.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, node)).To(Succeed())
+		node.Spec.Storage.WalSeparate = false
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+		var wal corev1.PersistentVolumeClaim
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0-wal", Namespace: ns}, &wal)).To(Succeed())
+		wal.Labels[labelNodeUID] = "someone-else"
+		Expect(k8sClient.Update(ctx, &wal)).To(Succeed())
+		reconcile()
+		var got pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, storageProvenanceCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Message).To(ContainSubstring(nodeName + "-0-wal"))
+
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("backfills the incarnation label on pods created before it existed", func() {
+		const nodeName = "oldpodnode"
+		r := &PgShardNodeReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: nodeName, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile()
+
+		// Simulate a pod from before the incarnation label existed (operator
+		// upgrade): the uid selector would silently drop it from every
+		// service, so — its owner UID already proving the incarnation — the
+		// label is backfilled instead.
+		var pod corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &pod)).To(Succeed())
+		stripped := pod.DeepCopy()
+		delete(stripped.Labels, labelNodeUID)
+		Expect(k8sClient.Patch(ctx, stripped, client.MergeFrom(&pod))).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &pod)).To(Succeed())
+		Expect(pod.Labels[labelNodeUID]).To(Equal(string(node.UID)),
+			"a pre-upgrade pod must be backfilled, not silently unrouted")
+
+		var got pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
 	It("creates no pod at all while any ordinal's storage is foreign", func() {
 		// Pods are born with a replica role label: creating ordinal 1's pod
 		// while ordinal 0 is foreign would put an unverified instance behind

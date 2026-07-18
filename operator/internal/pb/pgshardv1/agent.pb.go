@@ -2217,7 +2217,8 @@ type CreateDatabaseRequest struct {
 	// reusable: a request routed to a reassigned address could otherwise land
 	// on a different node incarnation — with `adopt`, silently re-stamping the
 	// wrong instance's database. When set, an agent whose own pod UID (from
-	// the downward API) differs answers FAILED_PRECONDITION. Empty skips the
+	// the downward API) differs answers ABORTED — a routing accident to retry
+	// against a re-resolved address, never a data verdict. Empty skips the
 	// check (legacy caller, or an agent without the downward-API wiring).
 	TargetPodUid  string `protobuf:"bytes,5,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
