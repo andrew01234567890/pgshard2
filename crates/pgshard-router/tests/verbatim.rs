@@ -250,3 +250,55 @@ async fn the_verbatim_backend_rejects_a_scatter_where_shards_disagree_on_column_
         other => panic!("expected a 0A000 remote error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_returning_write_reports_its_own_command_tag_not_select() {
+    let pg = Pg::start().await.expect("start postgres");
+    let backend = pg.connect().await.unwrap();
+    backend
+        .batch_execute("CREATE TABLE orders (customer_id int, note text)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO orders (customer_id, note) VALUES (1, 'one')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let proxy = Arc::new(Proxy::new(
+        pgshard_router::shared(
+            Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+        ),
+        backend_creds(),
+    ));
+    let mut client = client(spawn_router(proxy).await).await;
+
+    // A DELETE ... RETURNING is a row-returning write: it must report the DELETE
+    // verb (the frontend appends the affected count), not SELECT.
+    let responses = client
+        .simple_query(
+            DefaultSimpleQueryHandler::new(),
+            "DELETE FROM orders WHERE customer_id = 1 RETURNING note",
+        )
+        .await
+        .expect("delete returning");
+    let Some(Response::Query((tag, _, rows))) = responses.into_iter().next() else {
+        panic!("expected a row-returning response");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(CommandComplete::from(tag).tag, "DELETE 1");
+
+    // SHOW is row-returning but its real tag `SHOW` carries no count; since the
+    // frontend always appends one, the router keeps the default `SELECT n`
+    // rather than emit a spurious `SHOW 1`.
+    let responses = client
+        .simple_query(DefaultSimpleQueryHandler::new(), "SHOW server_version")
+        .await
+        .expect("show");
+    let Some(Response::Query((tag, _, _))) = responses.into_iter().next() else {
+        panic!("expected a row-returning response");
+    };
+    assert_eq!(CommandComplete::from(tag).tag, "SELECT 1");
+}

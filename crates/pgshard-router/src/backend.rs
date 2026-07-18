@@ -38,17 +38,51 @@ use crate::wire::Backend;
 
 /// One statement's result in a backend-agnostic form. Rows carry a schema whose
 /// `FieldInfo`s hold the column type (a real OID on the verbatim backend, text
-/// on the tokio one) plus the already-encoded [`DataRow`]s; a no-row statement
-/// carries the command tag string to send back verbatim.
+/// on the tokio one), the already-encoded [`DataRow`]s, and the command-tag
+/// *prefix* (the verb, plus INSERT's zero oid) — the frontend appends the row
+/// count. A no-row statement carries its full command tag to send back verbatim.
 pub enum BackendResult {
     Rows {
         schema: Arc<Vec<FieldInfo>>,
         rows: Vec<DataRow>,
+        /// Command-tag prefix without the trailing row count, e.g. `"INSERT 0"` /
+        /// `"UPDATE"`, so `INSERT/UPDATE/DELETE ... RETURNING` reports its own
+        /// verb. `None` leaves the frontend's default (`SELECT`), which is right
+        /// for a plain SELECT and for a countless row-returning tag like `SHOW`
+        /// (the frontend always appends a count, so it cannot emit a bare `SHOW`).
+        command_tag: Option<String>,
     },
     Command {
         tag: String,
     },
     Empty,
+}
+
+/// The command-tag prefix of a full tag when it ends with a numeric row count
+/// (which the frontend re-appends from the streamed row count): `"INSERT 0 1"`
+/// -> `Some("INSERT 0")`, `"SELECT 5"` -> `Some("SELECT")`. A tag with no count
+/// (`"SHOW"`) returns `None` — overriding it would make the frontend emit a
+/// spurious `"SHOW 1"`, so the default is kept instead.
+fn counted_tag_prefix(tag: &str) -> Option<String> {
+    match tag.rsplit_once(' ') {
+        Some((prefix, count)) if !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(prefix.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The command-tag prefix for a row-returning DML write (`INSERT/UPDATE/DELETE
+/// ... RETURNING`), else `None`. The text backend cannot see the backend tag, so
+/// it infers the verb from the leading keyword; a non-DML row-returning
+/// statement keeps the frontend default.
+fn dml_tag_prefix(query: &str) -> Option<String> {
+    match command_keyword(query).as_str() {
+        "INSERT" => Some("INSERT 0".to_owned()),
+        "UPDATE" => Some("UPDATE".to_owned()),
+        "DELETE" => Some("DELETE".to_owned()),
+        _ => None,
+    }
 }
 
 /// Run one simple query on a shard database and return one result per statement
@@ -150,6 +184,7 @@ fn text_result(query: &str, messages: Vec<SimpleQueryMessage>) -> PgWireResult<B
         Some(schema) => Ok(BackendResult::Rows {
             rows: encode_text_rows(&schema, &text_rows)?,
             schema,
+            command_tag: dml_tag_prefix(query),
         }),
         None => Ok(BackendResult::Command {
             tag: text_command_tag(query, affected),
@@ -367,9 +402,13 @@ impl SimpleQueryHandler for ResultCollector {
         PgWireClientError: From<<C as Sink<PgWireFrontendMessage>>::Error>,
     {
         match self.pending.take() {
+            // A row-returning statement's real verb (e.g. INSERT 0 / UPDATE for a
+            // RETURNING write) comes from its tag prefix; the frontend re-appends
+            // the row count.
             Some((schema, rows)) => self.out.push(BackendResult::Rows {
                 schema: Arc::new(schema),
                 rows,
+                command_tag: counted_tag_prefix(&message.tag),
             }),
             // The verbatim backend command tag, kept as its raw string.
             None => self.out.push(BackendResult::Command { tag: message.tag }),
@@ -400,5 +439,42 @@ impl SimpleQueryHandler for ResultCollector {
         PgWireClientError: From<<C as Sink<PgWireFrontendMessage>>::Error>,
     {
         Ok(std::mem::take(&mut self.out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{counted_tag_prefix, dml_tag_prefix};
+
+    #[test]
+    fn counted_tag_prefix_strips_a_trailing_row_count() {
+        assert_eq!(counted_tag_prefix("SELECT 5").as_deref(), Some("SELECT"));
+        assert_eq!(
+            counted_tag_prefix("INSERT 0 1").as_deref(),
+            Some("INSERT 0")
+        );
+        assert_eq!(counted_tag_prefix("UPDATE 3").as_deref(), Some("UPDATE"));
+        assert_eq!(counted_tag_prefix("DELETE 0").as_deref(), Some("DELETE"));
+        // A countless tag keeps the frontend default (never a spurious count).
+        assert_eq!(counted_tag_prefix("SHOW"), None);
+        assert_eq!(counted_tag_prefix("EXPLAIN"), None);
+    }
+
+    #[test]
+    fn dml_tag_prefix_matches_only_returning_writes() {
+        assert_eq!(
+            dml_tag_prefix("INSERT INTO t VALUES (1) RETURNING id").as_deref(),
+            Some("INSERT 0")
+        );
+        assert_eq!(
+            dml_tag_prefix("UPDATE t SET x=1 RETURNING x").as_deref(),
+            Some("UPDATE")
+        );
+        assert_eq!(
+            dml_tag_prefix("DELETE FROM t RETURNING id").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(dml_tag_prefix("SELECT * FROM t"), None);
+        assert_eq!(dml_tag_prefix("SHOW search_path"), None);
     }
 }
