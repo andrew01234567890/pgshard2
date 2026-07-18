@@ -86,6 +86,53 @@ type instanceView struct {
 	// this reconcile. A false value means "unknown", not "down": the other
 	// fields are their zero values and must not be read as fact.
 	observed bool
+	// systemID is the PostgreSQL system identifier the agent reported (0 when
+	// unreported); timeline likewise. Identity fencing happens BEFORE the
+	// election (partitionByIdentity), so the election logic itself never sees
+	// an instance whose WAL positions are not comparable.
+	systemID uint64
+	timeline int32
+}
+
+// partitionByIdentity drops views whose reported identity cannot belong to
+// this data lineage, so the election never compares WAL positions across
+// unrelated histories:
+//
+//   - a system identifier different from the latched one is FOREIGN data (a
+//     reused PVC, a restored volume) — its LSNs are meaningless here, and
+//     electing it would serve another database's contents;
+//   - a timeline AHEAD of the confirmed primary's, without an
+//     operator-driven promotion, is a split-brain artifact (something
+//     promoted itself) and is never electable. A timeline BEHIND the
+//     recorded one is deliberately NOT fenced here: a healthy standby
+//     legitimately lags the new timeline for a moment after every
+//     promotion, and telling that apart from an abandoned branch requires
+//     the timeline history file — agent work tracked with process
+//     supervision. The election's own most-advanced-LSN guard still applies
+//     to those.
+//
+// A zero on either side fences nothing — identity not yet latched, or an
+// instance that did not report — the election's confirmed-role requirements
+// still apply to those. Excluded pod names are returned for loud reporting;
+// exclusion must never be silent.
+func partitionByIdentity(
+	views []instanceView, systemID uint64, timeline int32,
+) (kept []instanceView, excluded []string) {
+	kept = make([]instanceView, 0, len(views))
+	for _, v := range views {
+		foreignID := systemID != 0 && v.systemID != 0 && v.systemID != systemID
+		divergentTL := timeline != 0 && v.timeline > timeline
+		// The instance currently claiming primary is never dropped from the
+		// view set: the handshake must keep tracking it (and its identity
+		// mismatch is reported); it is the ELECTION that must not choose a
+		// mismatched replacement, and candidates require the standby role.
+		if (foreignID || divergentTL) && !v.isPrimary {
+			excluded = append(excluded, v.pod)
+			continue
+		}
+		kept = append(kept, v)
+	}
+	return kept, excluded
 }
 
 // instanceSummary is the fold of one failover snapshot: the flags and running

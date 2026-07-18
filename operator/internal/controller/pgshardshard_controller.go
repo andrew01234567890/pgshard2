@@ -650,6 +650,8 @@ func (r *PgShardShardReconciler) aggregateStatus(
 				state.Ready = status.Ready
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)
+				view.systemID = status.SystemId
+				view.timeline = int32(status.Timeline)
 				view.walReceiver = status.WalReceiverActive
 				switch status.Role {
 				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
@@ -674,6 +676,26 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	// writes to a stale primary).
 	shard.Status.CurrentPrimary, shard.Status.Phase =
 		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
+
+	// Latch the data lineage identity and fence divergent instances out of the
+	// election — the same guard as the node controller (this is the legacy
+	// physical path for un-placed shards).
+	for _, v := range views {
+		if v.isPrimary && v.observed {
+			if v.systemID != 0 && shard.Status.SystemID == "" {
+				shard.Status.SystemID = strconv.FormatUint(v.systemID, 10)
+			}
+			if v.timeline != 0 {
+				shard.Status.Timeline = v.timeline
+			}
+		}
+	}
+	expectedID, _ := strconv.ParseUint(shard.Status.SystemID, 10, 64)
+	views, excluded := partitionByIdentity(views, expectedID, shard.Status.Timeline)
+	if len(excluded) > 0 {
+		logf.FromContext(ctx).Info("instances fenced from election: identity mismatch",
+			"shard", shard.Name, "pods", excluded)
+	}
 
 	// Drive the target/current-primary handshake: track the healthy primary, or
 	// elect and promote a replacement when it is gone.

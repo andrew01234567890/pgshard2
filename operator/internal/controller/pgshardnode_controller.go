@@ -19,11 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -447,6 +450,8 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)
 				view.walReceiver = status.WalReceiverActive
+				view.systemID = status.SystemId
+				view.timeline = int32(status.Timeline)
 				switch status.Role {
 				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
 					state.Role = roleLabelPrimary
@@ -470,6 +475,45 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	// writes to a stale primary).
 	node.Status.CurrentPrimary, node.Status.Phase =
 		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
+
+	// Latch the data lineage identity from the confirmed primary (never
+	// overwritten once set) and keep the primary timeline current, then fence
+	// divergent instances out of the election: a foreign system id is another
+	// database's data, and a divergent timeline makes WAL positions
+	// incomparable.
+	for _, v := range views {
+		if v.isPrimary && v.observed {
+			if v.systemID != 0 && node.Status.SystemID == "" {
+				node.Status.SystemID = strconv.FormatUint(v.systemID, 10)
+			}
+			if v.timeline != 0 {
+				node.Status.Timeline = v.timeline
+			}
+		}
+	}
+	expectedID, _ := strconv.ParseUint(node.Status.SystemID, 10, 64)
+	views, excluded := partitionByIdentity(views, expectedID, node.Status.Timeline)
+	if len(excluded) > 0 {
+		logf.FromContext(ctx).Info("instances fenced from election: identity mismatch",
+			"node", node.Name, "pods", excluded)
+	}
+	if node.Status.SystemID != "" {
+		cond := metav1.Condition{
+			Type:               "IdentityConsistent",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Latched",
+			Message:            "all observed instances match the latched system identity",
+			ObservedGeneration: node.Generation,
+		}
+		if len(excluded) > 0 {
+			cond.Status = metav1.ConditionFalse
+			cond.Reason = "ForeignInstance"
+			cond.Message = fmt.Sprintf(
+				"instances fenced from election (foreign system id or divergent timeline): %s",
+				strings.Join(excluded, ", "))
+		}
+		apimeta.SetStatusCondition(&node.Status.Conditions, cond)
+	}
 
 	// Drive the target/current-primary handshake: track the healthy primary, or
 	// elect and promote a replacement when it is gone.

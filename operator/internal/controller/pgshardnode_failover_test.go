@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -299,5 +300,97 @@ var _ = Describe("PgShardNode failover", func() {
 		Expect(replicaAgent.AppliedEpoch()).To(Equal(uint64(0)))
 
 		Expect(k8sClient.Delete(ctx, &back)).To(Succeed())
+	})
+})
+
+var _ = Describe("PgShardNode failover identity fencing", func() {
+	const ns = "default"
+	const idNode = "idnode"
+
+	It("never elects a foreign-identity or divergent-timeline instance, whatever its LSN", func() {
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(primaryAgent.Stop)
+		matchingAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(matchingAgent.Stop)
+		foreignAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(foreignAgent.Stop)
+
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		matchingAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		foreignAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		// The foreign instance carries another database's data (reused PVC):
+		// different system identifier, and the most advanced LSN — the exact
+		// candidate raw LSN comparison would wrongly elect.
+		foreignAgent.SetSystemID(9999)
+		foreignAgent.SetReceivedLSN(500)
+		matchingAgent.SetReceivedLSN(300)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			switch host {
+			case primaryPodIP:
+				return primaryAgent.Client()
+			case replicaPodIP:
+				return matchingAgent.Client()
+			default:
+				return foreignAgent.Client()
+			}
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: idNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 3},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: idNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: idNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("idnode-0", primaryPodIP)
+		stampPodIP("idnode-1", replicaPodIP)
+		stampPodIP("idnode-2", "127.0.0.4")
+
+		// The confirmed primary latches the lineage identity and timeline.
+		reconcile()
+		got := get()
+		Expect(got.Status.SystemID).To(Equal("4242"))
+		Expect(got.Status.Timeline).To(Equal(int32(1)))
+
+		// Primary dies: the election must skip the foreign instance despite
+		// its higher LSN and choose the matching replica.
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		primaryAgent.SetReady(false)
+		reconcile() // election pass
+		elected := get()
+		Expect(elected.Status.TargetPrimary).To(Equal("idnode-1"),
+			"the foreign-identity instance must never win an election")
+		cond := apimeta.FindStatusCondition(elected.Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(string(cond.Status)).To(Equal("False"))
+		Expect(cond.Message).To(ContainSubstring("idnode-2"))
+
+		// A timeline AHEAD of the recorded one (a self-promoted split-brain
+		// artifact) is fenced the same way: make the previously-foreign agent
+		// matching in identity but ahead in timeline — still excluded.
+		foreignAgent.SetSystemID(4242)
+		foreignAgent.SetTimeline(9)
+		reconcile()
+		Expect(get().Status.TargetPrimary).To(Equal("idnode-1"))
+
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
 	})
 })
