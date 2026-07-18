@@ -57,6 +57,12 @@ pub struct CopySpec<'a> {
 /// from (see [`crate::client::ReplicationClient::create_logical_slot_exported`]),
 /// and this must run while that replication connection is still idle.
 ///
+/// The `target` role must be allowed to set `session_replication_role`
+/// (superuser, or `GRANT SET ON PARAMETER session_replication_role`): the copy
+/// runs under replica session semantics so the target's ordinary triggers do
+/// not fire on seeded rows. A role without that privilege fails the copy
+/// loudly before any row moves.
+///
 /// The target COPY runs inside an explicit transaction committed only after the
 /// COPY has fully completed, so an error — or this future being dropped — never
 /// leaves partially or invisibly committed rows behind: an uncommitted target
@@ -103,32 +109,67 @@ pub async fn copy_filtered(
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(CopyError::Source)?;
+    // row_security=off makes RLS fail closed for the seed: if a policy would
+    // filter the table for this role, COPY errors instead of silently omitting
+    // rows that the stream (which reads WAL, not queries) would then never
+    // deliver either. The output-shaping GUCs mirror the replication client's
+    // startup pins so the copied text is byte-identical to the streamed text.
     let setup = source
         .batch_execute(&format!(
-            "SET TRANSACTION SNAPSHOT '{snapshot}'; SET bytea_output = 'hex'"
+            "SET TRANSACTION SNAPSHOT '{snapshot}'; \
+             SET LOCAL row_security = off; \
+             SET LOCAL bytea_output = 'hex'; \
+             SET LOCAL DateStyle = 'ISO'; \
+             SET LOCAL IntervalStyle = 'postgres'; \
+             SET LOCAL extra_float_digits = 3"
         ))
         .await
         .map_err(CopyError::Source);
 
+    // From here on, no early return: every path falls through to the source
+    // ROLLBACK below, so a failure part-way (e.g. the target role lacking the
+    // session_replication_role privilege after its BEGIN already ran) cannot
+    // strand either caller-owned session in an open or aborted transaction.
     let result = match setup {
         Ok(()) => {
-            target
-                .batch_execute("BEGIN")
+            // replica role keeps the target's ordinary triggers from firing on
+            // seeded rows (COPY FROM invokes triggers); the source already
+            // materialized their effects. DateStyle=ISO parses the source's
+            // pinned ISO output unambiguously whatever the target's default.
+            let target_setup = target
+                .batch_execute(
+                    "BEGIN; \
+                     SET LOCAL session_replication_role = replica; \
+                     SET LOCAL DateStyle = 'ISO'; \
+                     SET LOCAL IntervalStyle = 'postgres'",
+                )
                 .await
-                .map_err(CopyError::Target)?;
-            let copied =
-                stream_filtered(source, target, &table, &col_list, key_index, spec, shard_fn).await;
-            match copied {
-                Ok(n) => {
-                    // Rows become visible only here, after the COPY fully
-                    // completed — never part-way through a dropped future.
-                    target
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(CopyError::Target)?;
-                    Ok(n)
+                .map_err(CopyError::Target);
+            match target_setup {
+                Ok(()) => {
+                    let copied = stream_filtered(
+                        source, target, &table, &col_list, key_index, spec, shard_fn,
+                    )
+                    .await;
+                    match copied {
+                        Ok(n) => {
+                            // Rows become visible only here, after the COPY fully
+                            // completed — never part-way through a dropped future.
+                            target
+                                .batch_execute("COMMIT")
+                                .await
+                                .map_err(CopyError::Target)
+                                .map(|()| n)
+                        }
+                        Err(e) => {
+                            let _ = target.batch_execute("ROLLBACK").await;
+                            Err(e)
+                        }
+                    }
                 }
                 Err(e) => {
+                    // BEGIN may have succeeded before a later statement in the
+                    // batch failed, leaving the target in an aborted transaction.
                     let _ = target.batch_execute("ROLLBACK").await;
                     Err(e)
                 }

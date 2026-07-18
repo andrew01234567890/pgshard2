@@ -20,14 +20,15 @@ async fn connect_db(pg: &Pg, db: &str) -> anyhow::Result<tokio_postgres::Client>
     Ok(client)
 }
 
-/// Drive the stream until one transaction commits. Deliberately does **not**
-/// confirm progress back to the slot, modelling a consumer that crashed after
-/// committing to the target but before the slot advanced.
+/// Drive the stream until one transaction commits, returning that commit's
+/// `(commit_lsn, end_lsn)`. Deliberately does **not** confirm progress back to
+/// the slot, modelling a consumer that crashed after committing to the target
+/// but before the slot advanced.
 async fn apply_one_txn(
     client: &mut ReplicationClient,
     decoder: &mut PgOutputDecoder,
     applier: &mut Applier,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(pgshard_core::Lsn, pgshard_core::Lsn)> {
     let run = async {
         loop {
             let frame = client
@@ -35,10 +36,14 @@ async fn apply_one_txn(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("stream ended early"))?;
             let msg = decoder.decode(&frame.data)?;
-            let committed = matches!(msg, LogicalRepMsg::Commit(_));
+            let committed = if let LogicalRepMsg::Commit(c) = &msg {
+                Some((c.commit_lsn, c.end_lsn))
+            } else {
+                None
+            };
             applier.handle(&msg).await?;
-            if committed {
-                return anyhow::Ok(());
+            if let Some(lsns) = committed {
+                return anyhow::Ok(lsns);
             }
         }
     };
@@ -111,7 +116,12 @@ async fn applies_a_transaction_exactly_once_across_a_slot_replay() -> anyhow::Re
         "the fresh applier must resume from the persisted checkpoint"
     );
     let mut decoder = PgOutputDecoder::new(4);
-    apply_one_txn(&mut client, &mut decoder, &mut applier).await?;
+    let (_, replay_end) = apply_one_txn(&mut client, &mut decoder, &mut applier).await?;
+
+    // Even a skipped replay advances the ack position: the transaction is
+    // already durable here, so its end is safe to confirm — without this the
+    // final transaction would be re-sent on every reconnect forever.
+    assert!(applier.ack_lsn() >= replay_end);
 
     // The replayed transaction was at/below the checkpoint, so it was skipped —
     // the target still holds exactly the two rows, not four.
@@ -177,5 +187,79 @@ async fn applies_updates_and_deletes() -> anyhow::Result<()> {
         .await?;
     let got: Vec<(i32, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
     assert_eq!(got, vec![(1, "z".to_owned())]);
+    Ok(())
+}
+
+/// Replicated rows must not re-fire the target's ordinary triggers (the source
+/// already materialized their effects), and the applier must expose a durable
+/// ack position at least as far as its commit checkpoint.
+#[tokio::test]
+async fn replica_role_suppresses_target_triggers() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION trig_pub FOR TABLE orders;",
+        )
+        .await?;
+
+    source.batch_execute("CREATE DATABASE trig_target").await?;
+    let checker = connect_db(&pg, "trig_target").await?;
+    checker
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE TABLE audit (id int);
+             CREATE FUNCTION audit_ins() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO audit VALUES (NEW.id); RETURN NEW; END $$;
+             CREATE TRIGGER orders_audit AFTER INSERT ON orders
+               FOR EACH ROW EXECUTE FUNCTION audit_ins();",
+        )
+        .await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    let mut client = ReplicationClient::connect(&config).await?;
+    client.create_logical_slot("trig_slot", true).await?;
+    client.start_replication("trig_slot", "trig_pub").await?;
+
+    source
+        .batch_execute("INSERT INTO orders VALUES (7, 'x')")
+        .await?;
+
+    let mut applier = Applier::new(connect_db(&pg, "trig_target").await?, "trig-consumer").await?;
+    let mut decoder = PgOutputDecoder::new(4);
+    let (commit_lsn, end_lsn) = apply_one_txn(&mut client, &mut decoder, &mut applier).await?;
+
+    let applied: i64 = checker
+        .query_one("SELECT count(*) FROM orders", &[])
+        .await?
+        .get(0);
+    assert_eq!(applied, 1);
+    let audit: i64 = checker
+        .query_one("SELECT count(*) FROM audit", &[])
+        .await?
+        .get(0);
+    assert_eq!(audit, 0, "target trigger fired on a replicated row");
+
+    // The ack position is the transaction's durable END — past its commit
+    // record, not the commit LSN itself — so the slot can release the
+    // transaction's WAL instead of replaying it forever.
+    assert_eq!(applier.checkpoint(), commit_lsn);
+    assert!(
+        end_lsn > commit_lsn,
+        "end_lsn must lie past the commit record"
+    );
+    assert_eq!(applier.ack_lsn(), end_lsn);
+
+    // And it is persisted: a fresh applier loads the same ack position.
+    let reloaded = Applier::new(connect_db(&pg, "trig_target").await?, "trig-consumer").await?;
+    assert_eq!(reloaded.checkpoint(), commit_lsn);
+    assert_eq!(reloaded.ack_lsn(), end_lsn);
     Ok(())
 }

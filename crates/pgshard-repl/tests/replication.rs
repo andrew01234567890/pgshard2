@@ -117,3 +117,101 @@ async fn bytea_streams_as_hex_despite_source_escape_default() -> anyhow::Result<
     assert_eq!(values, vec![br"\xdeadbeef".to_vec()]);
     Ok(())
 }
+
+/// Persistent slots must be failover-enabled so the operator's slot
+/// synchronization carries them to standbys; a source-primary failover must not
+/// strand the consumer into a full reseed.
+#[tokio::test]
+async fn persistent_slots_are_failover_enabled() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let setup = pg.connect().await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    let mut client = ReplicationClient::connect(&config).await?;
+    client
+        .create_logical_slot("pgshard_failover_slot", false)
+        .await?;
+
+    let failover: bool = setup
+        .query_one(
+            "SELECT failover FROM pg_replication_slots WHERE slot_name = 'pgshard_failover_slot'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        failover,
+        "persistent slot was not created with FAILOVER true"
+    );
+
+    drop(client);
+    setup
+        .execute(
+            "SELECT pg_drop_replication_slot('pgshard_failover_slot')",
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The startup packet pins DateStyle/IntervalStyle/extra_float_digits, so the
+/// stream's text is stable even when the source database defaults are hostile:
+/// without the pins, `SQL, DMY` DateStyle would ship 2026-02-01 as
+/// `01/02/2026`, which an MDY consumer mis-parses as January 2nd.
+#[tokio::test]
+async fn stream_text_is_stable_under_hostile_source_defaults() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let setup = pg.connect().await?;
+    setup
+        .batch_execute(
+            "CREATE TABLE events (id int PRIMARY KEY, at date, took interval, ratio float8);
+             CREATE PUBLICATION events_pub FOR TABLE events;
+             ALTER DATABASE postgres SET DateStyle = 'SQL, DMY';
+             ALTER DATABASE postgres SET IntervalStyle = 'sql_standard';",
+        )
+        .await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    // Connects after the ALTER DATABASE, so without the startup pins the
+    // walsender would inherit the hostile defaults.
+    let mut client = ReplicationClient::connect(&config).await?;
+    client.create_logical_slot("pgshard_guc_slot", true).await?;
+    client
+        .start_replication("pgshard_guc_slot", "events_pub")
+        .await?;
+
+    setup
+        .execute(
+            "INSERT INTO events VALUES (1, date '2026-02-01', interval '1 day 2 hours', 0.1)",
+            &[],
+        )
+        .await?;
+
+    let mut decoder = PgOutputDecoder::new(4);
+    let values = read_insert(&mut client, &mut decoder).await?;
+    assert_eq!(
+        values[1],
+        b"2026-02-01".to_vec(),
+        "date must ship in ISO form"
+    );
+    assert_eq!(
+        values[2],
+        b"1 day 02:00:00".to_vec(),
+        "interval must ship in postgres style"
+    );
+    // extra_float_digits=3 ships the shortest exact form of 0.1.
+    assert_eq!(values[3], b"0.1".to_vec());
+    Ok(())
+}
