@@ -41,8 +41,12 @@ pub use pgshard_topo::Instance as Endpoint;
 pub enum BuildError {
     #[error("sharded table {0} has no shard key column")]
     MissingShardKey(TableName),
+    #[error("sharded table {0} has no shard key type")]
+    MissingShardKeyType(TableName),
     #[error("duplicate serving shard name {0:?}")]
     DuplicateShard(String),
+    #[error("topology carries {0} gate(s) but this router does not enforce gates yet")]
+    UnsupportedGates(usize),
     #[error(transparent)]
     VSchema(#[from] VSchemaError),
     #[error("serving shards do not partition the keyspace: {0}")]
@@ -97,9 +101,17 @@ pub struct Router {
 
 impl Router {
     /// Build a router from a compiled topology. Fails if a sharded table lacks a
-    /// shard key, the hash function is unknown, or the serving shards do not
-    /// partition the keyspace.
+    /// shard key or key type, the hash function is unknown, the serving shards do
+    /// not partition the keyspace, or the topology carries gates.
     pub fn build(topo: &Topology) -> Result<Self, BuildError> {
+        // Gates are buffering directives ("hold writes for this cutover"); this
+        // router does not enforce them yet, and silently executing gated traffic
+        // would defeat the cutover they protect. Refuse the snapshot instead —
+        // the watcher keeps serving the last good epoch — until the gate engine
+        // is wired into dispatch.
+        if !topo.gates.is_empty() {
+            return Err(BuildError::UnsupportedGates(topo.gates.len()));
+        }
         let vschema = build_vschema(topo)?;
 
         let mut serving: Vec<(KeyRange, ShardId)> = Vec::new();
@@ -262,9 +274,18 @@ fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {
                     .shard_key_column
                     .clone()
                     .ok_or_else(|| BuildError::MissingShardKey(name.clone()))?;
+                // An untyped key would hash the SQL literal's spelling instead of
+                // the column's value, so `'1'` and `1` could land on different
+                // shards. The operator has required a declared type since the
+                // typed-hashing change; a topology without one is malformed and
+                // is refused rather than routed by guesswork.
+                let shard_key_type = t
+                    .shard_key_type
+                    .map(map_shard_key_type)
+                    .ok_or_else(|| BuildError::MissingShardKeyType(name.clone()))?;
                 TableDef::Sharded {
                     shard_key_column,
-                    shard_key_type: t.shard_key_type.map(map_shard_key_type),
+                    shard_key_type: Some(shard_key_type),
                     shard_function: topo.hash_function.clone(),
                     sequences: t
                         .sequences
@@ -514,6 +535,36 @@ mod tests {
         assert!(matches!(
             Router::build(&dup),
             Err(BuildError::DuplicateShard(_))
+        ));
+
+        // A sharded table without a declared key type would hash the SQL
+        // literal's spelling instead of the column value — refuse it.
+        let mut untyped = orders();
+        untyped.shard_key_type = None;
+        let untyped = topology(vec![shard("s0", "-", Some("a"))], vec![untyped]);
+        assert!(matches!(
+            Router::build(&untyped),
+            Err(BuildError::MissingShardKeyType(_))
+        ));
+
+        // Gates are not enforced by this router yet; a topology carrying one
+        // must be refused (the watcher keeps the last good epoch), never served
+        // with its gate silently ignored.
+        let mut gated = topology(vec![shard("s0", "-", Some("a"))], vec![orders()]);
+        gated.gates.push(pgshard_topo::GateSpec {
+            id: "cutover-1".into(),
+            match_: pgshard_topo::GateMatch {
+                all: true,
+                tables: Vec::new(),
+                key_ranges: Vec::new(),
+            },
+            mode: pgshard_topo::GateMode::BufferWrites,
+            deadline: "2026-07-18T00:00:00Z".into(),
+            min_topology_generation: 0,
+        });
+        assert!(matches!(
+            Router::build(&gated),
+            Err(BuildError::UnsupportedGates(1))
         ));
     }
 

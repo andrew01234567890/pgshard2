@@ -146,6 +146,18 @@ async fn routes_single_shard_reads_and_writes_through_to_the_backend() {
     // Explicit transaction control is rejected, not silently autocommitted.
     let err = client.simple_query("BEGIN").await.unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+
+    // A leading comment must not smuggle transaction control past the reject:
+    // the classification is from the parsed AST, not the leading token. A
+    // client that believes it opened a transaction while its statements
+    // autocommit would be a wrong-data outcome.
+    let err = client.simple_query("/* x */ BEGIN").await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
+    let err = client
+        .simple_query("/* sneak */ SAVEPOINT s1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("0A000"));
 }
 
 /// A topology with two serving shards (databases `sh0`, `sh1`) on the same node,
@@ -503,4 +515,30 @@ async fn an_insert_needing_a_sequence_without_one_configured_errors() {
         .await
         .unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("55000"));
+}
+
+/// A topology whose only serving shard has no primary (failover in flight):
+/// a session-local statement must fail like any unavailable route — never
+/// return a fabricated CommandComplete for work that ran nowhere.
+#[tokio::test]
+async fn no_primary_fails_local_statements_instead_of_fabricating_success() {
+    let mut topo = single_shard_topology("127.0.0.1", 1);
+    topo.shards[0].primary = None;
+    let router = pgshard_router::shared(Router::build(&topo).unwrap());
+    let proxy = Arc::new(Proxy::new(
+        router,
+        Backend {
+            user: "postgres".into(),
+            password: "postgres".into(),
+            system_database: "postgres".into(),
+        },
+    ));
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let err = client.simple_query("SELECT 1").await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("57P01"));
 }
