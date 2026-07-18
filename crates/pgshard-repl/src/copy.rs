@@ -56,6 +56,15 @@ pub struct CopySpec<'a> {
 /// `snapshot` must be the snapshot exported by the slot the stream will resume
 /// from (see [`crate::client::ReplicationClient::create_logical_slot_exported`]),
 /// and this must run while that replication connection is still idle.
+///
+/// The target COPY runs inside an explicit transaction committed only after the
+/// COPY has fully completed, so an error — or this future being dropped — never
+/// leaves partially or invisibly committed rows behind: an uncommitted target
+/// transaction aborts when the session ends. The one irreducible ambiguity is a
+/// drop during the final COMMIT itself (the classic in-doubt commit); a caller
+/// that cancels this future must therefore discard both connections and have the
+/// seeding workflow decide completion from its own durable marker, never from
+/// the absence of an `Ok` here.
 pub async fn copy_filtered(
     source: &Client,
     target: &Client,
@@ -87,20 +96,52 @@ pub async fn copy_filtered(
     // Bind the exported snapshot so the copy sees exactly the slot's consistent
     // point. SET TRANSACTION SNAPSHOT must precede the first query; bytea_output
     // is pinned to hex so a bytea shard key decodes the same as the stream's.
+    // BEGIN runs separately so a failure to import the snapshot (e.g. the
+    // exporting connection died) can still roll the source session back instead
+    // of stranding it in an aborted transaction.
     source
-        .batch_execute(&format!(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
-             SET TRANSACTION SNAPSHOT '{snapshot}'; \
-             SET bytea_output = 'hex'"
-        ))
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(CopyError::Source)?;
+    let setup = source
+        .batch_execute(&format!(
+            "SET TRANSACTION SNAPSHOT '{snapshot}'; SET bytea_output = 'hex'"
+        ))
+        .await
+        .map_err(CopyError::Source);
 
-    let result =
-        stream_filtered(source, target, &table, &col_list, key_index, spec, shard_fn).await;
+    let result = match setup {
+        Ok(()) => {
+            target
+                .batch_execute("BEGIN")
+                .await
+                .map_err(CopyError::Target)?;
+            let copied =
+                stream_filtered(source, target, &table, &col_list, key_index, spec, shard_fn).await;
+            match copied {
+                Ok(n) => {
+                    // Rows become visible only here, after the COPY fully
+                    // completed — never part-way through a dropped future.
+                    target
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(CopyError::Target)?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = target.batch_execute("ROLLBACK").await;
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    };
 
-    // Always end the source transaction, even on error.
-    let _ = source.batch_execute("COMMIT").await;
+    // Always end the read-only source transaction; ROLLBACK also clears an
+    // aborted state after a failed snapshot import. Best-effort: on the success
+    // path the data is already committed on the target, and failing the whole
+    // copy over a source-session cleanup hiccup would be a false failure.
+    let _ = source.batch_execute("ROLLBACK").await;
     result
 }
 

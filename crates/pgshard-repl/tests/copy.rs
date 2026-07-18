@@ -113,3 +113,48 @@ async fn copies_only_rows_in_the_target_range() -> anyhow::Result<()> {
     assert!(sample.contains('\t') && sample.contains('\\'));
     Ok(())
 }
+
+/// A snapshot that passes the charset guard but does not exist: the import
+/// fails inside the source transaction. The copy must report the error, leave
+/// the source session usable (rolled back, not stranded in an aborted
+/// transaction), and leave zero rows on the target.
+#[tokio::test]
+async fn failed_snapshot_import_leaves_sessions_clean() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source.batch_execute(DDL).await?;
+    source
+        .execute(
+            "INSERT INTO orders (id, customer_id, note) VALUES (1, 1, 'x')",
+            &[],
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE seed_fail").await?;
+    let target = connect_db(&pg, "seed_fail").await?;
+    target.batch_execute(DDL).await?;
+
+    let shard_fn = shard_function("xxhash64_v1").unwrap();
+    let columns = vec!["id".to_owned(), "customer_id".to_owned(), "note".to_owned()];
+    let spec = CopySpec {
+        schema: "public",
+        table: "orders",
+        columns: &columns,
+        shard_key_column: "customer_id",
+        shard_key_type: ScalarType::Int,
+        target_range: KeyRange::new(0, None)?,
+    };
+    let err = copy_filtered(&source, &target, "deadbeef-1", &spec, shard_fn).await;
+    assert!(err.is_err(), "nonexistent snapshot must fail the copy");
+
+    // The source session must be immediately usable — a stranded aborted
+    // transaction would fail this query with 25P02.
+    let one: i32 = source.query_one("SELECT 1", &[]).await?.get(0);
+    assert_eq!(one, 1);
+
+    let count: i64 = target
+        .query_one("SELECT count(*) FROM orders", &[])
+        .await?
+        .get(0);
+    assert_eq!(count, 0);
+    Ok(())
+}
