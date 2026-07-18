@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
 	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
+	"github.com/andrew01234567890/pgshard2/operator/internal/pgconfig"
 )
 
 // labelNode selects the pods, PVCs, and services of one physical node. A node
@@ -106,6 +108,11 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	if err := r.syncRoleLabels(ctx, &node); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Apply a pending postgresql config change: reload in place for reload-only
+	// parameters (a restart-requiring change is left pending for the rollout).
+	if err := r.reconcileConfig(ctx, &node); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Prune only the pods this reconcile confirmed are ready replicas — never a
@@ -546,6 +553,105 @@ func (r *PgShardNodeReconciler) pollAgent(
 		return nil, fmt.Errorf("agent %s returned an empty status", host)
 	}
 	return resp.GetStatus(), nil
+}
+
+// reconcileConfig brings the running PostgreSQL up to the node's rendered
+// configuration. A change whose parameters are all reload-only is applied in
+// place via each agent's ReloadConfig; a change that needs a restart is left
+// pending (AppliedConfigHash keeps lagging so the drift stays visible) for the
+// rolling-restart workflow. The parameter set actually applied is recorded so
+// the next change can be classified against it.
+func (r *PgShardNodeReconciler) reconcileConfig(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) error {
+	log := logf.FromContext(ctx)
+	desiredHash := node.Spec.PostgresConfigHash
+	if desiredHash == "" || node.Status.AppliedConfigHash == desiredHash {
+		return nil
+	}
+
+	cmName, err := configMapName(node.Name)
+	if err != nil {
+		return err
+	}
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: cmName}, &cm); err != nil {
+		// The rendered config is not materialized yet; a later reconcile retries.
+		return client.IgnoreNotFound(err)
+	}
+	desired := configMapParameters(&cm)
+
+	// First observation of this node's config: the instances were created with
+	// it (baked into the pod spec and its mounted ConfigMap), so record it as
+	// applied without a reload.
+	if node.Status.AppliedParameters == nil {
+		return r.recordAppliedConfig(ctx, node, desiredHash, desired)
+	}
+
+	reload, restart := pgconfig.ClassifyDiff(node.Status.AppliedParameters, desired)
+	if len(restart) > 0 {
+		// A restart-requiring change is out of scope for an in-place reload;
+		// leave the applied hash lagging so the pending drift stays observable.
+		log.Info("postgres config change needs a restart; leaving pending", "parameters", restart)
+		return nil
+	}
+	if len(reload) > 0 {
+		if err := r.reloadInstances(ctx, node); err != nil {
+			return err
+		}
+		log.Info("reloaded postgres config", "parameters", reload)
+	}
+	return r.recordAppliedConfig(ctx, node, desiredHash, desired)
+}
+
+func (r *PgShardNodeReconciler) recordAppliedConfig(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, hash string, params map[string]string,
+) error {
+	node.Status.AppliedConfigHash = hash
+	node.Status.AppliedParameters = params
+	return r.Status().Update(ctx, node)
+}
+
+// reloadInstances calls ReloadConfig on every reachable instance of the node so
+// each re-reads its (already-updated) config file.
+func (r *PgShardNodeReconciler) reloadInstances(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) error {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(node.Namespace),
+		client.MatchingLabels(nodeSelector(node))); err != nil {
+		return err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, node) || pod.Status.PodIP == "" {
+			continue
+		}
+		agent, err := r.agentClient(pod.Status.PodIP, agentPort)
+		if err != nil {
+			return err
+		}
+		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err = agent.ReloadConfig(callCtx, &pgshardv1.ReloadConfigRequest{})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("reloading config on %s: %w", pod.Name, err)
+		}
+	}
+	return nil
+}
+
+// configMapParameters extracts the postgresql parameters from a rendered-config
+// ConfigMap, whose parameter keys are prefixed `param.`.
+func configMapParameters(cm *corev1.ConfigMap) map[string]string {
+	params := make(map[string]string, len(cm.Data))
+	for k, v := range cm.Data {
+		if name, ok := strings.CutPrefix(k, "param."); ok {
+			params[name] = v
+		}
+	}
+	return params
 }
 
 // syncRoleLabels moves the primary/replica labels to match polled reality,

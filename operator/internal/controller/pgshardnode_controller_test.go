@@ -32,6 +32,13 @@ import (
 	"github.com/andrew01234567890/pgshard2/operator/test/fakes"
 )
 
+// Shared postgres config-hash fixtures used across node/shard controller tests.
+const (
+	configHash1 = "hash-1"
+	configHash2 = "hash-2"
+	configHash3 = "hash-3"
+)
+
 var _ = Describe("PgShardNode lifecycle", func() {
 	const ns = "default"
 
@@ -40,7 +47,7 @@ var _ = Describe("PgShardNode lifecycle", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardNodeSpec{
 				Replicas:           2,
-				PostgresConfigHash: "hash-1",
+				PostgresConfigHash: configHash1,
 				Storage:            &pgshardv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")},
 			},
 		}
@@ -80,7 +87,7 @@ var _ = Describe("PgShardNode lifecycle", func() {
 				Expect(e.Name).NotTo(Equal("PGSHARD_SHARD"))
 				Expect(e.Name).NotTo(Equal("PGSHARD_CLUSTER"))
 			}
-			Expect(pod.Annotations["pgshard.dev/config-hash"]).To(Equal("hash-1"))
+			Expect(pod.Annotations["pgshard.dev/config-hash"]).To(Equal(configHash1))
 			Expect(pod.Spec.Subdomain).To(Equal("n1-pods"))
 
 			var pvc corev1.PersistentVolumeClaim
@@ -180,5 +187,92 @@ var _ = Describe("PgShardNode lifecycle", func() {
 
 		got := get()
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("reloads postgres config in place for reload-only changes", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		r := &PgShardNodeReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			Agents: agentclient.NewInsecurePool(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		node := newNode("cfg")
+		node.Spec.Replicas = 1
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+		// The rendered config the cluster controller would have materialized.
+		cmName, err := configMapName("cfg")
+		Expect(err).NotTo(HaveOccurred())
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: ns},
+			Data: map[string]string{
+				"config-hash":          configHash1,
+				"param.work_mem":       "4MB",
+				"param.shared_buffers": "128MB",
+			},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "cfg", Namespace: ns}}
+		reloads := func() int {
+			n := 0
+			for _, c := range agent.Calls {
+				if c == "ReloadConfig" {
+					n++
+				}
+			}
+			return n
+		}
+		nodeNow := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &got)).To(Succeed())
+			return got
+		}
+
+		// First reconcile records the current config as applied, no reload
+		// (the fresh pod was created carrying it).
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodeNow().Status.AppliedConfigHash).To(Equal(configHash1))
+		Expect(reloads()).To(Equal(0))
+
+		// Give the pod an address so the reload can reach its agent.
+		stampPodIP("cfg-0", "10.9.0.1")
+
+		// A reload-only change (work_mem) is applied in place.
+		cm.Data["config-hash"] = configHash2
+		cm.Data["param.work_mem"] = "8MB"
+		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+		got := nodeNow()
+		got.Spec.PostgresConfigHash = configHash2
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reloads()).To(Equal(1), "a reload-only change reloads in place")
+		Expect(nodeNow().Status.AppliedConfigHash).To(Equal(configHash2))
+
+		// A restart-requiring change (shared_buffers) is NOT reloaded; the
+		// applied hash stays lagging, pending the rolling restart.
+		cm.Data["config-hash"] = configHash3
+		cm.Data["param.shared_buffers"] = "256MB"
+		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+		got = nodeNow()
+		got.Spec.PostgresConfigHash = configHash3
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reloads()).To(Equal(1), "a restart-requiring change is not reloaded")
+		Expect(nodeNow().Status.AppliedConfigHash).
+			To(Equal(configHash2), "the applied hash lags a pending restart")
+
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
 	})
 })

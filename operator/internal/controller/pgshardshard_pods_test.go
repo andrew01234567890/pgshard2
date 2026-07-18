@@ -60,7 +60,7 @@ var _ = Describe("PgShardShard pod lifecycle", func() {
 				KeyRange:           pgshardv1alpha1.KeyRange{End: "80"},
 				Replicas:           2,
 				Serving:            true,
-				PostgresConfigHash: "hash-1",
+				PostgresConfigHash: configHash1,
 				Storage: &pgshardv1alpha1.StorageSpec{
 					Size: resource.MustParse("2Gi"),
 				},
@@ -89,7 +89,7 @@ var _ = Describe("PgShardShard pod lifecycle", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &pod)).To(Succeed())
 			Expect(pod.Spec.InitContainers[0].Image).To(Equal("ghcr.io/test/pgshard-agent:test"))
 			Expect(pod.Spec.Containers[0].Command[0]).To(Equal("/pgshard/pgshard-agent"))
-			Expect(pod.Annotations["pgshard.dev/config-hash"]).To(Equal("hash-1"))
+			Expect(pod.Annotations["pgshard.dev/config-hash"]).To(Equal(configHash1))
 			Expect(pod.Spec.Subdomain).To(Equal("sh1-pods"))
 
 			var pvc corev1.PersistentVolumeClaim

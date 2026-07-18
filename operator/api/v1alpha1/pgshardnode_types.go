@@ -97,6 +97,18 @@ type PgShardNodeStatus struct {
 
 	// +optional
 	StanzaInitialized bool `json:"stanzaInitialized,omitempty"`
+
+	// AppliedConfigHash is the config-hash the running PostgreSQL has loaded on
+	// this node. While it lags Spec.PostgresConfigHash the controller reconciles
+	// the difference — reloading in place for reload-only changes.
+	// +optional
+	AppliedConfigHash string `json:"appliedConfigHash,omitempty"`
+
+	// AppliedParameters is the postgresql parameter set the running PostgreSQL has
+	// loaded, retained so a later config change can be classified as needing a
+	// reload or a restart.
+	// +optional
+	AppliedParameters map[string]string `json:"appliedParameters,omitempty"`
 }
 
 // +kubebuilder:object:root=true

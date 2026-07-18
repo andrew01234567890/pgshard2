@@ -159,6 +159,20 @@ spec:
               promotion is confirmed. The operator polls the in-pod agents and is the sole
               writer of this status; agents never write it.
             properties:
+              appliedConfigHash:
+                description: |-
+                  AppliedConfigHash is the config-hash the running PostgreSQL has loaded on
+                  this node. While it lags Spec.PostgresConfigHash the controller reconciles
+                  the difference — reloading in place for reload-only changes.
+                type: string
+              appliedParameters:
+                additionalProperties:
+                  type: string
+                description: |-
+                  AppliedParameters is the postgresql parameter set the running PostgreSQL has
+                  loaded, retained so a later config change can be classified as needing a
+                  reload or a restart.
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
