@@ -29,12 +29,14 @@
 //!   `ON CONFLICT DO UPDATE`), `UPDATE ... FROM` / `DELETE ... USING`, and
 //!   MERGE/COPY are rejected with SQLSTATE `0A000`.
 //! - `search_path` is not modeled: an unqualified relation defaults to `public`.
-//! - Joins, subqueries, and CTEs are rejected, not routed: key-routing needs a
-//!   single plain sharded table in the FROM, no subquery anywhere in the
-//!   statement, and no `WITH` clause (which can shadow the table name or hide a
-//!   cross-shard write). This keeps the qualifier-blind extractor sound (only
-//!   one table is ever in scope) and never under-routes a query whose other
-//!   relations live on other shards.
+//! - Joins, subqueries, CTEs, and set operations over sharded tables are
+//!   rejected, not routed: key-routing needs a single plain sharded table in the
+//!   FROM, no subquery anywhere in the statement, and no `WITH` clause (which can
+//!   shadow the table name or hide a cross-shard write). A `UNION`/`INTERSECT`/
+//!   `EXCEPT` touching a sharded table needs a cross-shard merge and is rejected;
+//!   one over only global tables runs on the system database. This keeps the
+//!   qualifier-blind extractor sound (only one table is ever in scope) and never
+//!   under-routes a query whose other relations live on other shards.
 
 pub mod catalog;
 mod extract;
@@ -43,13 +45,17 @@ pub mod sequence;
 use std::collections::BTreeSet;
 
 use pg_query::NodeEnum;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{
+    DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, SetOperation, UpdateStmt,
+};
 
 use pgshard_core::{ScalarType, ScalarValue, TableDef, TableName, VSchema, shard_function};
 use pgshard_sql::{Parsed, StatementKind};
 
 pub use catalog::{ShardCatalog, ShardId};
-use extract::{KeyVal, analyze_from, contains_sublink, range_var_table, where_key_values};
+use extract::{
+    KeyVal, analyze_from, contains_cte, contains_sublink, range_var_table, where_key_values,
+};
 
 /// SQLSTATE `feature_not_supported`: what a statement the router cannot route
 /// (a cross-shard write, an unsupported form) is rejected with.
@@ -294,6 +300,14 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
 }
 
 fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
+    // A set operation (UNION/INTERSECT/EXCEPT) nests its operands in larg/rarg and
+    // leaves the top-level FROM empty, so the key-routing path below would see no
+    // tables and mistake it for a session-local read — running the whole set
+    // operation on a single shard and dropping the other shards' rows. Handle it
+    // on its own.
+    if s.op != SetOperation::SetopNone as i32 {
+        return plan_set_op(s, vschema);
+    }
     let from = analyze_from(&s.from_clause);
     let sharded: Vec<(&str, Option<ScalarType>, &str)> = from
         .tables
@@ -363,6 +377,66 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         }),
         Resolution::Shards(hit) => read_from_shards(hit),
     }
+}
+
+/// Plan a set operation (`UNION`/`INTERSECT`/`EXCEPT`). Its arms may target
+/// different shards and its result needs a cross-shard merge, so M1 cannot route
+/// one that touches a sharded table. A set operation purely over global tables
+/// runs whole on the system database; a tableless one (`SELECT 1 UNION SELECT 2`)
+/// is session-local.
+fn plan_set_op(s: &SelectStmt, vschema: &VSchema) -> Plan {
+    // set_op_from only sees each arm's leaf FROM, so a sharded table hidden in an
+    // arm's expression subquery (`SELECT (SELECT .. FROM sharded) UNION ..`) or a
+    // CTE body (`WITH x AS (SELECT .. FROM sharded) SELECT .. FROM x UNION ..`)
+    // would slip past it and mis-route. Reject any subquery or CTE anywhere in the
+    // set operation — the same shapes a single keyed statement rejects.
+    if contains_sublink(s) {
+        return reject("a set operation with a subquery is not supported in M1");
+    }
+    if contains_cte(s) {
+        return reject("a set operation with a CTE (WITH) is not supported in M1");
+    }
+    let from = set_op_from(s);
+    // A function in any arm's FROM could hide a sharded table; refuse to route
+    // past what we cannot see (the same stance as a single SELECT).
+    if !from.all_plain {
+        return reject(
+            "a set operation with a subquery or function in a FROM is not supported in M1",
+        );
+    }
+    if from
+        .tables
+        .iter()
+        .any(|t| matches!(placement(vschema, t), Placement::Sharded { .. }))
+    {
+        return reject(
+            "a set operation (UNION/INTERSECT/EXCEPT) over a sharded table is not supported in M1",
+        );
+    }
+    if from.tables.is_empty() {
+        Plan::RouterLocal
+    } else {
+        Plan::Unsharded
+    }
+}
+
+/// The FROM relations of every arm of a (possibly nested) set operation, and
+/// whether every arm's FROM is plain. A set operation nests its operands in
+/// `larg`/`rarg`; only the leaf arms carry a FROM clause.
+fn set_op_from(s: &SelectStmt) -> extract::FromClause {
+    if s.op == SetOperation::SetopNone as i32 {
+        return analyze_from(&s.from_clause);
+    }
+    let mut merged = extract::FromClause {
+        tables: Vec::new(),
+        all_plain: true,
+    };
+    for arm in [s.larg.as_deref(), s.rarg.as_deref()].into_iter().flatten() {
+        let arm = set_op_from(arm);
+        merged.tables.extend(arm.tables);
+        merged.all_plain &= arm.all_plain;
+    }
+    merged
 }
 
 fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
@@ -1062,6 +1136,38 @@ mod tests {
         for sql in rejected {
             assert!(is_reject(&plan1(sql)), "should reject: {sql}");
         }
+    }
+
+    #[test]
+    fn set_operations_touching_a_sharded_table_are_rejected() {
+        // A set operation nests its arms with an empty top-level FROM. Its arms
+        // may sit on different shards and its result needs a cross-shard merge,
+        // so running it whole on one shard would silently drop the others' rows.
+        let rejected = [
+            "SELECT * FROM orders WHERE customer_id = 5 UNION SELECT * FROM orders WHERE customer_id = 6",
+            "SELECT id FROM orders EXCEPT SELECT id FROM line_items",
+            "SELECT customer_id FROM orders WHERE customer_id = 5 \
+             INTERSECT SELECT customer_id FROM orders WHERE customer_id = 6",
+            // A sharded table buried in a nested (second-level) set operation.
+            "SELECT 1 UNION (SELECT 2 UNION SELECT customer_id FROM orders WHERE customer_id = 7)",
+            // A sharded table hidden in an arm's expression subquery — invisible
+            // to the leaf-FROM walk, so it must be caught as a subquery.
+            "SELECT (SELECT count(*) FROM orders) UNION SELECT 0",
+            // A sharded table hidden in a CTE body, both on the whole set
+            // operation and nested in a single arm.
+            "WITH x AS (SELECT customer_id FROM orders) SELECT customer_id FROM x UNION SELECT 0",
+            "SELECT 1 UNION (WITH y AS (SELECT customer_id FROM orders) SELECT customer_id FROM y)",
+        ];
+        for sql in rejected {
+            assert!(is_reject(&plan1(sql)), "should reject: {sql}");
+        }
+        // With no sharded arm, a set operation still routes: a global-only one
+        // runs whole on the system database, a tableless one is session-local.
+        assert_eq!(
+            plan1("SELECT k, v FROM settings UNION SELECT k, v FROM settings"),
+            Plan::Unsharded
+        );
+        assert_eq!(plan1("SELECT 1 UNION SELECT 2"), Plan::RouterLocal);
     }
 
     #[test]

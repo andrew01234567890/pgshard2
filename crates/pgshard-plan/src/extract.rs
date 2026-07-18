@@ -242,31 +242,41 @@ fn collect_from(node: &Node, fc: &mut FromClause) {
 /// where the subquery sits — a `WHERE` predicate, a target-list expression, an
 /// `UPDATE ... SET` value, an aggregate `FILTER`, an array element — so callers
 /// pass the whole statement, not just its `WHERE`.
-///
-/// Detection is structural over the serialized tree rather than a hand-listed
-/// walk of expression node types: serde visits every field, so a subquery cannot
-/// hide in a node the walk forgot. This matters because neither a bespoke match
-/// nor libpg_query's own `nodes()` iterator descends into every node — each
-/// misses different shapes (an aggregate `FILTER`, an `ARRAY[...]` element).
-/// A serialization error — which a well-formed parse tree does not produce — is
-/// treated as "contains a subquery" so the planner fails closed and rejects.
 pub fn contains_sublink<T: serde::Serialize>(tree: &T) -> bool {
-    match serde_json::to_value(tree) {
-        Ok(json) => json_contains_sublink(&json),
-        Err(_) => true,
-    }
+    contains_node(tree, "SubLink")
 }
 
-/// libpg_query serializes a `Node`'s oneof arm as an object keyed by the node's
-/// type name, so an expression subquery is an object with a `"SubLink"` key.
-/// A string *value* (e.g. a literal `'SubLink'`) is never an object key, so the
-/// structural check cannot mistake one for a subquery.
-fn json_contains_sublink(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            map.contains_key("SubLink") || map.values().any(json_contains_sublink)
+/// True when a parse-tree fragment contains a common table expression (a `WITH`
+/// clause) anywhere, including one nested in a set operation's arm. A CTE body is
+/// not a `SubLink`, so [`contains_sublink`] does not see it, yet it can hide a
+/// sharded-table reference (or shadow a table name); a keyed or set-operation
+/// route carrying one must be rejected.
+pub fn contains_cte<T: serde::Serialize>(tree: &T) -> bool {
+    contains_node(tree, "CommonTableExpr")
+}
+
+/// True when serializing `tree` yields, anywhere, an object with a key equal to
+/// `node_kind`. libpg_query serializes each parse-tree node as an object keyed by
+/// its type name (`SubLink`, `CommonTableExpr`), so this is a complete structural
+/// test: serde visits every field, so no node type can hide from it. This matters
+/// because neither a bespoke match nor libpg_query's own `nodes()` iterator
+/// descends into every node — each misses different shapes (an aggregate
+/// `FILTER`, an `ARRAY[...]` element). A string *value* (e.g. a literal
+/// `'SubLink'`) is never an object key, so the check cannot false-positive. A
+/// serialization error — which a well-formed parse tree does not produce — is
+/// treated as a match so the planner fails closed and rejects.
+fn contains_node<T: serde::Serialize>(tree: &T, node_kind: &str) -> bool {
+    fn walk(value: &serde_json::Value, key: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|v| walk(v, key))
+            }
+            serde_json::Value::Array(items) => items.iter().any(|v| walk(v, key)),
+            _ => false,
         }
-        serde_json::Value::Array(items) => items.iter().any(json_contains_sublink),
-        _ => false,
+    }
+    match serde_json::to_value(tree) {
+        Ok(json) => walk(&json, node_kind),
+        Err(_) => true,
     }
 }
