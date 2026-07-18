@@ -475,23 +475,20 @@ fn plan_set_op(s: &SelectStmt, vschema: &VSchema) -> Plan {
 /// the statement defines. A serialization failure (which a well-formed parse
 /// tree does not produce) reports a sentinel so the caller fails closed.
 fn unknown_relation<T: serde::Serialize>(tree: &T, vschema: &VSchema) -> Option<TableName> {
-    let Some((rels, ctes)) = extract::referenced_relations(tree) else {
-        return Some(TableName::new("", "<unserializable statement>"));
+    let resolve = |schema: &str, name: &str| -> bool {
+        let t = TableName::new(if schema.is_empty() { "public" } else { schema }, name);
+        is_catalog_schema(&t) || !matches!(placement(vschema, &t), Placement::Unknown)
     };
-    for (schema, name) in rels {
-        // Only an unqualified name can refer to a CTE.
-        if schema.is_empty() && ctes.contains(&name) {
-            continue;
-        }
-        let t = TableName::new(if schema.is_empty() { "public" } else { &schema }, name);
-        if is_catalog_schema(&t) {
-            continue;
-        }
-        if matches!(placement(vschema, &t), Placement::Unknown) {
-            return Some(t);
-        }
-    }
-    None
+    extract::find_unresolved_relation(tree, &resolve).map(|(schema, name)| {
+        TableName::new(
+            if schema.is_empty() {
+                "public".to_owned()
+            } else {
+                schema
+            },
+            name,
+        )
+    })
 }
 
 /// The FROM relations of every arm of a (possibly nested) set operation, and
@@ -1148,6 +1145,12 @@ mod tests {
             "SELECT * FROM (SELECT * FROM mystery) m",
             "SELECT (SELECT count(*) FROM mystery)",
             "WITH x AS (SELECT * FROM mystery) SELECT * FROM x",
+            // CTE visibility is scoped: without RECURSIVE a CTE sees only
+            // EARLIER siblings, so `mystery` inside `a` is a base relation —
+            // the later CTE of the same name must not mask it.
+            "WITH a AS (SELECT * FROM mystery), mystery AS (SELECT * FROM settings) SELECT * FROM a",
+            // A non-recursive self reference is a base relation too.
+            "WITH t AS (SELECT * FROM t) SELECT * FROM t",
         ] {
             assert!(
                 matches!(&plan1(sql), Plan::Reject { code, .. } if *code == UNDEFINED_TABLE),
@@ -1166,6 +1169,22 @@ mod tests {
         // not a base relation, and its body references only known tables.
         assert_eq!(
             plan1("WITH x AS (SELECT * FROM settings) SELECT * FROM x"),
+            Plan::Unsharded
+        );
+        // Ordered sibling visibility: a LATER CTE may reference an earlier one.
+        assert_eq!(
+            plan1(
+                "WITH mystery AS (SELECT * FROM settings), a AS (SELECT * FROM mystery) \
+                 SELECT * FROM a"
+            ),
+            Plan::Unsharded
+        );
+        // WITH RECURSIVE makes every name visible to every body.
+        assert_eq!(
+            plan1(
+                "WITH RECURSIVE a AS (SELECT * FROM mystery), \
+                 mystery AS (SELECT * FROM settings) SELECT * FROM a"
+            ),
             Plan::Unsharded
         );
     }

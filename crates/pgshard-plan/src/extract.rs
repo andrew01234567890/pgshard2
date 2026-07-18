@@ -281,52 +281,100 @@ fn contains_node<T: serde::Serialize>(tree: &T, node_kind: &str) -> bool {
     }
 }
 
-/// Every relation reference in the statement — `RangeVar`s anywhere (plain
-/// FROM, join arms, subqueries in any clause, CTE bodies) — plus the names of
-/// CTEs the statement itself defines. The same complete serde walk as
-/// [`contains_node`], so no shape can hide a table reference from the caller's
-/// unknown-relation guard. `None` on a serialization error (well-formed parse
-/// trees do not produce one) so the caller fails closed.
+/// Finds the first relation reference anywhere in the statement that `resolve`
+/// does not recognize, honoring CTE visibility scopes. `resolve` receives the
+/// reference exactly as written (`schemaname` empty when unqualified) and
+/// returns whether it names a known/permitted relation.
 ///
-/// Each reference is `(schemaname, relname)` exactly as written — an empty
-/// schema means unqualified, which the caller resolves (default `public`, and
-/// only unqualified names can refer to a CTE).
-/// Every `(schemaname, relname)` reference plus the statement's own CTE names.
-pub(crate) type RelationRefs = (Vec<(String, String)>, std::collections::BTreeSet<String>);
+/// CTE scoping follows PostgreSQL: a plain `WITH` makes each CTE's name visible
+/// only to LATER sibling bodies and to the statement's main body — a forward or
+/// self reference is a base relation, not the CTE — while `WITH RECURSIVE`
+/// makes every name in the list visible to every body. Only an unqualified
+/// reference can resolve to a CTE. Nested statements (a `WITH` inside a
+/// subquery) extend the visible set for their own subtree only.
+///
+/// The traversal is the same complete serde walk as [`contains_node`], so no
+/// shape — join arms, subqueries in any clause, CTE bodies, set-operation arms
+/// — can hide a `RangeVar` from it. `None` from serialization failure is
+/// reported as an unresolved sentinel so the caller fails closed.
+pub(crate) fn find_unresolved_relation<T: serde::Serialize>(
+    tree: &T,
+    resolve: &dyn Fn(&str, &str) -> bool,
+) -> Option<(String, String)> {
+    use std::collections::BTreeSet;
 
-pub(crate) fn referenced_relations<T: serde::Serialize>(tree: &T) -> Option<RelationRefs> {
+    // A `ctes` item is a `Node` wrapper: `{"node": {"CommonTableExpr": {...}}}`.
+    fn cte_name(cte: &serde_json::Value) -> Option<&str> {
+        cte.as_object()?
+            .get("node")?
+            .as_object()?
+            .get("CommonTableExpr")?
+            .as_object()?
+            .get("ctename")?
+            .as_str()
+    }
+
     fn walk(
         value: &serde_json::Value,
-        rels: &mut Vec<(String, String)>,
-        ctes: &mut std::collections::BTreeSet<String>,
-    ) {
+        visible: &BTreeSet<String>,
+        resolve: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<(String, String)> {
         match value {
             serde_json::Value::Object(map) => {
                 if let Some(rv) = map.get("RangeVar").and_then(|v| v.as_object()) {
                     let schema = rv.get("schemaname").and_then(|v| v.as_str()).unwrap_or("");
                     let name = rv.get("relname").and_then(|v| v.as_str()).unwrap_or("");
-                    rels.push((schema.to_owned(), name.to_owned()));
+                    let is_cte = schema.is_empty() && visible.contains(name);
+                    if !is_cte && !resolve(schema, name) {
+                        return Some((schema.to_owned(), name.to_owned()));
+                    }
+                    // A RangeVar has no nested relations; nothing further below.
+                    return None;
                 }
-                if let Some(cte) = map.get("CommonTableExpr").and_then(|v| v.as_object())
-                    && let Some(name) = cte.get("ctename").and_then(|v| v.as_str())
-                {
-                    ctes.insert(name.to_owned());
+                // A WITH clause opens a scope: walk each CTE body under the
+                // names visible to IT (earlier siblings, or all names under
+                // RECURSIVE), then the rest of this object under all of them.
+                if let Some(wc) = map.get("with_clause").and_then(|v| v.as_object()) {
+                    let recursive = wc
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let ctes: &[serde_json::Value] = wc
+                        .get("ctes")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let mut all = visible.clone();
+                    all.extend(ctes.iter().filter_map(cte_name).map(str::to_owned));
+                    let mut before = visible.clone();
+                    for cte in ctes {
+                        let body_visible = if recursive { &all } else { &before };
+                        if let Some(hit) = walk(cte, body_visible, resolve) {
+                            return Some(hit);
+                        }
+                        if let Some(name) = cte_name(cte) {
+                            before.insert(name.to_owned());
+                        }
+                    }
+                    // The statement's other fields see every CTE.
+                    for (k, v) in map {
+                        if k != "with_clause"
+                            && let Some(hit) = walk(v, &all, resolve)
+                        {
+                            return Some(hit);
+                        }
+                    }
+                    return None;
                 }
-                for v in map.values() {
-                    walk(v, rels, ctes);
-                }
+                map.values().find_map(|v| walk(v, visible, resolve))
             }
-            serde_json::Value::Array(items) => {
-                for v in items {
-                    walk(v, rels, ctes);
-                }
-            }
-            _ => {}
+            serde_json::Value::Array(items) => items.iter().find_map(|v| walk(v, visible, resolve)),
+            _ => None,
         }
     }
-    let json = serde_json::to_value(tree).ok()?;
-    let mut rels = Vec::new();
-    let mut ctes = std::collections::BTreeSet::new();
-    walk(&json, &mut rels, &mut ctes);
-    Some((rels, ctes))
+
+    let Ok(json) = serde_json::to_value(tree) else {
+        return Some((String::new(), "<unserializable statement>".to_owned()));
+    };
+    walk(&json, &std::collections::BTreeSet::new(), resolve)
 }
