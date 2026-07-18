@@ -9,6 +9,8 @@ repository.workspace = true
 pg_query = "6.1.1"
 pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 pgshard-sql = { version = "0.0.0", path = "../pgshard-sql" }
+serde = { version = "1.0.228", default-features = false }
+serde_json = "1.0.150"
 thiserror = "2.0.18"
 
 [lints]

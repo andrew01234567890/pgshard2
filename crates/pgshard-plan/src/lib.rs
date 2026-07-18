@@ -29,10 +29,12 @@
 //!   `ON CONFLICT DO UPDATE`), `UPDATE ... FROM` / `DELETE ... USING`, and
 //!   MERGE/COPY are rejected with SQLSTATE `0A000`.
 //! - `search_path` is not modeled: an unqualified relation defaults to `public`.
-//! - Joins and subqueries are rejected, not routed: key-routing needs a single
-//!   plain sharded table in the FROM and no subquery in the WHERE. This keeps
-//!   the qualifier-blind extractor sound (only one table is ever in scope) and
-//!   never under-routes a query whose other relations live on other shards.
+//! - Joins, subqueries, and CTEs are rejected, not routed: key-routing needs a
+//!   single plain sharded table in the FROM, no subquery anywhere in the
+//!   statement, and no `WITH` clause (which can shadow the table name or hide a
+//!   cross-shard write). This keeps the qualifier-blind extractor sound (only
+//!   one table is ever in scope) and never under-routes a query whose other
+//!   relations live on other shards.
 
 pub mod catalog;
 mod extract;
@@ -331,9 +333,18 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             "SELECT joining a sharded table with another relation is not supported in M1",
         );
     }
-    // A subquery in the WHERE would run only on the routed shard yet could
-    // reference rows on others; refuse the shard-key fast path.
-    if contains_sublink(s.where_clause.as_deref()) {
+    // A `WITH` clause can *shadow* the sharded table name — `WITH orders AS
+    // (SELECT ... FROM elsewhere) SELECT * FROM orders WHERE key = 5` routes by
+    // the base table's key yet reads the CTE, whose query can touch other shards
+    // — and a data-modifying CTE runs its writes on the routed shard regardless.
+    // The extractor cannot see through a CTE, so refuse the fast path.
+    if s.with_clause.is_some() {
+        return reject("SELECT with a CTE (WITH) on a sharded table is not supported in M1");
+    }
+    // A subquery anywhere in the statement — a WHERE predicate, a target-list
+    // expression, an aggregate FILTER — would run only on the routed shard yet
+    // could reference rows on others; refuse the shard-key fast path.
+    if contains_sublink(s) {
         return reject("SELECT with a subquery on a sharded table is not supported in M1");
     }
 
@@ -359,19 +370,21 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         return reject("INSERT without a target relation");
     };
     let table = range_var_table(rv);
-    // A CTE (`WITH`, possibly data-modifying) or a subquery in a VALUES cell can
-    // read or write rows on other shards, but would run only on the shard this
-    // INSERT routes to. Reject before routing rather than execute against the
-    // wrong shard — otherwise, once a sequence fills the omitted id, the
-    // statement would silently succeed with wrong data.
+    // A CTE (`WITH`, possibly data-modifying) or a subquery anywhere in the
+    // statement (a VALUES cell, RETURNING, ON CONFLICT) can read or write rows on
+    // other shards, but would run only on the shard this INSERT routes to. Reject
+    // before routing rather than execute against the wrong shard — otherwise,
+    // once a sequence fills the omitted id, the statement would silently succeed
+    // with wrong data. (A plain `INSERT ... SELECT` is not a SubLink; the sharded
+    // path rejects it separately for lacking literal shard-key values.)
     if s.with_clause.is_some() {
         return reject(&format!(
             "INSERT into {table} with a CTE (WITH) is not supported in M1"
         ));
     }
-    if extract::insert_values_have_sublink(s) {
+    if contains_sublink(s) {
         return reject(&format!(
-            "INSERT into {table} with a subquery in VALUES is not supported in M1"
+            "INSERT into {table} with a subquery is not supported in M1"
         ));
     }
     match placement(vschema, &table) {
@@ -439,13 +452,23 @@ fn plan_update(s: &UpdateStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             }
             // `UPDATE ... FROM other` joins another relation whose rows may live
             // on other shards; running it on the target's shard alone matches the
-            // wrong set. A WHERE subquery has the same problem.
+            // wrong set. A subquery anywhere (a WHERE predicate or a SET value)
+            // has the same problem.
             if !s.from_clause.is_empty() {
                 return reject(&format!(
                     "UPDATE {table} ... FROM another relation is not supported in M1"
                 ));
             }
-            if contains_sublink(s.where_clause.as_deref()) {
+            // A data-modifying CTE (`WITH d AS (DELETE FROM other ...) UPDATE ...`)
+            // is not a SubLink, so it slips past the subquery check, yet its
+            // writes execute against the routed shard rather than the rows'
+            // real shards. Reject any CTE, as INSERT does.
+            if s.with_clause.is_some() {
+                return reject(&format!(
+                    "UPDATE {table} with a CTE (WITH) is not supported in M1"
+                ));
+            }
+            if contains_sublink(s) {
                 return reject(&format!(
                     "UPDATE {table} with a subquery is not supported in M1"
                 ));
@@ -476,14 +499,23 @@ fn plan_delete(s: &DeleteStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             key_type,
             shard_fn,
         } => {
-            // `DELETE ... USING other` and a WHERE subquery both bring in rows
-            // that may live on other shards; neither is routable on one shard.
+            // `DELETE ... USING other` and a subquery (in the WHERE or RETURNING)
+            // both bring in rows that may live on other shards; neither is
+            // routable on one shard.
             if !s.using_clause.is_empty() {
                 return reject(&format!(
                     "DELETE FROM {table} ... USING another relation is not supported in M1"
                 ));
             }
-            if contains_sublink(s.where_clause.as_deref()) {
+            // A data-modifying CTE is not a SubLink but still executes its writes
+            // on the routed shard rather than the rows' real shards. Reject any
+            // CTE, as INSERT does.
+            if s.with_clause.is_some() {
+                return reject(&format!(
+                    "DELETE FROM {table} with a CTE (WITH) is not supported in M1"
+                ));
+            }
+            if contains_sublink(s) {
                 return reject(&format!(
                     "DELETE FROM {table} with a subquery is not supported in M1"
                 ));
@@ -965,6 +997,71 @@ mod tests {
             plan1("SELECT * FROM orders WHERE customer_id = 5 AND status IN ('a', 'b')"),
             Plan::SingleShard(shard_of(5))
         );
+    }
+
+    #[test]
+    fn keyed_routes_reject_a_subquery_anywhere_not_only_in_the_where() {
+        // A subquery runs only on the routed shard, so a keyed route carrying one
+        // is rejected wherever it sits — not just in the WHERE. Each of these
+        // hides the subquery in a spot a walk that stopped at the WHERE, or that
+        // enumerated only some node types, would let through as silently wrong
+        // data.
+        let rejected = [
+            // A scalar subquery in the target list.
+            "SELECT (SELECT count(*) FROM line_items), note FROM orders WHERE customer_id = 5",
+            // A subquery inside an aggregate FILTER — reached only by descending
+            // a function's filter clause, which the previous hand-walk did not.
+            "SELECT count(*) FILTER (WHERE total > (SELECT avg(total) FROM line_items)) \
+             FROM orders WHERE customer_id = 5",
+            // A subquery in HAVING.
+            "SELECT count(*) FROM orders WHERE customer_id = 5 \
+             HAVING count(*) > (SELECT count(*) FROM line_items)",
+            // A subquery buried in an array element in the WHERE.
+            "SELECT * FROM orders WHERE customer_id = 5 \
+             AND status = ANY(ARRAY[(SELECT status FROM line_items LIMIT 1)])",
+            // A subquery in an UPDATE's SET value rather than its WHERE.
+            "UPDATE orders SET note = (SELECT note FROM line_items LIMIT 1) WHERE customer_id = 5",
+            // A subquery in a RETURNING list.
+            "DELETE FROM orders WHERE customer_id = 5 \
+             RETURNING (SELECT count(*) FROM line_items)",
+        ];
+        for sql in rejected {
+            assert!(is_reject(&plan1(sql)), "should reject: {sql}");
+        }
+        // The same statements without a subquery still route by their shard key.
+        assert_eq!(
+            plan1("SELECT count(*) FROM orders WHERE customer_id = 5"),
+            Plan::SingleShard(shard_of(5))
+        );
+        assert_eq!(
+            plan1("UPDATE orders SET note = 'x' WHERE customer_id = 5"),
+            Plan::SingleShard(shard_of(5))
+        );
+    }
+
+    #[test]
+    fn keyed_routes_reject_a_cte_which_is_not_a_subquery() {
+        // A CTE is a SelectStmt/DeleteStmt/…, not a SubLink, so the subquery check
+        // does not see it — but it still reaches other shards. These must reject.
+        let rejected = [
+            // A CTE that *shadows* the sharded table name: the outer FROM looks
+            // like base `orders` and routes by customer_id = 5, but PostgreSQL
+            // resolves `orders` to the CTE, which reads line_items on shard 9.
+            "WITH orders AS (SELECT 5 AS customer_id, note FROM line_items WHERE customer_id = 9) \
+             SELECT * FROM orders WHERE customer_id = 5",
+            // A read-only CTE alongside a keyed read still can't be routed.
+            "WITH recent AS (SELECT id FROM line_items) \
+             SELECT * FROM orders WHERE customer_id = 5",
+            // Data-modifying CTEs on an UPDATE/DELETE target: the write runs on
+            // the routed shard, not the rows' real shard.
+            "WITH d AS (DELETE FROM line_items WHERE customer_id = 9 RETURNING id) \
+             UPDATE orders SET note = 'x' WHERE customer_id = 5",
+            "WITH u AS (UPDATE line_items SET note = 'z' WHERE customer_id = 9 RETURNING id) \
+             DELETE FROM orders WHERE customer_id = 5",
+        ];
+        for sql in rejected {
+            assert!(is_reject(&plan1(sql)), "should reject: {sql}");
+        }
     }
 
     #[test]
