@@ -90,9 +90,15 @@ pub struct XLogData {
 pub struct ReplicationClient {
     stream: TcpStream,
     read_buf: BytesMut,
-    /// The highest end-of-WAL the server has reported; sent back in standby
-    /// status updates so the server can advance the slot.
+    /// The highest end-of-WAL the server has reported; reported as the *written*
+    /// position in standby status updates.
     last_wal_end: Lsn,
+    /// The consumer's durable position, reported as the *flushed* position so the
+    /// server advances the slot (and releases WAL) only up to what the consumer
+    /// has committed. Left at 0 until the consumer sets it via [`Self::confirm`],
+    /// so an un-checkpointed consumer never lets the slot move past a replayable
+    /// point.
+    confirmed_lsn: Lsn,
 }
 
 impl ReplicationClient {
@@ -104,6 +110,7 @@ impl ReplicationClient {
             stream,
             read_buf: BytesMut::with_capacity(16 * 1024),
             last_wal_end: Lsn(0),
+            confirmed_lsn: Lsn(0),
         };
         client.startup(config).await?;
         Ok(client)
@@ -311,14 +318,25 @@ impl ReplicationClient {
         }
     }
 
-    /// Acknowledge the stream up to the highest WAL end seen, letting the server
-    /// advance the slot and release retained WAL. A consumer that has not durably
-    /// checkpointed its progress should not call this past that point.
+    /// Record the consumer's durable position. Reported as the flushed/applied
+    /// LSN in the next standby status, so the server advances the slot (and frees
+    /// WAL) only up to what the consumer has committed — the invariant that makes
+    /// a restart replay exactly the un-applied tail. Never let this run ahead of a
+    /// durable checkpoint.
+    pub fn confirm(&mut self, lsn: Lsn) {
+        if lsn > self.confirmed_lsn {
+            self.confirmed_lsn = lsn;
+        }
+    }
+
+    /// Send a standby status update: the WAL received as the write position, and
+    /// the consumer's confirmed position (see [`Self::confirm`]) as the flush and
+    /// apply positions the server advances the slot to.
     pub async fn send_standby_status(&mut self) -> Result<()> {
         let status = StandbyStatusUpdate {
             write_lsn: self.last_wal_end,
-            flush_lsn: self.last_wal_end,
-            apply_lsn: self.last_wal_end,
+            flush_lsn: self.confirmed_lsn,
+            apply_lsn: self.confirmed_lsn,
             client_time: 0,
             reply_requested: false,
         };
