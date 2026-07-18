@@ -159,12 +159,15 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 		return ctrl.Result{}, nil
 	}
 
-	// Validated. Advance to ProvisioningTargets; the next reconcile creates the
-	// target shards.
+	// Validated. Advance to ProvisioningTargets and requeue so the next reconcile
+	// creates the target shards. The requeue is required: this reconcile writes
+	// status only, which does not bump the generation, so the watch's
+	// GenerationChangedPredicate would otherwise drop the self-update event and
+	// the reshard would stall here until the operator restarts.
 	reshard.Status.Phase = pgshardv1alpha1.ReshardProvisioningTargets
 	setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionTrue, "PartitionValid",
 		"target ranges partition the source shard's key range")
-	return ctrl.Result{}, nil
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // fail moves the reshard to the terminal Failed phase, recording the reason on
@@ -195,7 +198,9 @@ func setReshardCondition(
 func (r *PgShardReshardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&pgshardv1alpha1.PgShardShard{}).
+		// The reshard reads no shard/node status, so watch only structural
+		// (generation) changes: a target's status heartbeat must not re-enqueue it.
+		Owns(&pgshardv1alpha1.PgShardShard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&pgshardv1alpha1.PgShardNode{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.ConfigMap{}).
 		Named("pgshardreshard").

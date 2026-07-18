@@ -72,8 +72,12 @@ var _ = Describe("PgShardReshard validation", func() {
 			pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
 			pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
 
-		_, err := reconcile("rs-ok")
+		res, err := reconcile("rs-ok")
 		Expect(err).NotTo(HaveOccurred())
+		// The advance must requeue: a status-only write does not bump the
+		// generation, so without this the GenerationChangedPredicate would drop
+		// the follow-up event and the reshard would stall at ProvisioningTargets.
+		Expect(res).NotTo(Equal(ctrl.Result{}))
 
 		got := getReshard("rs-ok")
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardProvisioningTargets))
@@ -169,12 +173,13 @@ var _ = Describe("PgShardReshard validation", func() {
 			}
 			Expect(k8sClient.Create(ctx, cl)).To(Succeed())
 		}
-		createSourceIn := func(name, cluster, start, end string) {
+		// All these tests split the source range 40-80.
+		createSourceIn := func(name, cluster string) {
 			src := &pgshardv1alpha1.PgShardShard{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 				Spec: pgshardv1alpha1.PgShardShardSpec{
 					ClusterRef: cluster,
-					KeyRange:   pgshardv1alpha1.KeyRange{Start: start, End: end},
+					KeyRange:   pgshardv1alpha1.KeyRange{Start: "40", End: "80"},
 					Replicas:   1,
 					Serving:    true,
 				},
@@ -201,8 +206,9 @@ var _ = Describe("PgShardReshard validation", func() {
 		// #1), then run the ProvisioningTargets reconcile that creates the targets
 		// (reconcile #2).
 		provision := func(name string) {
-			_, err := reconcile(name)
+			res, err := reconcile(name)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(res).NotTo(Equal(ctrl.Result{}))
 			Expect(getReshard(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardProvisioningTargets))
 			_, err = reconcile(name)
 			Expect(err).NotTo(HaveOccurred())
@@ -210,7 +216,7 @@ var _ = Describe("PgShardReshard validation", func() {
 
 		It("creates hidden target shards on the shared node for shared placement", func() {
 			createCluster("cl-shared", pgshardv1alpha1.PlacementShared)
-			createSourceIn("cl-shared-src", "cl-shared", "40", "80")
+			createSourceIn("cl-shared-src", "cl-shared")
 			createReshardIn("rs-shared", "cl-shared", "cl-shared-src",
 				pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
 				pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
@@ -236,7 +242,7 @@ var _ = Describe("PgShardReshard validation", func() {
 
 		It("creates a reshard-owned node per target for dedicated placement", func() {
 			createCluster("cl-ded", pgshardv1alpha1.PlacementDedicatedInstance)
-			createSourceIn("cl-ded-src", "cl-ded", "40", "80")
+			createSourceIn("cl-ded-src", "cl-ded")
 			createReshardIn("rs-ded", "cl-ded", "cl-ded-src",
 				pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
 				pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
@@ -261,7 +267,7 @@ var _ = Describe("PgShardReshard validation", func() {
 
 		It("is idempotent across repeated reconciles", func() {
 			createCluster("cl-idem", pgshardv1alpha1.PlacementShared)
-			createSourceIn("cl-idem-src", "cl-idem", "40", "80")
+			createSourceIn("cl-idem-src", "cl-idem")
 			createReshardIn("rs-idem", "cl-idem", "cl-idem-src",
 				pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
 				pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
@@ -278,6 +284,37 @@ var _ = Describe("PgShardReshard validation", func() {
 				_, err := getShard(n)
 				Expect(err).NotTo(HaveOccurred())
 			}
+		})
+
+		It("surfaces a condition and retries on a target-name collision", func() {
+			createCluster("clcol", pgshardv1alpha1.PlacementShared)
+			createSourceIn("clcol-src", "clcol")
+			createReshardIn("rscol", "clcol", "clcol-src",
+				pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
+				pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
+			// A pre-existing shard with the first target's name, owned by nobody.
+			bare := &pgshardv1alpha1.PgShardShard{
+				ObjectMeta: metav1.ObjectMeta{Name: "clcol-40-60", Namespace: ns},
+				Spec: pgshardv1alpha1.PgShardShardSpec{
+					ClusterRef: "clcol",
+					KeyRange:   pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
+					Replicas:   1,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bare)).To(Succeed())
+
+			_, err := reconcile("rscol") // Validating -> ProvisioningTargets
+			Expect(err).NotTo(HaveOccurred())
+			res, err := reconcile("rscol") // ProvisioningTargets -> hits the collision
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+			got := getReshard("rscol")
+			Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardProvisioningTargets))
+			cond := apimeta.FindStatusCondition(got.Status.Conditions, "TargetsProvisioned")
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("TargetCollision"))
 		})
 	})
 })
