@@ -542,3 +542,65 @@ async fn no_primary_fails_local_statements_instead_of_fabricating_success() {
     let err = client.simple_query("SELECT 1").await.unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("57P01"));
 }
+
+/// The write lease: a router whose topology view cannot be confirmed current
+/// within the lease refuses writes (a stale writer is the split-brain window
+/// the lease bounds) while reads keep answering.
+#[tokio::test]
+async fn expired_write_lease_blocks_writes_but_not_reads() {
+    let pg = Pg::start().await.expect("start postgres");
+    let backend = pg.connect().await.unwrap();
+    backend
+        .batch_execute("CREATE TABLE orders (customer_id int, note text)")
+        .await
+        .unwrap();
+
+    // write_lease_seconds is 10 in the fixture topology.
+    let router = pgshard_router::shared(
+        Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+    );
+    let freshness = pgshard_topo::Freshness::new();
+    let proxy = Arc::new(
+        Proxy::new(
+            router,
+            Backend {
+                user: "postgres".into(),
+                password: "postgres".into(),
+                system_database: "postgres".into(),
+            },
+        )
+        .with_freshness(freshness.clone()),
+    );
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // Fresh: the write goes through.
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'ok')")
+        .await
+        .unwrap();
+
+    // Stale beyond the lease: writes refuse, reads still answer.
+    freshness.backdate(std::time::Duration::from_secs(11));
+    let err = client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'no')")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("57P01"));
+    let rows = client
+        .simple_query("SELECT note FROM orders WHERE customer_id = 1")
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|m| matches!(m,
+        tokio_postgres::SimpleQueryMessage::Row(r) if r.get("note") == Some("ok"))));
+
+    // A successful refresh restores writes.
+    freshness.bump();
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'again')")
+        .await
+        .unwrap();
+}

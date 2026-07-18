@@ -88,14 +88,20 @@ async fn main() -> anyhow::Result<()> {
             &backend.system_database,
         )
     });
-    let proxy = std::sync::Arc::new(match system_conn {
-        Some(conn) => {
-            let seq = std::sync::Arc::new(SequenceCache::new(PgBlockReserver::new(conn)));
-            tracing::info!("sequence allocation enabled via the system database");
-            Proxy::with_sequences(router, backend, seq)
+    // The watcher's freshness stamp drives the write lease: writes stop once
+    // the topology can no longer be confirmed current within the lease window.
+    let freshness = watcher.freshness();
+    let proxy = std::sync::Arc::new(
+        match system_conn {
+            Some(conn) => {
+                let seq = std::sync::Arc::new(SequenceCache::new(PgBlockReserver::new(conn)));
+                tracing::info!("sequence allocation enabled via the system database");
+                Proxy::with_sequences(router, backend, seq)
+            }
+            None => Proxy::new(router, backend),
         }
-        None => Proxy::new(router, backend),
-    });
+        .with_freshness(freshness),
+    );
 
     let listener = TcpListener::bind(args.listen)
         .await

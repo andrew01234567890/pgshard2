@@ -97,6 +97,9 @@ pub struct Router {
     primaries: BTreeMap<ShardId, Option<Endpoint>>,
     /// The system (unsharded) database endpoint, if known.
     system: Option<Endpoint>,
+    /// How stale the topology view may be before writes must stop (the
+    /// cluster's writeLeaseSeconds).
+    write_lease: std::time::Duration,
 }
 
 impl Router {
@@ -143,11 +146,19 @@ impl Router {
             catalog,
             primaries,
             system: topo.sequence_endpoint.clone(),
+            write_lease: std::time::Duration::from_secs(u64::from(topo.write_lease_seconds)),
         })
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The bound on topology staleness beyond which writes must stop: a router
+    /// that cannot confirm its view is current within this window may be
+    /// routing against a world that has moved on (a cutover it never saw).
+    pub fn write_lease(&self) -> std::time::Duration {
+        self.write_lease
     }
 
     /// Any serving shard with a primary, as a connection [`Target`]. Used to run

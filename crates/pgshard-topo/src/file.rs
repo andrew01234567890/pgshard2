@@ -16,11 +16,12 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::model::Topology;
-use crate::{TopologyError, TopologyWatcher, validate};
+use crate::{Freshness, TopologyError, TopologyWatcher, validate};
 
 pub struct FileWatcher {
     sender: Arc<watch::Sender<Arc<Topology>>>,
     path: PathBuf,
+    freshness: Freshness,
 }
 
 impl FileWatcher {
@@ -42,8 +43,11 @@ impl FileWatcher {
         let initial = load(&path).await?;
         let (sender, _) = watch::channel(Arc::new(initial));
         let sender = Arc::new(sender);
+        // The initial load just validated the source.
+        let freshness = Freshness::new();
 
         let poller = Arc::clone(&sender);
+        let poll_freshness = freshness.clone();
         let poll_path = path.clone();
         tokio::spawn(async move {
             // First tick after a full interval, not immediately: the initial
@@ -59,6 +63,12 @@ impl FileWatcher {
                 }
                 match load(&poll_path).await {
                     Ok(candidate) => {
+                        // A successful read+validate confirms the view is
+                        // current even when the epoch is unchanged; an error
+                        // deliberately leaves the freshness clock running so
+                        // consumers (the router's write lease) can bound how
+                        // stale their view might be.
+                        poll_freshness.bump();
                         apply(&poller, candidate);
                     }
                     Err(err) => {
@@ -69,14 +79,25 @@ impl FileWatcher {
             }
         });
 
-        Ok(FileWatcher { sender, path })
+        Ok(FileWatcher {
+            sender,
+            path,
+            freshness,
+        })
     }
 
     /// Re-reads the file immediately (tests use this instead of waiting for
     /// the poll tick). Returns whether the snapshot was applied.
     pub async fn reload(&self) -> Result<bool, TopologyError> {
         let candidate = load(&self.path).await?;
+        self.freshness.bump();
         Ok(apply(&self.sender, candidate))
+    }
+
+    /// The stamp of this watcher's last successful source validation — feed it
+    /// to the router so its write lease can bound staleness.
+    pub fn freshness(&self) -> Freshness {
+        self.freshness.clone()
     }
 }
 

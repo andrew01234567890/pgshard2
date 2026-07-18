@@ -35,6 +35,48 @@ pub trait TopologyWatcher {
     fn subscribe(&self) -> watch::Receiver<Arc<Topology>>;
 }
 
+/// The instant a watcher last successfully read AND validated its source —
+/// bumped on every successful poll, including one whose epoch was unchanged
+/// (an unchanged-but-readable source still confirms the view is current), and
+/// never on an error. Distinct from receiving a new snapshot: this is what
+/// lets a consumer bound how stale its view can possibly be — the router's
+/// write lease rejects writes once the age exceeds the topology's
+/// `write_lease_seconds`, so a router cut off from its source cannot keep
+/// writing against a routing world that may have moved on.
+#[derive(Clone)]
+pub struct Freshness(Arc<std::sync::RwLock<std::time::Instant>>);
+
+impl Freshness {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::RwLock::new(std::time::Instant::now())))
+    }
+
+    /// Record a successful source validation now.
+    pub fn bump(&self) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+    }
+
+    /// How long ago the source was last successfully validated.
+    pub fn age(&self) -> std::time::Duration {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+
+    /// Test hook: pretend the last successful validation happened `by` ago.
+    #[doc(hidden)]
+    pub fn backdate(&self, by: std::time::Duration) {
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = std::time::Instant::now().checked_sub(by) {
+            *guard = at;
+        }
+    }
+}
+
+impl Default for Freshness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Validates a candidate snapshot: the epoch and topology generation are the
 /// CRD's 1-based counters, the shard function must be known, and serving shards
 /// must partition the full keyspace. Serving shards are sorted before the

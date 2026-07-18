@@ -76,6 +76,13 @@ pub struct Proxy {
     /// `None` disables injection (such an INSERT then errors rather than routing
     /// a row with a missing id).
     seq: Option<SequenceAllocator>,
+    /// The topology watcher's last-successful-validation stamp. When present,
+    /// writes are refused once its age exceeds the router's write lease: a
+    /// router that cannot confirm its view is current may be routing against a
+    /// world that has moved on (a cutover it never saw), and a stale writer is
+    /// exactly the split-brain window the lease bounds. `None` (tests, direct
+    /// construction) disables the gate.
+    freshness: Option<pgshard_topo::Freshness>,
 }
 
 impl Proxy {
@@ -85,6 +92,7 @@ impl Proxy {
             router,
             backend,
             seq: None,
+            freshness: None,
         }
     }
 
@@ -96,7 +104,15 @@ impl Proxy {
             router,
             backend,
             seq: Some(seq),
+            freshness: None,
         }
+    }
+
+    /// Enforce the write lease against this freshness stamp (the topology
+    /// watcher's last successful source validation).
+    pub fn with_freshness(mut self, freshness: pgshard_topo::Freshness) -> Self {
+        self.freshness = Some(freshness);
+        self
     }
 
     /// Route backend traffic through the text-mode tokio-postgres backend instead
@@ -319,6 +335,25 @@ fn is_transaction_control(parsed: &Parsed) -> bool {
     })
 }
 
+/// Statement kinds that mutate data or schema — what the write lease gates.
+/// Reads stay allowed on a stale view (the plan's lease semantics): a stale
+/// read is bounded-stale data, but a stale WRITE can land on a shard that a
+/// cutover this router never saw has already retired.
+fn is_write(parsed: &Parsed) -> bool {
+    parsed.statements().iter().any(|s| {
+        matches!(
+            s,
+            StatementKind::Insert
+                | StatementKind::Update
+                | StatementKind::Delete
+                | StatementKind::Ddl
+                | StatementKind::Merge
+                | StatementKind::Copy
+                | StatementKind::Other
+        )
+    })
+}
+
 impl Proxy {
     async fn dispatch(
         &self,
@@ -327,6 +362,25 @@ impl Proxy {
         route: Route,
         query: &str,
     ) -> PgWireResult<Vec<Response>> {
+        // The write lease: once the topology view's last confirmed-fresh
+        // instant is older than the lease, this router can no longer prove its
+        // routing is current — refuse writes (reads continue) until the watcher
+        // validates the source again.
+        if let Some(freshness) = &self.freshness {
+            let age = freshness.age();
+            let lease = router.write_lease();
+            if age > lease && is_write(parsed) {
+                return Err(user_error(
+                    "57P01",
+                    format!(
+                        "write lease expired: topology last confirmed {}s ago (limit {}s); \
+                         refusing writes until the view refreshes",
+                        age.as_secs(),
+                        lease.as_secs()
+                    ),
+                ));
+            }
+        }
         match route {
             Route::Shard(t) => {
                 // An INSERT omitting a sequence-bound column has its id(s) filled
