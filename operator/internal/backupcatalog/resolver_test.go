@@ -15,18 +15,19 @@ import (
 //	t4  full backups of C..F
 //	t5  barrier b2
 const (
-	stanzaA = "c-A-g1"
-	stanzaB = "c-B-g1"
-	stanzaC = "c-C-g1"
-	stanzaD = "c-D-g1"
-	stanzaE = "c-E-g1"
-	stanzaF = "c-F-g1"
-	point1  = "pgshard_b1"
-	point2  = "pgshard_b2"
-	backup1 = "bk1"
-	stopA   = "0/3000000"
-	stanzaS = "c-sys-g1"
-	pointS  = "0/1000000"
+	stanzaA  = "c-A-g1"
+	stanzaB  = "c-B-g1"
+	stanzaC  = "c-C-g1"
+	stanzaD  = "c-D-g1"
+	stanzaE  = "c-E-g1"
+	stanzaF  = "c-F-g1"
+	point1   = "pgshard_b1"
+	point2   = "pgshard_b2"
+	backup1  = "bk1"
+	stopA    = "0/3000000"
+	sysShard = "sys"
+	stanzaS  = "c-sys-g1"
+	pointS   = "0/1000000"
 )
 
 var (
@@ -54,7 +55,7 @@ func driftCatalog() Catalog {
 				Tables: driftTables(), Shards: []ShardTopology{
 					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA, Role: RoleData, State: StateServing},
 					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB, Role: RoleData, State: StateServing},
-					{Name: "sys", Stanza: stanzaS, Role: RoleSystem, State: StateServing},
+					{Name: sysShard, Stanza: stanzaS, Role: RoleSystem, State: StateServing},
 				}},
 			{Generation: 2, ValidFrom: t3, Epoch: 10, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
@@ -62,35 +63,35 @@ func driftCatalog() Catalog {
 					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD, Role: RoleData, State: StateServing},
 					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE, Role: RoleData, State: StateServing},
 					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF, Role: RoleData, State: StateServing},
-					{Name: "sys", Stanza: stanzaS, Role: RoleSystem, State: StateServing},
+					{Name: sysShard, Stanza: stanzaS, Role: RoleSystem, State: StateServing},
 				}},
 		},
 		Barriers: []BarrierManifest{
 			{ID: "b1", Time: t2, TopologyGeneration: 1, Shards: []BarrierShard{
 				{Name: "A", Stanza: stanzaA, LSN: "0/5000000", Timeline: 1, RestorePoint: point1},
 				{Name: "B", Stanza: stanzaB, LSN: "0/6000000", Timeline: 2, RestorePoint: point1},
-				{Name: "sys", Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point1},
+				{Name: sysShard, Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point1},
 			}},
 			{ID: "b2", Time: t5, TopologyGeneration: 2, Shards: []BarrierShard{
 				{Name: "C", Stanza: stanzaC, LSN: "0/8000000", Timeline: 1, RestorePoint: point2},
 				{Name: "D", Stanza: stanzaD, LSN: "0/8000010", Timeline: 1, RestorePoint: point2},
 				{Name: "E", Stanza: stanzaE, LSN: "0/8000020", Timeline: 1, RestorePoint: point2},
 				{Name: "F", Stanza: stanzaF, LSN: "0/8000030", Timeline: 1, RestorePoint: point2},
-				{Name: "sys", Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point2},
+				{Name: sysShard, Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point2},
 			}},
 		},
 		Backups: []BackupManifest{
 			{ID: backup1, CompletedAt: t1, TopologyGeneration: 1, Shards: []BackupShard{
 				{Name: "A", Stanza: stanzaA, Label: "20260716-1F", StopLSN: stopA, Timeline: 1, StopTime: t1},
 				{Name: "B", Stanza: stanzaB, Label: "20260716-2F", StopLSN: "0/4000000", Timeline: 2, StopTime: t1},
-				{Name: "sys", Stanza: stanzaS, Label: "20260716-SF", StopLSN: pointS, Timeline: 1, StopTime: t1},
+				{Name: sysShard, Stanza: stanzaS, Label: "20260716-SF", StopLSN: pointS, Timeline: 1, StopTime: t1},
 			}},
 			{ID: "bk2", CompletedAt: t4, TopologyGeneration: 2, Shards: []BackupShard{
 				{Name: "C", Stanza: stanzaC, Label: "20260716-3F", StopLSN: "0/7000000", Timeline: 1, StopTime: t4},
 				{Name: "D", Stanza: stanzaD, Label: "20260716-4F", StopLSN: "0/7000010", Timeline: 1, StopTime: t4},
 				{Name: "E", Stanza: stanzaE, Label: "20260716-5F", StopLSN: "0/7000020", Timeline: 1, StopTime: t4},
 				{Name: "F", Stanza: stanzaF, Label: "20260716-6F", StopLSN: "0/7000030", Timeline: 1, StopTime: t4},
-				{Name: "sys", Stanza: stanzaS, Label: "20260716-S2", StopLSN: pointS, Timeline: 1, StopTime: t4},
+				{Name: sysShard, Stanza: stanzaS, Label: "20260716-S2", StopLSN: pointS, Timeline: 1, StopTime: t4},
 			}},
 		},
 	}
