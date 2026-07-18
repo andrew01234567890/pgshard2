@@ -248,25 +248,51 @@ pub enum TupleColumn<'a> {
     Binary(&'a [u8]),
 }
 
+/// The `streaming` option negotiated at `START_REPLICATION`. It determines
+/// whether a Stream Abort carries the protocol-v4 abort LSN and timestamp, which
+/// are sent only under parallel streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// In-progress transactions are not streamed (`streaming off`).
+    Off,
+    /// In-progress transactions are streamed (`streaming on`, protocol v2+).
+    On,
+    /// Streamed and applied in parallel (`streaming parallel`, protocol v4+);
+    /// Stream Abort additionally carries the abort LSN and timestamp.
+    Parallel,
+}
+
 /// Decodes a stream of `pgoutput` frames, tracking the streamed-transaction
 /// bracket so per-change xid prefixes are read exactly when present.
 #[derive(Debug, Clone)]
 pub struct PgOutputDecoder {
     protocol_version: u32,
+    stream_mode: StreamMode,
     in_stream: bool,
 }
 
 impl PgOutputDecoder {
-    /// A decoder for the given negotiated `pgoutput` protocol version.
+    /// A decoder for the given negotiated `pgoutput` protocol version, without
+    /// streaming of in-progress transactions.
     pub fn new(protocol_version: u32) -> Self {
+        Self::with_stream_mode(protocol_version, StreamMode::Off)
+    }
+
+    /// A decoder for the given negotiated protocol version and streaming mode.
+    pub fn with_stream_mode(protocol_version: u32, stream_mode: StreamMode) -> Self {
         Self {
             protocol_version,
+            stream_mode,
             in_stream: false,
         }
     }
 
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
+    }
+
+    pub fn stream_mode(&self) -> StreamMode {
+        self.stream_mode
     }
 
     /// Whether the decoder is currently between a Stream Start and Stream Stop.
@@ -279,6 +305,11 @@ impl PgOutputDecoder {
         let mut r = Reader::new(bytes);
         let tag = r.u8()?;
         let in_stream = self.in_stream;
+        // The stream-bracket transition is applied only once the whole frame is
+        // accepted, so a decode error never leaves the decoder in a half-updated
+        // state that would misread a following change's xid prefix.
+        let mut next_in_stream = in_stream;
+        let parallel = self.stream_mode == StreamMode::Parallel;
         let msg = match tag {
             b'B' => LogicalRepMsg::Begin(begin(&mut r)?),
             b'M' => LogicalRepMsg::Message(logical_message(&mut r, in_stream)?),
@@ -292,15 +323,15 @@ impl PgOutputDecoder {
             b'T' => LogicalRepMsg::Truncate(truncate(&mut r, in_stream)?),
             b'S' => {
                 let start = stream_start(&mut r)?;
-                self.in_stream = true;
+                next_in_stream = true;
                 LogicalRepMsg::StreamStart(start)
             }
             b'E' => {
-                self.in_stream = false;
+                next_in_stream = false;
                 LogicalRepMsg::StreamStop
             }
             b'c' => LogicalRepMsg::StreamCommit(stream_commit(&mut r)?),
-            b'A' => LogicalRepMsg::StreamAbort(stream_abort(&mut r, self.protocol_version)?),
+            b'A' => LogicalRepMsg::StreamAbort(stream_abort(&mut r, parallel)?),
             b'b' => LogicalRepMsg::BeginPrepare(prepared(&mut r, false)?),
             b'P' => LogicalRepMsg::Prepare(prepared(&mut r, true)?),
             b'K' => LogicalRepMsg::CommitPrepared(prepared(&mut r, true)?),
@@ -311,6 +342,7 @@ impl PgOutputDecoder {
         if r.remaining() != 0 {
             return Err(DecodeError::TrailingBytes(r.remaining()));
         }
+        self.in_stream = next_in_stream;
         Ok(msg)
     }
 }
@@ -361,7 +393,9 @@ fn relation<'a>(r: &mut Reader<'a>, in_stream: bool) -> Result<Relation<'a>, Dec
     let name = r.cstr()?;
     let replica_identity = r.u8()?;
     let count = count(r.i16()? as i32)?;
-    let mut columns = Vec::with_capacity(count.min(r.remaining()));
+    // Each column is at least flags(1) + name terminator(1) + oid(4) + typmod(4),
+    // so `remaining / 10` bounds how many can exist — cap the pre-allocation there.
+    let mut columns = Vec::with_capacity(count.min(r.remaining() / 10));
     for _ in 0..count {
         columns.push(RelationColumn {
             flags: r.u8()?,
@@ -442,7 +476,9 @@ fn truncate<'a>(r: &mut Reader<'a>, in_stream: bool) -> Result<Truncate, DecodeE
     let xid = stream_xid(r, in_stream)?;
     let count = count(r.i32()?)?;
     let options = r.u8()?;
-    let mut relations = Vec::with_capacity(count.min(r.remaining()));
+    // Each relation is a 4-byte oid, so the frame cannot hold more than
+    // `remaining / 4` of them — cap the pre-allocation to that, not the byte count.
+    let mut relations = Vec::with_capacity(count.min(r.remaining() / 4));
     for _ in 0..count {
         relations.push(r.u32()?);
     }
@@ -471,13 +507,14 @@ fn stream_commit(r: &mut Reader) -> Result<StreamCommit, DecodeError> {
     })
 }
 
-fn stream_abort(r: &mut Reader, protocol_version: u32) -> Result<StreamAbort, DecodeError> {
+fn stream_abort(r: &mut Reader, parallel: bool) -> Result<StreamAbort, DecodeError> {
     let xid = r.u32()?;
     let subxid = r.u32()?;
-    // The abort LSN and timestamp are sent only under protocol v4 with parallel
-    // streaming. The frame is self-delimiting, so their presence shows as bytes
-    // still remaining after the two xids.
-    let (abort_lsn, abort_timestamp) = if protocol_version >= 4 && r.remaining() >= 16 {
+    // The abort LSN and timestamp are sent only under parallel streaming (which
+    // implies protocol v4). Reading them is driven by the negotiated stream mode,
+    // not by guessing from the remaining length; the strict trailing-bytes check
+    // then rejects a frame that carries them unexpectedly, or omits them.
+    let (abort_lsn, abort_timestamp) = if parallel {
         (Some(r.lsn()?), Some(r.i64()?))
     } else {
         (None, None)
@@ -955,11 +992,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_abort_reads_v4_fields_only_when_present() {
-        // v4 parallel streaming: abort LSN + timestamp present.
+    fn stream_abort_reads_abort_fields_per_negotiated_stream_mode() {
         let with_extra = Frame::tag(b'A').u32(1).u32(2).u64(0x99).i64(725).build();
+        let bare = Frame::tag(b'A').u32(1).u32(2).build();
+
+        // Parallel streaming: the abort LSN + timestamp are read.
         assert_eq!(
-            PgOutputDecoder::new(4).decode(&with_extra).unwrap(),
+            PgOutputDecoder::with_stream_mode(4, StreamMode::Parallel)
+                .decode(&with_extra)
+                .unwrap(),
             LogicalRepMsg::StreamAbort(StreamAbort {
                 xid: 1,
                 subxid: 2,
@@ -967,10 +1008,11 @@ mod tests {
                 abort_timestamp: Some(725),
             })
         );
-        // Non-parallel: only the two xids.
-        let bare = Frame::tag(b'A').u32(1).u32(2).build();
+        // Non-parallel: only the two xids, no guessing from length.
         assert_eq!(
-            PgOutputDecoder::new(2).decode(&bare).unwrap(),
+            PgOutputDecoder::with_stream_mode(4, StreamMode::On)
+                .decode(&bare)
+                .unwrap(),
             LogicalRepMsg::StreamAbort(StreamAbort {
                 xid: 1,
                 subxid: 2,
@@ -978,6 +1020,34 @@ mod tests {
                 abort_timestamp: None,
             })
         );
+        // The mode makes it exact rather than heuristic: a non-parallel frame that
+        // carries 16 stray bytes is rejected, and a parallel frame missing them is
+        // truncated — neither is silently misread.
+        assert_eq!(
+            PgOutputDecoder::with_stream_mode(4, StreamMode::On)
+                .decode(&with_extra)
+                .unwrap_err(),
+            DecodeError::TrailingBytes(16)
+        );
+        assert!(matches!(
+            PgOutputDecoder::with_stream_mode(4, StreamMode::Parallel)
+                .decode(&bare)
+                .unwrap_err(),
+            DecodeError::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn a_decode_error_does_not_corrupt_the_stream_bracket() {
+        // A malformed Stream Start (trailing byte) must not leave in_stream set;
+        // otherwise a following plain change would be misread as carrying a prefix.
+        let mut d = dec();
+        let bad_start = Frame::tag(b'S').u32(9).u8(1).u8(0xFF).build();
+        assert_eq!(
+            d.decode(&bad_start).unwrap_err(),
+            DecodeError::TrailingBytes(1)
+        );
+        assert!(!d.in_stream());
     }
 
     #[test]

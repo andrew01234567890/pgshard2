@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pgshard-core = { path = "../pgshard-core" }
+pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 thiserror = "2.0.18"
 
 [lints]
