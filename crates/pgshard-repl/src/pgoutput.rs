@@ -597,18 +597,25 @@ fn count(value: i32) -> Result<usize, DecodeError> {
 
 /// A bounds-checked cursor over a frame. Every read either advances within the
 /// buffer or returns [`DecodeError::Truncated`]; it never panics.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.buf.len() - self.pos
+    }
+
+    /// Consume and return all remaining bytes.
+    pub(crate) fn rest(&mut self) -> &'a [u8] {
+        let slice = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        slice
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
@@ -625,7 +632,7 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8, DecodeError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
 
@@ -644,14 +651,14 @@ impl<'a> Reader<'a> {
         Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn i64(&mut self) -> Result<i64, DecodeError> {
+    pub(crate) fn i64(&mut self) -> Result<i64, DecodeError> {
         let b = self.take(8)?;
         Ok(i64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
     }
 
-    fn lsn(&mut self) -> Result<Lsn, DecodeError> {
+    pub(crate) fn lsn(&mut self) -> Result<Lsn, DecodeError> {
         let b = self.take(8)?;
         Ok(Lsn(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
