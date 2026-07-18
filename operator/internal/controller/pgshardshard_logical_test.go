@@ -140,6 +140,8 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &got)).To(Succeed())
 		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, shardDatabaseReadyCondition)).
 			To(BeTrue(), "the DatabaseReady condition is set")
+		Expect(agent.DatabaseProvenance(dbShard)).To(Equal(string(got.UID)),
+			"the database is stamped with this placement's identity")
 
 		// A second reconcile is a no-op: the recorded node identity short-circuits
 		// the call.
@@ -151,6 +153,75 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		var provisioned pgshardv1alpha1.PgShardShard
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &provisioned)).To(Succeed())
 		Expect(provisioned.Status.DatabaseNode).To(Equal("dbnode"))
+	})
+
+	It("fences a same-named database left by another placement and adopts only on explicit authorization", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "stalenode", Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		node.Status.Phase = pgshardv1alpha1.NodeReady
+		node.Status.CurrentPrimary = "stalenode-0"
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "stalenode-0", Namespace: ns},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "postgres", Image: "pg"},
+			}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.PodIP = "10.0.0.9"
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// A retained database from an earlier placement: same name, different
+		// (stale, partially-seeded) contents.
+		const staleShard = "staleshard"
+		agent.SeedDatabase(staleShard, "app", "prior-placement-uid")
+
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: staleShard, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				Replicas: 1, NodeRef: "stalenode",
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+
+		r := &PgShardShardReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: staleShard, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		reconcile()
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: staleShard, Namespace: ns}, &got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, shardDatabaseReadyCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("ForeignDatabase"))
+		Expect(cond.Message).To(ContainSubstring(adoptDatabaseAnnotation))
+		Expect(agent.DatabaseProvenance(staleShard)).To(Equal("prior-placement-uid"),
+			"the foreign marker is untouched")
+
+		// Explicit adoption: a deliberate human/restore action, never routine.
+		got.Annotations = map[string]string{adoptDatabaseAnnotation: "true"}
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: staleShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, shardDatabaseReadyCondition)).To(BeTrue())
+		Expect(agent.DatabaseProvenance(staleShard)).To(Equal(string(got.UID)),
+			"adoption re-stamps the marker with this placement's identity")
 	})
 
 	It("marks an overlong database name terminal without calling the agent or wedging the mirror", func() {
