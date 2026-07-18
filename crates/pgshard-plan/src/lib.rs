@@ -37,6 +37,11 @@
 //!   one over only global tables runs on the system database. This keeps the
 //!   qualifier-blind extractor sound (only one table is ever in scope) and never
 //!   under-routes a query whose other relations live on other shards.
+//! - A function body is opaque to the router. `SELECT f()`, where `f` runs
+//!   `SELECT count(*) FROM sharded`, carries no AST-visible table reference, so
+//!   it is treated as session-local and runs on one shard — a partial result.
+//!   Functions that read sharded tables are unsupported in M1 (no parser can see
+//!   through a function body without resolving it against the catalog).
 
 pub mod catalog;
 mod extract;
@@ -323,11 +328,16 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         .collect();
 
     if sharded.is_empty() {
-        // No sharded table in a plain FROM. If every FROM item is a plain
-        // relation, this is a global/system read (or a tableless `SELECT 1`);
-        // a subquery/function in the FROM could hide a sharded table, so route
-        // it to the system database rather than the shards either way.
-        return if from.tables.is_empty() && from.all_plain {
+        // No sharded table in a plain FROM. A tableless statement with no
+        // subquery is session-local (`SELECT 1`, `SELECT current_setting(...)`).
+        // But a subquery or CTE — or a subquery/function in the FROM — could still
+        // reach a sharded table (`SELECT (SELECT count(*) FROM sharded)`); running
+        // that on one arbitrary shard would silently return partial data. Route
+        // anything but a plain tableless statement to the system database, where a
+        // sharded reference errors loudly rather than answering wrong.
+        let session_local =
+            from.tables.is_empty() && from.all_plain && !contains_sublink(s) && !contains_cte(s);
+        return if session_local {
             Plan::RouterLocal
         } else {
             Plan::Unsharded
@@ -1168,6 +1178,30 @@ mod tests {
             Plan::Unsharded
         );
         assert_eq!(plan1("SELECT 1 UNION SELECT 2"), Plan::RouterLocal);
+    }
+
+    #[test]
+    fn tableless_select_hiding_a_sharded_reference_is_not_run_on_one_shard() {
+        // A tableless statement with no subquery is session-local.
+        assert_eq!(plan1("SELECT 1"), Plan::RouterLocal);
+        assert_eq!(plan1("SELECT current_setting('x')"), Plan::RouterLocal);
+        // But a target-list subquery or a CTE can reach a sharded table even with
+        // no FROM. Such a statement must not run on one arbitrary shard (which
+        // returns partial data); it routes to the system database, where a sharded
+        // reference errors loudly instead of answering wrong.
+        assert_eq!(
+            plan1("SELECT (SELECT count(*) FROM orders)"),
+            Plan::Unsharded
+        );
+        assert_eq!(
+            plan1("WITH x AS (SELECT customer_id FROM orders) SELECT (SELECT count(*) FROM x)"),
+            Plan::Unsharded
+        );
+        // A subquery over a global table is answered correctly on the system db.
+        assert_eq!(
+            plan1("SELECT (SELECT count(*) FROM settings)"),
+            Plan::Unsharded
+        );
     }
 
     #[test]
