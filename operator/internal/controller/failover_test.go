@@ -493,6 +493,19 @@ func TestIdentityFencingChangesTheElection(t *testing.T) {
 	})
 }
 
+func TestMalformedLatchRefusesEveryRole(t *testing.T) {
+	// A latch we cannot read means nothing can be verified: a sole healthy
+	// claimant must not keep -rw on its strength.
+	views := []instanceView{
+		{pod: "p0", isPrimary: true, ready: true, observed: true, systemID: 4242, timeline: 1},
+		{pod: "p1", isStandby: true, ready: true, observed: true, systemID: 4242, timeline: 1},
+	}
+	a := assessIdentity(views, identityInputs{malformed: true})
+	if !a.suppressPrimary || len(a.unrecognized) != 2 || len(a.fenced) != 2 {
+		t.Fatalf("assessment = %+v, want every role refused and publication suppressed", a)
+	}
+}
+
 func TestIdentityConditionReportsIncompleteObservation(t *testing.T) {
 	// A known rogue that becomes unreachable must not flap the condition to
 	// True: an unobserved started instance means this poll cannot attest
@@ -505,18 +518,46 @@ func TestIdentityConditionReportsIncompleteObservation(t *testing.T) {
 }
 
 func TestLatchIdentity(t *testing.T) {
-	t.Run("latches only from a trusted claimant with a nonzero id", func(t *testing.T) {
-		views := []instanceView{
-			{pod: "p9", isPrimary: true, observed: true, systemID: 9999, timeline: 5}, // unsolicited
+	t.Run("latches only from a trusted claimant, and never while observed ids disagree", func(t *testing.T) {
+		agreeing := []instanceView{
 			{pod: "p0", isPrimary: true, observed: true, systemID: 4242, timeline: 2},
+			{pod: "p1", isStandby: true, observed: true, systemID: 4242, timeline: 2},
 		}
-		id, expected, tl, err := latchIdentity(views, "p0", "", "", 0)
+		id, expected, tl, err := latchIdentity(agreeing, "p0", "", "", 0)
 		if err != nil || id != "4242" || expected != 4242 || tl != 2 {
-			t.Fatalf("latch = (%q,%d,%d,%v), want only the trusted claimant to latch", id, expected, tl, err)
+			t.Fatalf("latch = (%q,%d,%d,%v), want the trusted claimant to latch", id, expected, tl, err)
 		}
-		id, expected, tl, err = latchIdentity(views, "", "", "", 0)
+		id, expected, tl, err = latchIdentity(agreeing, "", "", "", 0)
 		if err != nil || id != "" || expected != 0 || tl != 0 {
 			t.Fatalf("latch = (%q,%d,%d,%v), want no latch without any trusted claimant", id, expected, tl, err)
+		}
+		// A one-poll blind spot can record CurrentPrimary before the rival is
+		// even observable; the latch must still refuse to imprint a lineage
+		// while observed instances disagree — the conflict path owns the poll.
+		disputed := []instanceView{
+			{pod: "p0", isPrimary: true, observed: true, systemID: 9999, timeline: 5},
+			{pod: "p1", isStandby: true, observed: true, systemID: 4242, timeline: 1},
+		}
+		id, expected, _, err = latchIdentity(disputed, "p0", "", "", 0)
+		if err != nil || id != "" || expected != 0 {
+			t.Fatalf("latch = (%q,%d,%v), want no latch while identities conflict", id, expected, err)
+		}
+	})
+	t.Run("only the committed target advances an existing timeline record", func(t *testing.T) {
+		views := []instanceView{
+			// The reigning primary suddenly reports a HIGHER timeline: every
+			// legitimate promotion goes through TargetPrimary, so this is a
+			// stale-status same-name rogue or a restored fork — it must be
+			// fenced by the assessment, not laundered into the record.
+			{pod: "p0", isPrimary: true, observed: true, systemID: 4242, timeline: 8},
+		}
+		_, _, tl, err := latchIdentity(views, "p0", "", "4242", 7)
+		if err != nil || tl != 7 {
+			t.Fatalf("timeline = (%d,%v), want the record held at 7 for a non-committed claimant", tl, err)
+		}
+		_, _, tl, err = latchIdentity(views, "", "p0", "4242", 7)
+		if err != nil || tl != 8 {
+			t.Fatalf("timeline = (%d,%v), want the committed target's promotion recorded", tl, err)
 		}
 	})
 	t.Run("a trusted pod NAME on a foreign volume cannot launder its timeline", func(t *testing.T) {

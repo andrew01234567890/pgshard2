@@ -563,6 +563,124 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 
+	It("never latches an intruder that claimed primary while its rival was unobservable", func() {
+		const bpNode = "blindnode"
+		intruder, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(intruder.Stop)
+		rival, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(rival.Stop)
+
+		// A reused foreign volume boots claiming primary while the genuine
+		// standby cannot be polled: the first poll records CurrentPrimary with
+		// nothing to compare against. When the rival appears, that trust must
+		// NOT be allowed to latch the intruder's lineage.
+		intruder.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		intruder.SetSystemID(9999)
+		rival.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		rival.SetEmptyStatus(true)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return intruder.Client()
+			}
+			return rival.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		Expect(k8sClient.Create(ctx, &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: bpNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		})).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: bpNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bpNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP(bpNode+"-0", primaryPodIP)
+		stampPodIP(bpNode+"-1", replicaPodIP)
+		reconcile() // blind poll: intruder becomes CurrentPrimary, unavoidably
+
+		// The rival becomes observable and disagrees: the trust recorded
+		// during the blind poll must not convert into a latch.
+		rival.SetEmptyStatus(false)
+		for range 3 {
+			reconcile()
+			got := get()
+			Expect(got.Status.SystemID).To(BeEmpty(),
+				"a blind-poll CurrentPrimary must not latch the intruder's lineage")
+			Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+				"publication stops the moment the conflict is visible")
+		}
+		cond := apimeta.FindStatusCondition(get().Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("IdentityConflict"))
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("refuses every role under an unreadable latched identity", func() {
+		const mlNode = "malformednode"
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		agent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+
+		dial := func(string, int32) (pgshardv1.AgentServiceClient, error) {
+			return agent.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: mlNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: mlNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile()
+		stampPodIP(mlNode+"-0", primaryPodIP)
+
+		// A corrupted latch (manual status edit, storage damage): nothing can
+		// be verified against it, so even a sole healthy claimant loses
+		// recognition — not just the election.
+		var got pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlNode, Namespace: ns}, &got)).To(Succeed())
+		got.Status.SystemID = "not-a-number"
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+
+		for range 2 {
+			reconcile()
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlNode, Namespace: ns}, &got)).To(Succeed())
+			Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+				"an unverifiable latch must not publish any primary")
+			Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("MalformedIdentity"))
+
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
 	It("suppresses primary publication while a same-lineage rogue claimant lives", func() {
 		const sbNode = "suppressnode"
 		legit, err := fakes.NewFakeAgent()

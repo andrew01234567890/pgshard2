@@ -686,6 +686,7 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		timeline:  shard.Status.Timeline,
 		current:   before.CurrentPrimary,
 		committed: before.TargetPrimary,
+		malformed: parseErr != nil,
 	})
 	// An unrecognized instance's role is never believed: no CurrentPrimary
 	// (-rw writes) for a rogue claimant, no replica role (-ro reads) for a

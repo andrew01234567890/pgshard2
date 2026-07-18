@@ -481,6 +481,7 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 		timeline:  node.Status.Timeline,
 		current:   before.CurrentPrimary,
 		committed: before.TargetPrimary,
+		malformed: parseErr != nil,
 	})
 	// An unrecognized instance's role is never believed: publishing a rogue
 	// claimant would put CurrentPrimary — and the -rw write service — on data

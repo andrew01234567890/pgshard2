@@ -109,6 +109,10 @@ type identityInputs struct {
 	timeline  int32
 	current   string
 	committed string
+	// malformed: the persisted latch failed to parse. Nothing can be
+	// verified, so every role is refused and publication suppressed until a
+	// human repairs the status.
+	malformed bool
 }
 
 // identityAssessment classifies one poll's views against the latched lineage.
@@ -195,6 +199,19 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 		if !v.observed && v.host != "" {
 			a.anyStartedUnobserved = true
 		}
+	}
+	if in.malformed {
+		// The persisted latch is unreadable: nothing can be compared, so
+		// NOTHING may be believed — not just the election. A sole claimant
+		// must not keep -rw on the strength of a latch we cannot verify.
+		for _, v := range views {
+			a.unrecognized = append(a.unrecognized, v.pod)
+			a.fenced = append(a.fenced, fmt.Sprintf(
+				"%s (latched identity is unreadable; nothing can be verified)", v.pod))
+		}
+		a.suppressPrimary = true
+		a.kept = append(a.kept, views...)
+		return a
 	}
 	if in.systemID == 0 {
 		ids := map[uint64]bool{}
@@ -301,27 +318,53 @@ func parseLatchedID(s string) (uint64, error) {
 // recognizes as primary (current) or is promoting (committed). An unsolicited
 // claimant must not latch (a reused volume could imprint a foreign lineage
 // forever), and even a trusted pod NAME returning on a foreign volume must
-// not launder its timeline into the recorded one. Returns the possibly
-// just-latched id string, its parsed value, and the updated timeline.
+// not launder its timeline into the recorded one. Two further guards:
+//
+//   - no latch while observed instances DISAGREE on their nonzero ids. A
+//     one-poll blind spot (the rival unobserved while an intruder claims
+//     primary) records CurrentPrimary before any comparison is possible;
+//     without this guard the next poll would latch the intruder via that
+//     trust and fence the genuine lineage as "foreign". The conflict path
+//     handles the poll instead;
+//   - the recorded timeline only ever advances, and only the COMMITTED
+//     election target may advance it past an existing value: a timeline bump
+//     is a promotion, and the operator drives every legitimate promotion
+//     through TargetPrimary — a reigning primary that suddenly reports a
+//     higher timeline (a stale-status same-name rogue, a restored fork) must
+//     be fenced by the assessment, not laundered into the record. The
+//     first recorded timeline (record zero) may come from either trusted
+//     name (the bootstrap latch itself).
+//
+// Returns the possibly just-latched id string, its parsed value, and the
+// updated timeline.
 func latchIdentity(
 	views []instanceView, current, committed, latched string, timeline int32,
 ) (systemID string, expectedID uint64, tl int32, parseErr error) {
 	systemID, tl = latched, timeline
 	expectedID, parseErr = parseLatchedID(latched)
+	ids := map[uint64]bool{}
+	for _, v := range views {
+		if v.observed && v.systemID != 0 {
+			ids[v.systemID] = true
+		}
+	}
+	disagreement := len(ids) > 1
 	for _, v := range views {
 		trusted := v.pod != "" && (v.pod == current || v.pod == committed)
 		if !v.isPrimary || !v.observed || !trusted || v.systemID == 0 {
 			continue
 		}
 		if parseErr == nil && expectedID == 0 {
+			if disagreement {
+				continue
+			}
 			systemID = strconv.FormatUint(v.systemID, 10)
 			expectedID = v.systemID
 		}
-		// The recorded timeline only ever ADVANCES: a trusted pod name
-		// returning on an old backup of the same cluster (matching id, lower
-		// timeline) must not drag the record back to its stale fork — the
-		// assessment then fences it as an off-timeline claimant.
-		if v.systemID == expectedID && v.timeline > tl {
+		if v.systemID != expectedID || v.timeline <= tl {
+			continue
+		}
+		if tl == 0 || v.pod == committed {
 			tl = v.timeline
 		}
 	}
