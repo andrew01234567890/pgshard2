@@ -236,6 +236,24 @@ message CreateDatabaseRequest {
   // (bootstrap) role. At most 63 bytes when set. Only applied at creation —
   // ownership of an already existing database is not reconciled here.
   string owner = 2;
+  // Identity of the shard placement this database belongs to (the shard's
+  // Kubernetes UID). At creation the agent stamps it as the database comment
+  // ("pgshard-provenance:<value>"); when the database already exists the agent
+  // verifies the stamp and fails with FAILED_PRECONDITION on a different or
+  // missing marker — deterministic names plus retained volumes mean a
+  // same-named database can hold another placement's stale, partially-seeded
+  // data, and it must never be adopted silently. A crash between CREATE
+  // DATABASE and the comment leaves the marker missing; recovering from that
+  // window also requires the explicit adopt authorization below. At most 128
+  // bytes, characters restricted to [A-Za-z0-9._:-]. Empty skips stamping and
+  // verification.
+  string provenance = 3;
+  // Explicit authorization to take over an existing database whose provenance
+  // marker is missing or different: the agent re-stamps the marker with
+  // `provenance` instead of failing. Only meaningful with a nonempty
+  // provenance (INVALID_ARGUMENT otherwise). Set from a deliberate
+  // restore/adopt action, never on the routine reconcile path.
+  bool adopt = 4;
 }
 
 message CreateDatabaseResponse {}

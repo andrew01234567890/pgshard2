@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio_postgres::NoTls;
 use tokio_postgres::error::SqlState;
 
-use crate::instance::{Instance, RestorePoint, Snapshot};
+use crate::instance::{ForeignDatabase, Instance, RestorePoint, Snapshot, provenance_marker};
 
 pub struct PgInstance {
     conn_string: String,
@@ -36,6 +36,27 @@ impl PgInstance {
 /// and safe against injection regardless of the source.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Quote a PostgreSQL string literal: wrap in single quotes and double any
+/// embedded single quote. The service layer restricts the characters that
+/// reach this; quoting keeps the statement correct regardless.
+fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+async fn stamp_provenance(
+    client: &tokio_postgres::Client,
+    name: &str,
+    provenance: &str,
+) -> anyhow::Result<()> {
+    let stmt = format!(
+        "COMMENT ON DATABASE {} IS {}",
+        quote_ident(name),
+        quote_literal(&provenance_marker(provenance))
+    );
+    client.batch_execute(&stmt).await?;
+    Ok(())
 }
 
 /// PostgreSQL text LSN ("X/Y", hex) to the u64 the wire protocol uses.
@@ -141,30 +162,64 @@ impl Instance for PgInstance {
         Ok(())
     }
 
-    async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()> {
+    async fn create_database(
+        &self,
+        name: &str,
+        owner: &str,
+        provenance: &str,
+        adopt: bool,
+    ) -> anyhow::Result<()> {
         let client = self.connect().await?;
-        // Fast path: skip the DDL (and its error) when the database is present.
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
-                &[&name],
-            )
-            .await?
-            .get(0);
-        if exists {
-            return Ok(());
-        }
-        let mut stmt = format!("CREATE DATABASE {}", quote_ident(name));
-        if !owner.is_empty() {
-            stmt.push_str(&format!(" OWNER {}", quote_ident(owner)));
-        }
-        // CREATE DATABASE cannot run inside a transaction block; simple-query.
-        match client.batch_execute(&stmt).await {
-            Ok(()) => Ok(()),
-            // Lost the check-then-create race with a concurrent caller: the
-            // database now exists, which is the requested end state.
-            Err(e) if e.code() == Some(&SqlState::DUPLICATE_DATABASE) => Ok(()),
-            Err(e) => Err(e.into()),
+        loop {
+            // The provenance marker lives in the database's comment
+            // (pg_shdescription), the one annotation CREATE DATABASE-adjacent
+            // metadata offers without connecting into the new database.
+            let existing = client
+                .query_opt(
+                    "SELECT sd.description
+                     FROM pg_database d
+                     LEFT JOIN pg_shdescription sd
+                       ON sd.objoid = d.oid AND sd.classoid = 'pg_database'::regclass
+                     WHERE d.datname = $1",
+                    &[&name],
+                )
+                .await?;
+            if let Some(row) = existing {
+                if provenance.is_empty() {
+                    return Ok(());
+                }
+                let found: Option<String> = row.get(0);
+                return match found {
+                    Some(ref marker) if *marker == provenance_marker(provenance) => Ok(()),
+                    _ if adopt => stamp_provenance(&client, name, provenance).await,
+                    found => Err(ForeignDatabase {
+                        name: name.to_owned(),
+                        found,
+                    }
+                    .into()),
+                };
+            }
+            let mut stmt = format!("CREATE DATABASE {}", quote_ident(name));
+            if !owner.is_empty() {
+                stmt.push_str(&format!(" OWNER {}", quote_ident(owner)));
+            }
+            // CREATE DATABASE cannot run inside a transaction block; simple-query.
+            match client.batch_execute(&stmt).await {
+                Ok(()) => {
+                    if !provenance.is_empty() {
+                        // Not atomic with the create: a crash inside this window
+                        // leaves the database unstamped, and the retry then fails
+                        // closed (ForeignDatabase) until an explicit adopt — safer
+                        // than ever mistaking foreign data for our own.
+                        stamp_provenance(&client, name, provenance).await?;
+                    }
+                    return Ok(());
+                }
+                // Lost the check-then-create race: loop back to verify the
+                // winner's provenance marker instead of assuming success.
+                Err(e) if e.code() == Some(&SqlState::DUPLICATE_DATABASE) => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 

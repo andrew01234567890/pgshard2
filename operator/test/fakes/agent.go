@@ -48,6 +48,10 @@ type FakeAgent struct {
 	// owner) so controller tests can assert placement provisioning.
 	databases map[string]string
 
+	// dbProvenance mirrors the real agent's database-comment marker (name ->
+	// provenance value; absent key = unmarked database).
+	dbProvenance map[string]string
+
 	// emptyStatus makes GetStatus return a response with a nil Status, to
 	// exercise the operator's empty-status handling.
 	emptyStatus bool
@@ -117,6 +121,7 @@ func NewFakeAgent() (*FakeAgent, error) {
 		},
 		executedSchemaOps: map[string]string{},
 		databases:         map[string]string{},
+		dbProvenance:      map[string]string{},
 		server:            grpc.NewServer(),
 		listener:          listener,
 	}
@@ -312,8 +317,23 @@ func (f *FakeAgent) CreateDatabase(
 	if len(req.Name) > 63 || len(req.Owner) > 63 {
 		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
 	}
-	if _, ok := f.databases[req.Name]; !ok {
-		f.databases[req.Name] = req.Owner
+	if req.Adopt && req.Provenance == "" {
+		return nil, status.Error(codes.InvalidArgument, "adopt requires a provenance marker to stamp")
+	}
+	if _, ok := f.databases[req.Name]; ok {
+		if req.Provenance != "" && f.dbProvenance[req.Name] != req.Provenance {
+			if !req.Adopt {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"database %q already exists with provenance %q; refusing to adopt without explicit authorization",
+					req.Name, f.dbProvenance[req.Name])
+			}
+			f.dbProvenance[req.Name] = req.Provenance
+		}
+		return &pgshardv1.CreateDatabaseResponse{}, nil
+	}
+	f.databases[req.Name] = req.Owner
+	if req.Provenance != "" {
+		f.dbProvenance[req.Name] = req.Provenance
 	}
 	return &pgshardv1.CreateDatabaseResponse{}, nil
 }
@@ -338,4 +358,26 @@ func (f *FakeAgent) Databases() map[string]string {
 	out := make(map[string]string, len(f.databases))
 	maps.Copy(out, f.databases)
 	return out
+}
+
+// DatabaseProvenance returns the provenance marker stamped on a database
+// (empty = unmarked or absent).
+func (f *FakeAgent) DatabaseProvenance(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dbProvenance[name]
+}
+
+// SeedDatabase plants a pre-existing database with an arbitrary provenance
+// marker (empty = unmarked), as a retained volume from another placement
+// would leave behind.
+func (f *FakeAgent) SeedDatabase(name, owner, provenance string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.databases[name] = owner
+	if provenance == "" {
+		delete(f.dbProvenance, name)
+	} else {
+		f.dbProvenance[name] = provenance
+	}
 }

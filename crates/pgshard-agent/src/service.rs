@@ -15,7 +15,7 @@ use pgshard_proto::v1;
 use v1::agent_service_server::AgentService;
 
 use crate::epoch::{EpochError, EpochGuard, Outcome};
-use crate::instance::{Instance, RestorePoint};
+use crate::instance::{ForeignDatabase, Instance, RestorePoint};
 use crate::schema::{Claim, SchemaError, SchemaLog};
 use crate::status::to_status;
 
@@ -98,6 +98,27 @@ fn check_ident(what: &str, value: &str, required: bool) -> Result<(), Status> {
         return Err(Status::invalid_argument(format!(
             "{what} exceeds PostgreSQL's {MAX_IDENT_BYTES}-byte identifier limit"
         )));
+    }
+    Ok(())
+}
+
+/// Bounds the provenance marker (a Kubernetes UID in practice) and keeps the
+/// stamped comment trivially parseable and safe to embed.
+const MAX_PROVENANCE_BYTES: usize = 128;
+
+fn check_provenance(value: &str) -> Result<(), Status> {
+    if value.len() > MAX_PROVENANCE_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "provenance exceeds {MAX_PROVENANCE_BYTES} bytes"
+        )));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return Err(Status::invalid_argument(
+            "provenance may only contain [A-Za-z0-9._:-]",
+        ));
     }
     Ok(())
 }
@@ -377,10 +398,19 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         let req = request.into_inner();
         check_ident("database name", &req.name, true)?;
         check_ident("owner", &req.owner, false)?;
+        check_provenance(&req.provenance)?;
+        if req.adopt && req.provenance.is_empty() {
+            return Err(Status::invalid_argument(
+                "adopt requires a provenance marker to stamp",
+            ));
+        }
         self.instance
-            .create_database(&req.name, &req.owner)
+            .create_database(&req.name, &req.owner, &req.provenance, req.adopt)
             .await
-            .map_err(internal)?;
+            .map_err(|e| match e.downcast::<ForeignDatabase>() {
+                Ok(foreign) => Status::failed_precondition(foreign.to_string()),
+                Err(other) => internal(other),
+            })?;
         Ok(Response::new(v1::CreateDatabaseResponse {}))
     }
     async fn drop_database(
@@ -568,6 +598,7 @@ mod tests {
             Request::new(v1::CreateDatabaseRequest {
                 name: name.into(),
                 owner: owner.into(),
+                ..Default::default()
             })
         };
         s.create_database(req("mycl-x40-x80", "app")).await.unwrap();
@@ -585,7 +616,7 @@ mod tests {
         let err = s
             .create_database(Request::new(v1::CreateDatabaseRequest {
                 name: String::new(),
-                owner: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -601,7 +632,7 @@ mod tests {
         assert_eq!(
             s.create_database(Request::new(v1::CreateDatabaseRequest {
                 name: too_long.clone(),
-                owner: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap_err()
@@ -622,6 +653,7 @@ mod tests {
             s.create_database(Request::new(v1::CreateDatabaseRequest {
                 name: "ok".into(),
                 owner: too_long,
+                ..Default::default()
             }))
             .await
             .unwrap_err()
@@ -636,7 +668,7 @@ mod tests {
         let s = svc(FakeInstance::primary());
         s.create_database(Request::new(v1::CreateDatabaseRequest {
             name: "shard-a".into(),
-            owner: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -659,11 +691,98 @@ mod tests {
         let err = s
             .create_database(Request::new(v1::CreateDatabaseRequest {
                 name: "shard-a".into(),
-                owner: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn create_database_stamps_and_verifies_provenance() {
+        let s = svc(FakeInstance::primary());
+        let req = |provenance: &str, adopt: bool| {
+            Request::new(v1::CreateDatabaseRequest {
+                name: "mycl-x40-x80".into(),
+                provenance: provenance.into(),
+                adopt,
+                ..Default::default()
+            })
+        };
+        s.create_database(req("uid-a", false)).await.unwrap();
+        assert_eq!(
+            s.instance.marker_of("mycl-x40-x80").as_deref(),
+            Some("pgshard-provenance:uid-a")
+        );
+        // Same placement retries idempotently.
+        s.create_database(req("uid-a", false)).await.unwrap();
+        // A different placement is fenced out, and the marker is untouched.
+        let err = s.create_database(req("uid-b", false)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            s.instance.marker_of("mycl-x40-x80").as_deref(),
+            Some("pgshard-provenance:uid-a")
+        );
+        // Explicit adoption re-stamps.
+        s.create_database(req("uid-b", true)).await.unwrap();
+        assert_eq!(
+            s.instance.marker_of("mycl-x40-x80").as_deref(),
+            Some("pgshard-provenance:uid-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_database_fences_an_unmarked_existing_database() {
+        let s = svc(FakeInstance::primary());
+        // A retained database with no marker (pre-provenance data, or a crash
+        // between CREATE DATABASE and the comment) is never silently adopted.
+        s.instance.seed_database("mycl-x40-x80", "app", None);
+        let req = |adopt: bool| {
+            Request::new(v1::CreateDatabaseRequest {
+                name: "mycl-x40-x80".into(),
+                provenance: "uid-a".into(),
+                adopt,
+                ..Default::default()
+            })
+        };
+        let err = s.create_database(req(false)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        s.create_database(req(true)).await.unwrap();
+        assert_eq!(
+            s.instance.marker_of("mycl-x40-x80").as_deref(),
+            Some("pgshard-provenance:uid-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_database_validates_provenance_and_adopt() {
+        let s = svc(FakeInstance::primary());
+        let req = |provenance: String, adopt: bool| {
+            Request::new(v1::CreateDatabaseRequest {
+                name: "shard-a".into(),
+                provenance,
+                adopt,
+                ..Default::default()
+            })
+        };
+        // Adoption without a marker to stamp is meaningless.
+        let err = s
+            .create_database(req(String::new(), true))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // Characters outside [A-Za-z0-9._:-] and overlong values are rejected.
+        let err = s
+            .create_database(req("uid'; DROP--".into(), false))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let err = s
+            .create_database(req("a".repeat(129), false))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(s.instance.databases().is_empty());
     }
 
     #[tokio::test]

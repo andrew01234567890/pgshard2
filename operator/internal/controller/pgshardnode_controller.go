@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,6 +46,34 @@ import (
 // is not scoped to a cluster (a shared node hosts several clusters' shard
 // databases), so — unlike a shard — its objects carry no cluster label.
 const labelNode = "pgshard.dev/node"
+
+// labelNodeUID binds a PVC to the exact PgShardNode (by Kubernetes UID) whose
+// data it holds. PVCs are retained across pod churn and node deletion, and
+// their names are deterministic — so a recreated node with the same name would
+// otherwise silently mount a prior node's stale data. A PVC whose UID label is
+// missing or different is never mounted; adopting it is an explicit human
+// action (relabel the PVC, or delete it for a fresh volume).
+const labelNodeUID = "pgshard.dev/node-uid"
+
+// storageProvenanceCondition reports whether every PVC this node would mount
+// carries its UID label (True/Verified) or a foreign volume blocked instance
+// creation (False/ForeignData).
+const storageProvenanceCondition = "StorageProvenance"
+
+// foreignPVCError blocks mounting a retained PVC that belongs to a different
+// (or unlabeled, pre-provenance) node identity.
+type foreignPVCError struct {
+	pvc      string
+	foundUID string
+}
+
+func (e *foreignPVCError) Error() string {
+	found := "no node-uid label"
+	if e.foundUID != "" {
+		found = "node-uid " + e.foundUID
+	}
+	return fmt.Sprintf("pvc %s exists with %s and does not belong to this node", e.pvc, found)
+}
 
 // PgShardNodeReconciler owns the physical objects of one node: pods, PVCs,
 // services, and the aggregated status (the operator polls the in-pod agents;
@@ -97,8 +127,15 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
 		if err := r.ensureInstance(ctx, &node, ordinal); err != nil {
+			var foreign *foreignPVCError
+			if errors.As(err, &foreign) {
+				return r.degradeForeignStorage(ctx, &node, foreign)
+			}
 			return ctrl.Result{}, err
 		}
+	}
+	if err := r.clearStorageProvenance(ctx, &node); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	readyReplicas, err := r.aggregateStatus(ctx, &node)
@@ -212,7 +249,10 @@ func (r *PgShardNodeReconciler) ensureInstance(
 
 // ensurePVC creates a node PVC if absent. PVCs deliberately carry no owner
 // reference: data outlives pod churn, and deletion is an explicit decommission
-// step — never on scale-down or pod recreation.
+// step — never on scale-down or pod recreation. An existing PVC is verified
+// against this node's UID on every pass: deterministic names mean a recreated
+// same-named node finds its predecessor's retained volume here, and mounting
+// it would silently serve another lineage's data.
 func (r *PgShardNodeReconciler) ensurePVC(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode, pvcName string,
 ) error {
@@ -221,6 +261,9 @@ func (r *PgShardNodeReconciler) ensurePVC(
 	}}
 	err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)
 	if err == nil {
+		if uid := pvc.Labels[labelNodeUID]; uid != string(node.UID) {
+			return &foreignPVCError{pvc: pvcName, foundUID: uid}
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -235,6 +278,7 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		}
 	}
 	pvc.Labels = nodeSelector(node)
+	pvc.Labels[labelNodeUID] = string(node.UID)
 	pvc.Spec = corev1.PersistentVolumeClaimSpec{
 		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		Resources: corev1.VolumeResourceRequirements{
@@ -246,6 +290,57 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		return fmt.Errorf("pvc %s: %w", pvcName, err)
 	}
 	return nil
+}
+
+// degradeForeignStorage records that a retained volume from another node
+// identity blocked instance creation, and stops reconciling instances: the pod
+// that would mount it is never created. Recovery is an explicit human action —
+// relabel the PVC to this node's UID to adopt its data deliberately, or delete
+// it for a fresh volume — retried at the poll cadence, not by hot-looping an
+// error.
+func (r *PgShardNodeReconciler) degradeForeignStorage(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, foreign *foreignPVCError,
+) (ctrl.Result, error) {
+	logf.FromContext(ctx).Info("foreign PVC blocks instance creation",
+		"node", node.Name, "pvc", foreign.pvc, "foundUID", foreign.foundUID)
+	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type:   storageProvenanceCondition,
+		Status: metav1.ConditionFalse,
+		Reason: "ForeignData",
+		Message: fmt.Sprintf(
+			"%s; relabel it with %s=%s to adopt its data deliberately, or delete it for a fresh volume",
+			foreign.Error(), labelNodeUID, node.UID),
+		ObservedGeneration: node.Generation,
+	})
+	node.Status.Phase = pgshardv1alpha1.NodeDegraded
+	if err := r.Status().Update(ctx, node); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	interval := r.StatusPollInterval
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// clearStorageProvenance flips a previously-failed provenance check back to
+// True once every PVC verifies (the operator relabeled or deleted the foreign
+// volume). Nodes that never failed carry no condition at all.
+func (r *PgShardNodeReconciler) clearStorageProvenance(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) error {
+	cond := apimeta.FindStatusCondition(node.Status.Conditions, storageProvenanceCondition)
+	if cond == nil || cond.Status == metav1.ConditionTrue {
+		return nil
+	}
+	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type:               storageProvenanceCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Verified",
+		Message:            "all PVCs carry this node's identity label",
+		ObservedGeneration: node.Generation,
+	})
+	return client.IgnoreNotFound(r.Status().Update(ctx, node))
 }
 
 // pruneExcessInstances deletes pods for ordinals at or above the desired

@@ -2194,7 +2194,25 @@ type CreateDatabaseRequest struct {
 	// Role that owns the new database; empty leaves it owned by the connecting
 	// (bootstrap) role. At most 63 bytes when set. Only applied at creation —
 	// ownership of an already existing database is not reconciled here.
-	Owner         string `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
+	Owner string `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
+	// Identity of the shard placement this database belongs to (the shard's
+	// Kubernetes UID). At creation the agent stamps it as the database comment
+	// ("pgshard-provenance:<value>"); when the database already exists the agent
+	// verifies the stamp and fails with FAILED_PRECONDITION on a different or
+	// missing marker — deterministic names plus retained volumes mean a
+	// same-named database can hold another placement's stale, partially-seeded
+	// data, and it must never be adopted silently. A crash between CREATE
+	// DATABASE and the comment leaves the marker missing; recovering from that
+	// window also requires the explicit adopt authorization below. At most 128
+	// bytes, characters restricted to [A-Za-z0-9._:-]. Empty skips stamping and
+	// verification.
+	Provenance string `protobuf:"bytes,3,opt,name=provenance,proto3" json:"provenance,omitempty"`
+	// Explicit authorization to take over an existing database whose provenance
+	// marker is missing or different: the agent re-stamps the marker with
+	// `provenance` instead of failing. Only meaningful with a nonempty
+	// provenance (INVALID_ARGUMENT otherwise). Set from a deliberate
+	// restore/adopt action, never on the routine reconcile path.
+	Adopt         bool `protobuf:"varint,4,opt,name=adopt,proto3" json:"adopt,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2241,6 +2259,20 @@ func (x *CreateDatabaseRequest) GetOwner() string {
 		return x.Owner
 	}
 	return ""
+}
+
+func (x *CreateDatabaseRequest) GetProvenance() string {
+	if x != nil {
+		return x.Provenance
+	}
+	return ""
+}
+
+func (x *CreateDatabaseRequest) GetAdopt() bool {
+	if x != nil {
+		return x.Adopt
+	}
+	return false
 }
 
 type CreateDatabaseResponse struct {
@@ -2704,10 +2736,14 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06events\x18\x01 \x03(\v2\x12.pgshard.v1.VEventR\x06events\"%\n" +
 	"\x0fDropSlotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\"\x12\n" +
-	"\x10DropSlotResponse\"A\n" +
+	"\x10DropSlotResponse\"w\n" +
 	"\x15CreateDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05owner\x18\x02 \x01(\tR\x05owner\"\x18\n" +
+	"\x05owner\x18\x02 \x01(\tR\x05owner\x12\x1e\n" +
+	"\n" +
+	"provenance\x18\x03 \x01(\tR\n" +
+	"provenance\x12\x14\n" +
+	"\x05adopt\x18\x04 \x01(\bR\x05adopt\"\x18\n" +
 	"\x16CreateDatabaseResponse\")\n" +
 	"\x13DropDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x16\n" +

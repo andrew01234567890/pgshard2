@@ -211,6 +211,12 @@ const shardDatabaseReadyCondition = "DatabaseReady"
 // terminal condition instead of an endless retry.
 const maxDatabaseNameBytes = 63
 
+// adoptDatabaseAnnotation ("true") authorizes taking over an existing
+// same-named database whose provenance marker does not match this shard — a
+// deliberate restore/adopt action. Without it a foreign or unmarked database
+// is fenced (DatabaseReady False/ForeignDatabase) and never served.
+const adoptDatabaseAnnotation = "pgshard.dev/adopt-database"
+
 // shardDatabaseName is the Postgres DATABASE a placed shard lives in. Shard
 // names are namespace-unique, and a node hosts many shards' databases, so the
 // shard name is a natural per-node-unique database name.
@@ -272,13 +278,27 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		log.Error(err, "dialing agent for database provisioning")
 		return
 	}
-	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{Name: name}); err != nil {
+	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{
+		Name: name,
+		// The shard UID binds the database to this placement: deterministic
+		// names plus retained volumes mean a same-named database can hold a
+		// prior placement's stale, partially-seeded data, and the agent fences
+		// it (FAILED_PRECONDITION) instead of adopting it silently.
+		Provenance: string(shard.UID),
+		Adopt:      shard.Annotations[adoptDatabaseAnnotation] == "true",
+	}); err != nil {
+		switch grpcstatus.Code(err) {
 		// InvalidArgument is a permanent contract violation; record it terminally
 		// rather than retrying forever. Other errors are transient — the poll
 		// interval retries.
-		if grpcstatus.Code(err) == codes.InvalidArgument {
+		case codes.InvalidArgument:
 			r.setDatabaseCondition(shard, metav1.ConditionFalse, "Rejected", err.Error())
-		} else {
+		case codes.FailedPrecondition:
+			r.setDatabaseCondition(shard, metav1.ConditionFalse, "ForeignDatabase",
+				err.Error()+fmt.Sprintf(
+					" (annotate the shard with %s=true to adopt it deliberately)",
+					adoptDatabaseAnnotation))
+		default:
 			log.Error(err, "creating shard database", "database", name)
 		}
 		return
