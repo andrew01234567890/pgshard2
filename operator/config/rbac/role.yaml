@@ -63,8 +63,17 @@ rules:
   resources:
   - pgshardclusters/status
   - pgshardnodes/status
+  - pgshardreshards/status
   - pgshardshards/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - pgshard.dev
+  resources:
+  - pgshardreshards
+  verbs:
+  - get
+  - list
+  - watch
