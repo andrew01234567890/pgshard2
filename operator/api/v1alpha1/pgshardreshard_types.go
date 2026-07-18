@@ -51,6 +51,7 @@ type PgShardReshardSpec struct {
 // exist in the state model but are not yet driven (they need the seeding engine,
 // the freeze-LSN handshake, and router-fleet gating); this controller drives
 // through ProvisioningTargets and back out via RollingBack.
+// +kubebuilder:validation:Enum=Pending;Validating;ProvisioningTargets;Seeding;CatchingUp;ReadyToCutover;CuttingOver;SwitchedForward;Finalizing;Completed;RollingBack;Failed
 type ReshardPhase string
 
 const (
@@ -98,7 +99,11 @@ type PgShardReshardStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// TargetShards are the names of the PgShardShard objects created for the
-	// target ranges, in TargetRanges order.
+	// target ranges, in TargetRanges order. Recording them here is a convenience;
+	// resume safety does not depend on it, because the controller derives each
+	// target's name deterministically from the (immutable) cluster and key range,
+	// so a crash between creating a target and recording it re-derives the same
+	// name and the create is idempotent (AlreadyExists).
 	// +optional
 	TargetShards []string `json:"targetShards,omitempty"`
 
