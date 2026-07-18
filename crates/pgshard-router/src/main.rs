@@ -77,10 +77,15 @@ async fn main() -> anyhow::Result<()> {
     // one. Built from the initial endpoint; a system-shard endpoint change needs
     // a router restart to pick up (a follow-up), though the reserver reconnects
     // through transient failures on its own.
+    // Typed setters, never a formatted conninfo string: a credential containing
+    // whitespace or quotes must not split into extra connection options.
     let system_conn = router.load().system_endpoint().map(|ep| {
-        format!(
-            "host={} port={} user={} password={} dbname={}",
-            ep.host, ep.port, backend.user, backend.password, backend.system_database
+        pgshard_router::sequence::reserver_config(
+            &ep.host,
+            ep.port,
+            &backend.user,
+            &backend.password,
+            &backend.system_database,
         )
     });
     let proxy = std::sync::Arc::new(match system_conn {

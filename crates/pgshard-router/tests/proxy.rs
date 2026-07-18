@@ -410,7 +410,9 @@ async fn an_omitted_sequence_column_is_filled_from_the_system_database() {
 
     let router =
         pgshard_router::shared(Router::build(&sequenced_topology(pg.host(), pg.port())).unwrap());
-    let seq = Arc::new(SequenceCache::new(PgBlockReserver::new(sys_conn)));
+    let seq = Arc::new(SequenceCache::new(PgBlockReserver::new(
+        sys_conn.parse().unwrap(),
+    )));
     let proxy = Arc::new(Proxy::with_sequences(
         router,
         Backend {

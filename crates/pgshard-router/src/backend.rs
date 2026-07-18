@@ -128,13 +128,16 @@ impl BackendConnection for TokioPostgresBackend {
         database: &str,
         query: &str,
     ) -> PgWireResult<Vec<BackendResult>> {
-        let conn = format!(
-            "host={} port={} user={} password={} dbname={}",
-            endpoint.host, endpoint.port, self.creds.user, self.creds.password, database
-        );
-        let (client, connection) = tokio_postgres::connect(&conn, NoTls)
-            .await
-            .map_err(tokio_backend_error)?;
+        // Typed setters, never a formatted conninfo string: a credential
+        // containing whitespace or quotes must not split into extra connection
+        // options (e.g. a second host to fail over to).
+        let mut conn = tokio_postgres::Config::new();
+        conn.host(&endpoint.host)
+            .port(endpoint.port)
+            .user(&self.creds.user)
+            .password(&self.creds.password)
+            .dbname(database);
+        let (client, connection) = conn.connect(NoTls).await.map_err(tokio_backend_error)?;
         // The connection task drives the protocol; it ends when `client` drops.
         let driver = tokio::spawn(connection);
         let result = client
