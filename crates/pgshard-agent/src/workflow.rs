@@ -80,6 +80,20 @@ pub struct WorkflowHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+impl WorkflowHandle {
+    /// A workflow whose status is terminal is replaceable (and holds no claim
+    /// on its target) even if its task has not quite finished unwinding — a
+    /// restart acknowledged against a dying task would otherwise be a success
+    /// with no worker behind it.
+    fn live(&self) -> bool {
+        if self.join.is_finished() {
+            return false;
+        }
+        let phase = self.status.borrow().phase;
+        phase != v1::WorkflowPhase::Error as i32 && phase != v1::WorkflowPhase::Stopped as i32
+    }
+}
+
 #[derive(Default)]
 pub struct WorkflowRegistry {
     inner: Mutex<HashMap<String, WorkflowHandle>>,
@@ -268,7 +282,7 @@ impl WorkflowRegistry {
         let spec_bytes = spec.encode_to_vec();
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.get(&run.id)
-            && !existing.join.is_finished()
+            && existing.live()
         {
             if existing.spec_bytes == spec_bytes {
                 return Ok(());
@@ -277,9 +291,10 @@ impl WorkflowRegistry {
         }
         // One running workflow per target database: seeding truncates, so a
         // second worker under a DIFFERENT id would destroy the first's copy.
-        if let Some((other, _)) = inner.iter().find(|(id, h)| {
-            **id != run.id && !h.join.is_finished() && h.target_database == run.target_database
-        }) {
+        if let Some((other, _)) = inner
+            .iter()
+            .find(|(id, h)| **id != run.id && h.live() && h.target_database == run.target_database)
+        {
             return Err(WorkflowError::TargetBusy(
                 other.clone(),
                 run.target_database,
@@ -417,6 +432,13 @@ struct PublicationShape {
     delete: bool,
     truncate: bool,
     via_partition_root: bool,
+    publishes_generated: bool,
+    /// Row versions (xmin) of the pg_publication row and every
+    /// pg_publication_rel row. A sampled shape comparison alone would miss a
+    /// toggle-away-and-back between polls; ANY ALTER PUBLICATION rewrites at
+    /// least one of these rows, and xids never repeat, so the version set
+    /// cannot match unless the publication was untouched the whole time.
+    versions: Vec<(u32, String)>,
     tables: Vec<PublishedTable>,
 }
 
@@ -426,12 +448,27 @@ async fn fetch_publication(
 ) -> anyhow::Result<PublicationShape> {
     let row = source_sql
         .query_opt(
-            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot,
+                    pubgencols::text <> 'n'
              FROM pg_publication WHERE pubname = $1",
             &[&publication],
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("publication {publication} does not exist on the source"))?;
+    let versions = source_sql
+        .query(
+            "SELECT oid, xmin::text FROM pg_publication WHERE pubname = $1
+             UNION ALL
+             SELECT pr.oid, pr.xmin::text FROM pg_publication_rel pr
+             JOIN pg_publication p ON p.oid = pr.prpubid
+             WHERE p.pubname = $1
+             ORDER BY oid",
+            &[&publication],
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
     let tables = source_sql
         .query(
             "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
@@ -454,6 +491,8 @@ async fn fetch_publication(
         delete: row.get(2),
         truncate: row.get(3),
         via_partition_root: row.get(4),
+        publishes_generated: row.get(5),
+        versions,
         tables,
     })
 }
@@ -508,6 +547,11 @@ async fn preflight(
         "publication {} sets publish_via_partition_root, which this runner cannot stream soundly",
         run.publication
     );
+    anyhow::ensure!(
+        !shape.publishes_generated,
+        "publication {} publishes generated columns, which this runner cannot stream soundly",
+        run.publication
+    );
     let published = &shape.tables;
     for table in &run.tables {
         anyhow::ensure!(
@@ -558,35 +602,42 @@ async fn preflight(
             table.name,
             src[0].relkind as u8 as char
         );
-        // Generated columns are excluded from the copy: pgoutput does not
-        // publish them either, so both paths let the target recompute — but
-        // ONLY if the target column is generated too; a plain target column
-        // would be left NULL by the stream while the source computed a value.
-        let copy_cols: Vec<&SqlColumn> = src.iter().filter(|c| !c.generated).collect();
+        // Generated columns are rejected outright for M1: pgoutput does not
+        // publish them and COPY cannot insert them, and PostgreSQL offers no
+        // sound cross-database comparison of the generation expressions —
+        // differing expressions would silently diverge.
+        for c in &src {
+            anyhow::ensure!(
+                !c.generated,
+                "column {} of {}.{} is generated; generated columns cannot be streamed soundly",
+                c.name,
+                table.schema,
+                table.name
+            );
+        }
         // A column list on the publication would stream a transformed row
-        // shape; the seed copy takes every non-generated column, so the
-        // stream must too.
+        // shape; the seed copy takes every column, so the stream's published
+        // set must equal it exactly.
         if let Some(attnames) = published
             .iter()
             .find(|p| p.schema == table.schema && p.name == table.name)
             .and_then(|p| p.columns.as_ref())
         {
-            for c in &copy_cols {
-                anyhow::ensure!(
-                    attnames.contains(&c.name),
-                    "publication {} omits column {} of {}.{}: streamed rows would be silently transformed",
-                    run.publication,
-                    c.name,
-                    table.schema,
-                    table.name
-                );
-            }
+            let src_names: Vec<&String> = src.iter().map(|c| &c.name).collect();
+            anyhow::ensure!(
+                attnames.len() == src_names.len() && src_names.iter().all(|n| attnames.contains(n)),
+                "publication {} publishes a different column set for {}.{} than the table has: streamed rows would be silently transformed",
+                run.publication,
+                table.schema,
+                table.name
+            );
         }
         // The target table must be COPY- and apply-compatible before the slot
-        // is replaced or anything is truncated, not one table into the seed:
-        // every copied column present with the same type, generated columns
-        // generated on both sides, and no extra target column that would
-        // reject an insert lacking it.
+        // is replaced or anything is truncated, not one table into the seed.
+        // The contract is EXACT schema equivalence — reshard targets are
+        // clones — because anything looser reintroduces silent divergence:
+        // an extra target column's defaults or constraints, a same-named
+        // column of another type, or generation expressions that differ.
         let tgt = table_columns(target_sql, &table.schema, &table.name).await?;
         anyhow::ensure!(
             !tgt.is_empty(),
@@ -601,6 +652,15 @@ async fn preflight(
             table.schema,
             table.name
         );
+        for t in &tgt {
+            anyhow::ensure!(
+                src.iter().any(|c| c.name == t.name),
+                "target table {}.{} has extra column {}: copied and streamed rows do not carry it",
+                table.schema,
+                table.name,
+                t.name
+            );
+        }
         for c in &src {
             let t = tgt.iter().find(|t| t.name == c.name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -610,6 +670,16 @@ async fn preflight(
                     c.name
                 )
             })?;
+            // Type OIDs are database-local, so equality is only meaningful
+            // for builtin pg_catalog types (stable OIDs); custom types are
+            // out of M1 scope.
+            anyhow::ensure!(
+                c.type_oid < 16384 && t.type_oid < 16384,
+                "column {} of {}.{} has a non-builtin type; custom types cannot be compared across databases and are not supported",
+                c.name,
+                table.schema,
+                table.name
+            );
             anyhow::ensure!(
                 t.type_oid == c.type_oid && t.typmod == c.typmod,
                 "column {} of {}.{} has a different type on the target: copied and streamed values could be transformed or rejected",
@@ -618,23 +688,21 @@ async fn preflight(
                 table.name
             );
             anyhow::ensure!(
-                t.generated == c.generated,
-                "column {} of {}.{} is generated on one side only: the two sides would compute different values",
+                !t.generated,
+                "column {} of {}.{} is generated on the target; copied and streamed values would be rejected",
                 c.name,
                 table.schema,
                 table.name
             );
-        }
-        for t in &tgt {
-            if !src.iter().any(|c| c.name == t.name) {
-                anyhow::ensure!(
-                    !t.required(),
-                    "target table {}.{} has extra required column {}: copied and streamed rows do not carry it",
-                    table.schema,
-                    table.name,
-                    t.name
-                );
-            }
+            // GENERATED ALWAYS identity refuses explicit values: COPY would
+            // pass (COPY overrides), but every streamed INSERT would fail.
+            anyhow::ensure!(
+                t.identity as u8 != b'a',
+                "column {} of {}.{} is GENERATED ALWAYS AS IDENTITY on the target: streamed inserts carrying explicit values would be rejected",
+                c.name,
+                table.schema,
+                table.name
+            );
         }
         let key = src
             .iter()
@@ -647,13 +715,6 @@ async fn preflight(
                     table.name
                 )
             })?;
-        anyhow::ensure!(
-            !key.generated,
-            "shard key {}.{}.{} is a generated column and cannot be streamed",
-            table.schema,
-            table.name,
-            table.shard_key_column
-        );
         let key_oid = key.type_oid;
         anyhow::ensure!(
             allowed_key_oids(table.shard_key_type).contains(&key_oid),
@@ -718,7 +779,7 @@ async fn preflight(
             ),
         }
         plans.push(TablePreflight {
-            columns: copy_cols.iter().map(|c| c.name.clone()).collect(),
+            columns: src.iter().map(|c| c.name.clone()).collect(),
         });
     }
     Ok((plans, shape))
@@ -730,17 +791,9 @@ struct SqlColumn {
     type_oid: u32,
     typmod: i32,
     generated: bool,
-    not_null: bool,
-    has_default: bool,
-    identity: bool,
+    /// attidentity: 0 none, 'a' GENERATED ALWAYS, 'd' BY DEFAULT.
+    identity: i8,
     relkind: i8,
-}
-
-impl SqlColumn {
-    /// Would an INSERT that does not mention this column be rejected?
-    fn required(&self) -> bool {
-        self.not_null && !self.has_default && !self.identity && !self.generated
-    }
 }
 
 async fn table_columns(
@@ -751,8 +804,7 @@ async fn table_columns(
     Ok(sql
         .query(
             "SELECT a.attname::text, a.atttypid::oid, a.atttypmod,
-                    a.attgenerated <> '', a.attnotnull, a.atthasdef,
-                    a.attidentity <> '', c.relkind
+                    a.attgenerated <> '', a.attidentity, c.relkind
              FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
              JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -768,10 +820,8 @@ async fn table_columns(
             type_oid: r.get(1),
             typmod: r.get(2),
             generated: r.get(3),
-            not_null: r.get(4),
-            has_default: r.get(5),
-            identity: r.get(6),
-            relkind: r.get(7),
+            identity: r.get(4),
+            relkind: r.get(5),
         })
         .collect())
 }

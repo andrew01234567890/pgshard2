@@ -362,7 +362,7 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     let mut col_listed = spec(&pg, "wf_cols", "pgshard_cols");
     col_listed.publication = "pub_cols".into();
     registry.start(&col_listed, &config).await?;
-    wait_for_error(&registry, "wf_cols", "omits column").await;
+    wait_for_error(&registry, "wf_cols", "different column set").await;
 
     // A partition-root publication announces leaf relations the mapping
     // does not know, and direct leaf truncates go unpublished.
@@ -404,6 +404,44 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     });
     registry.start(&mistyped_tgt, &config).await?;
     wait_for_error(&registry, "wf_mt", "different type on the target").await;
+
+    // Exact schema equivalence: an extra target column's defaults or
+    // constraints could reject or transform copied rows after truncation.
+    source
+        .batch_execute("CREATE TABLE extra_col (id int PRIMARY KEY, note text)")
+        .await?;
+    target
+        .batch_execute("CREATE TABLE extra_col (id int PRIMARY KEY, note text, added timestamptz)")
+        .await?;
+    source
+        .batch_execute("CREATE PUBLICATION pub_extra FOR TABLE extra_col")
+        .await?;
+    let mut extra = spec(&pg, "wf_extra", "pgshard_extra");
+    extra.publication = "pub_extra".into();
+    extra.tables[0].source = Some(v1::TableRef {
+        schema: "public".into(),
+        name: "extra_col".into(),
+    });
+    registry.start(&extra, &config).await?;
+    wait_for_error(&registry, "wf_extra", "extra column").await;
+
+    // Generated columns cannot be compared across databases and are refused.
+    source
+        .batch_execute(
+            "CREATE TABLE gen_col (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
+        )
+        .await?;
+    source
+        .batch_execute("CREATE PUBLICATION pub_gen FOR TABLE gen_col")
+        .await?;
+    let mut generated = spec(&pg, "wf_gen", "pgshard_gen");
+    generated.publication = "pub_gen".into();
+    generated.tables[0].source = Some(v1::TableRef {
+        schema: "public".into(),
+        name: "gen_col".into(),
+    });
+    registry.start(&generated, &config).await?;
+    wait_for_error(&registry, "wf_gen", "generated").await;
 
     // REPLICA IDENTITY FULL is refused up front: the applier cannot apply
     // FULL-identity updates/deletes, so accepting it would re-seed
@@ -635,10 +673,15 @@ async fn altering_the_publication_mid_stream_fails_loudly() -> anyhow::Result<()
     })
     .await;
 
-    // Disabling a DML kind mid-stream makes pgoutput silently omit changes;
-    // the catalog poll must notice within its interval and fail the workflow.
+    // A transient toggle — disable a DML kind and RESTORE it before the next
+    // poll — leaves the sampled shape identical, but every ALTER PUBLICATION
+    // rewrites the catalog row and xids never repeat, so the captured row
+    // version cannot match. The workflow must still fail.
     source
-        .batch_execute("ALTER PUBLICATION seed_pub SET (publish = 'insert')")
+        .batch_execute(
+            "ALTER PUBLICATION seed_pub SET (publish = 'insert');
+             ALTER PUBLICATION seed_pub SET (publish = 'insert, update, delete, truncate');",
+        )
         .await?;
     wait_for_error(&registry, "wf_pubdrift", "changed while streaming").await;
     Ok(())
