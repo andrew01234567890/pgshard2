@@ -72,6 +72,7 @@ func (r *PgShardReshardReconciler) reconcileProvisioningTargets(
 		return ctrl.Result{}, err
 	}
 
+	reshard.Status.ClusterUID = string(cluster.UID)
 	rendered, err := pgconfig.Render(clusterRenderInputs(&cluster))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("rendering configuration: %w", err)

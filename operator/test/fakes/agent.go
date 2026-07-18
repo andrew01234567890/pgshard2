@@ -469,6 +469,9 @@ func (f *FakeAgent) StopWorkflow(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, "StopWorkflow")
+	if f.workflowPhases == nil {
+		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
+	}
 	f.workflowPhases[req.GetId()] = pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STOPPED
 	return &pgshardv1.StopWorkflowResponse{}, nil
 }

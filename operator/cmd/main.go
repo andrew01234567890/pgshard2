@@ -217,6 +217,7 @@ func main() {
 	if err := (&controller.PgShardReshardReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Agents: agentclient.NewInsecurePool(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgshardreshard")
 		os.Exit(1)

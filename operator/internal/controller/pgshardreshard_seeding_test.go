@@ -118,16 +118,16 @@ var _ = Describe("PgShardReshard seeding", func() {
 				ClusterRef: clusterName,
 				Tables: []pgshardv1alpha1.TableEntry{
 					{Name: "orders", Type: pgshardv1alpha1.TableSharded,
-						ShardKeyColumn: "customer_id", ShardKeyType: pgshardv1alpha1.ShardKeyInt},
+						ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt},
 					{Name: "audit", Type: pgshardv1alpha1.TableGlobal},
 					{Schema: "app", Name: "items", Type: pgshardv1alpha1.TableSharded,
-						ShardKeyColumn: "customer_id", ShardKeyType: pgshardv1alpha1.ShardKeyInt},
+						ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt},
 				},
 			},
 		}
 		_ = k8sClient.Create(ctx, cfg)
 
-		_ = makeNodeWithPrimary(clusterName+"-srcnode", sourceIP)
+		srcPod := makeNodeWithPrimary(clusterName+"-srcnode", sourceIP)
 		src := &pgshardv1alpha1.PgShardShard{
 			ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-src", Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
@@ -139,6 +139,9 @@ var _ = Describe("PgShardReshard seeding", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, src)).To(Succeed())
+		// Seeding copies OUT of the source database; it must be verified on
+		// its current primary just like the targets.
+		markVerified(src.Name, clusterName+"-srcnode", srcPod)
 
 		reshard := &pgshardv1alpha1.PgShardReshard{
 			ObjectMeta: metav1.ObjectMeta{Name: reshardName, Namespace: ns},
@@ -255,6 +258,56 @@ var _ = Describe("PgShardReshard seeding", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal("WorkflowFailed"))
 		Expect(cond.Message).To(ContainSubstring("provenance mismatch"))
+	})
+
+	It("fails closed when status.targetShards diverges from the spec-derived targets", func() {
+		_, targetAgent, reconcile, _ := seedSetup("rsd-tamper", true)
+		got := getReshard("rsd-tamper")
+		got.Status.TargetShards[0] = "some-other-shard"
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		got = getReshard("rsd-tamper")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("TargetListMismatch"))
+		Expect(targetAgent.StartedWorkflows()).To(BeEmpty(),
+			"a tampered target list must never receive a truncating workflow")
+	})
+
+	It("pins the sharded schema and holds on drift instead of advancing", func() {
+		_, _, reconcile, _ := seedSetup("rsd-drift", true)
+		// First reconcile pins the schema and advances to CatchingUp; rewind
+		// to Seeding to model drift discovered on a later reconcile.
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		got := getReshard("rsd-drift")
+		Expect(got.Status.SeedTablesPinned).To(BeTrue())
+		Expect(got.Status.SeedTables).To(HaveLen(2))
+		got.Status.Phase = pgshardv1alpha1.ReshardSeeding
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+
+		var cfg pgshardv1alpha1.PgShardTableConfig
+		Expect(k8sClient.Get(ctx,
+			types.NamespacedName{Name: "cdrift-tables", Namespace: ns}, &cfg)).To(Succeed())
+		cfg.Spec.Tables = append(cfg.Spec.Tables, pgshardv1alpha1.TableEntry{
+			Name: "late_arrival", Type: pgshardv1alpha1.TableSharded,
+			ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt,
+		})
+		Expect(k8sClient.Update(ctx, &cfg)).To(Succeed())
+
+		res, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+		got = getReshard("rsd-drift")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardSeeding))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("SchemaDrift"))
 	})
 
 	It("holds while the source has no verified primary", func() {

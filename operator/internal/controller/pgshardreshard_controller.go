@@ -185,6 +185,9 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	// status only, which does not bump the generation, so the watch's
 	// GenerationChangedPredicate would otherwise drop the self-update event and
 	// the reshard would stall here until the operator restarts.
+	// Pin the exact objects this validation ran against: a same-named
+	// replacement is a different placement whose data was never validated.
+	reshard.Status.SourceShardUID = string(source.UID)
 	reshard.Status.Phase = pgshardv1alpha1.ReshardProvisioningTargets
 	setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionTrue, "PartitionValid",
 		"target ranges partition the source shard's key range")
