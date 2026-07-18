@@ -659,6 +659,14 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a null-terminated string field, borrowing the frame.
+    ///
+    /// pgoutput string fields (schema/table/column/type names, origin name,
+    /// message prefix, GID) are in the source server's encoding. This assumes
+    /// that encoding is UTF-8 — which pgshard-provisioned clusters are — and
+    /// fails closed (`InvalidUtf8`, halting the stream) rather than mis-decoding
+    /// if it is not. Supporting a non-UTF-8 source (lossy or raw-bytes
+    /// identifiers) is a follow-up. Tuple values and message content are never
+    /// routed through here; they stay raw `&[u8]`.
     fn cstr(&mut self) -> Result<&'a str, DecodeError> {
         let rest = &self.buf[self.pos..];
         let nul = rest
