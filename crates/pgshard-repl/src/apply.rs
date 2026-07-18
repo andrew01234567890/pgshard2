@@ -38,6 +38,8 @@ pub enum ApplyError {
     },
     #[error("non-UTF-8 value in a text column")]
     InvalidUtf8,
+    #[error("a change affected {affected} target rows, expected exactly 1 (target diverged)")]
+    RowCountMismatch { affected: u64 },
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
 }
@@ -49,6 +51,8 @@ struct RelationInfo {
     schema: String,
     table: String,
     columns: Vec<String>,
+    /// `relreplident`: `d` default (PK), `i` index, `f` full, `n` nothing.
+    replica_identity: u8,
     /// Indices into `columns` of the replica-identity key columns — the `WHERE`
     /// of an update or delete.
     key_columns: Vec<usize>,
@@ -150,6 +154,7 @@ impl Applier {
                         schema: r.namespace.to_owned(),
                         table: r.name.to_owned(),
                         columns: r.columns.iter().map(|c| c.name.to_owned()).collect(),
+                        replica_identity: r.replica_identity,
                         key_columns: r
                             .columns
                             .iter()
@@ -255,7 +260,14 @@ impl Applier {
 
         let txn = self.target.transaction().await?;
         for sql in &statements {
-            txn.batch_execute(sql).await?;
+            // Each built statement targets exactly one row (insert, or update/delete
+            // matched by the replica-identity key). A different count means the
+            // target diverged from the source — a missing row, or a duplicate under
+            // a key that should be unique — so surface it instead of hiding it.
+            let affected = txn.execute(sql.as_str(), &[]).await?;
+            if affected != 1 {
+                return Err(ApplyError::RowCountMismatch { affected });
+            }
         }
         // Advance the checkpoint in the SAME transaction as the changes: either
         // both land or neither does, which is what makes the apply exactly-once.
@@ -367,6 +379,15 @@ fn build_delete(relation: &RelationInfo, key_source: &[Cell]) -> Result<String> 
 
 /// The `WHERE` matching a row by its replica-identity key columns.
 fn build_where(relation: &RelationInfo, key_source: &[Cell]) -> Result<String> {
+    // Only a key-based identity (default = PK, or an explicit index) matches a
+    // single row unambiguously. REPLICA IDENTITY FULL (`f`) matches on the whole
+    // old row — which double-matches duplicate rows — and NOTHING (`n`) gives no
+    // key at all; reject both rather than risk changing the wrong rows.
+    if !matches!(relation.replica_identity, b'd' | b'i') {
+        return Err(ApplyError::Unsupported(
+            "update/delete requires REPLICA IDENTITY DEFAULT or an index (full/nothing not supported)",
+        ));
+    }
     if relation.key_columns.is_empty() {
         return Err(ApplyError::Unsupported(
             "update/delete on a table with no replica-identity key",
@@ -418,7 +439,28 @@ fn quote_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_ident, quote_literal};
+    use super::{
+        Cell, RelationInfo, build_delete, build_insert, build_update, quote_ident, quote_literal,
+    };
+
+    fn text(s: &str) -> Cell {
+        Cell::Text(s.as_bytes().to_vec())
+    }
+
+    /// A two-column `public.orders(id, note)` with `id` as the key.
+    fn orders(replica_identity: u8) -> RelationInfo {
+        RelationInfo {
+            schema: "public".to_owned(),
+            table: "orders".to_owned(),
+            columns: vec!["id".to_owned(), "note".to_owned()],
+            replica_identity,
+            key_columns: if replica_identity == b'n' {
+                vec![]
+            } else {
+                vec![0]
+            },
+        }
+    }
 
     #[test]
     fn quoting_neutralizes_injection() {
@@ -430,5 +472,83 @@ mod tests {
         );
         assert_eq!(quote_ident("orders"), "\"orders\"");
         assert_eq!(quote_ident("weird\"name"), "\"weird\"\"name\"");
+    }
+
+    #[test]
+    fn insert_names_every_column() {
+        let sql = build_insert(&orders(b'd'), &[text("1"), text("hi")]).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"public\".\"orders\" (\"id\", \"note\") VALUES ('1', 'hi')"
+        );
+    }
+
+    #[test]
+    fn update_sets_shipped_columns_and_matches_by_key() {
+        // Default identity, key unchanged: key_source is the new tuple.
+        let sql = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[text("1"), text("z")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"orders\" SET \"id\" = '1', \"note\" = 'z' WHERE \"id\" = '1'"
+        );
+    }
+
+    #[test]
+    fn update_skips_unchanged_toast_and_no_op_updates() {
+        // A shipped 'note' change with an unchanged-TOAST 'id' would not happen for
+        // a key, but exercises SET omission on the second column.
+        let sql = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[text("1"), Cell::Unchanged],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"orders\" SET \"id\" = '1' WHERE \"id\" = '1'"
+        );
+        // All columns unchanged → nothing to set → no statement.
+        let none = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[Cell::Unchanged, Cell::Unchanged],
+        )
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn delete_matches_by_key() {
+        let sql = build_delete(&orders(b'd'), &[text("1"), Cell::Null]).unwrap();
+        assert_eq!(sql, "DELETE FROM \"public\".\"orders\" WHERE \"id\" = '1'");
+    }
+
+    #[test]
+    fn multi_column_key_is_anded() {
+        let mut rel = orders(b'i');
+        rel.columns = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        rel.key_columns = vec![0, 1];
+        let sql = build_delete(&rel, &[text("x"), text("y"), text("z")]).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"public\".\"orders\" WHERE \"a\" = 'x' AND \"b\" = 'y'"
+        );
+    }
+
+    #[test]
+    fn unsupported_or_missing_keys_fail_closed() {
+        // REPLICA IDENTITY FULL / NOTHING are rejected.
+        assert!(build_delete(&orders(b'f'), &[text("1"), text("hi")]).is_err());
+        assert!(build_delete(&orders(b'n'), &[text("1"), text("hi")]).is_err());
+        // A NULL or unshipped-TOAST key value is rejected.
+        assert!(build_delete(&orders(b'd'), &[Cell::Null, text("hi")]).is_err());
+        assert!(build_delete(&orders(b'd'), &[Cell::Unchanged, text("hi")]).is_err());
     }
 }
