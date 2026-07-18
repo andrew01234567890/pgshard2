@@ -126,6 +126,12 @@ impl ReplicationClient {
                 ("database", config.database.as_str()),
                 ("replication", "database"),
                 ("client_encoding", "UTF8"),
+                // Pin bytea_output=hex so pgoutput renders bytea as `\x…`, which is
+                // the one form the keyspace-id filter's coerce_bytea decodes. Without
+                // this the walsender inherits the source's database/cluster default,
+                // and under `bytea_output = escape` a bytea shard key would fail to
+                // coerce and the row could not be routed during a reshard seed.
+                ("bytea_output", "hex"),
             ],
             &mut buf,
         )

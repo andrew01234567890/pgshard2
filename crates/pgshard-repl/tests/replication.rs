@@ -73,3 +73,47 @@ async fn streams_a_real_insert_end_to_end() -> anyhow::Result<()> {
     assert_eq!(values, vec![b"42".to_vec(), b"hi".to_vec()]);
     Ok(())
 }
+
+/// The client pins `bytea_output = hex` on its walsender session, so a bytea
+/// shard key streams in the `\x…` form the keyspace-id filter can decode even
+/// when the source database defaults to `escape`. Without the pin the walsender
+/// would inherit `escape` and ship `\336\255\276\357`, which the filter cannot
+/// coerce — the row would be unroutable during a reshard seed.
+#[tokio::test]
+async fn bytea_streams_as_hex_despite_source_escape_default() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let setup = pg.connect().await?;
+    setup
+        .batch_execute(
+            "CREATE TABLE items (id bytea PRIMARY KEY);
+             CREATE PUBLICATION items_pub FOR TABLE items;
+             ALTER DATABASE postgres SET bytea_output = 'escape';",
+        )
+        .await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    // Connects after the ALTER DATABASE, so its inherited default is `escape`;
+    // the startup pin must override it back to `hex`.
+    let mut client = ReplicationClient::connect(&config).await?;
+    client
+        .create_logical_slot("pgshard_bytea_slot", true)
+        .await?;
+    client
+        .start_replication("pgshard_bytea_slot", "items_pub")
+        .await?;
+
+    setup
+        .execute(r"INSERT INTO items (id) VALUES ('\xdeadbeef')", &[])
+        .await?;
+
+    let mut decoder = PgOutputDecoder::new(4);
+    let values = read_insert(&mut client, &mut decoder).await?;
+    assert_eq!(values, vec![br"\xdeadbeef".to_vec()]);
+    Ok(())
+}
