@@ -6,3 +6,4 @@
 //! apply with a transactional checkpoint.
 
 pub mod pgoutput;
+pub mod stream;
