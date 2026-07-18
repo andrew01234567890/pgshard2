@@ -2031,8 +2031,14 @@ dependencies = [
 name = "pgshard-repl"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "pgshard-core",
+ "pgshard-testutil",
+ "postgres-protocol",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

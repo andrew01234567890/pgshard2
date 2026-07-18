@@ -8,6 +8,15 @@ repository.workspace = true
 [dependencies]
 pgshard-core = { version = "0.0.0", path = "../pgshard-core" }
 thiserror = "2.0.18"
+bytes = "1.10.1"
+tokio = { version = "1.53.0", features = ["net", "io-util", "time", "rt", "macros"] }
+postgres-protocol = "0.6.12"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+pgshard-testutil = { version = "0.0.0", path = "../pgshard-testutil" }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7.18"
+anyhow = "1.0.100"
