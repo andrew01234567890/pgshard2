@@ -77,7 +77,9 @@ impl<I: Instance> AgentSvc<I> {
 fn workflow_status(err: WorkflowError) -> Status {
     match err {
         WorkflowError::Invalid(_) => Status::invalid_argument(err.to_string()),
-        WorkflowError::Conflict(_) => Status::failed_precondition(err.to_string()),
+        WorkflowError::Conflict(_) | WorkflowError::TargetBusy(..) => {
+            Status::failed_precondition(err.to_string())
+        }
         WorkflowError::Unimplemented(..) => Status::unimplemented(err.to_string()),
     }
 }
@@ -378,8 +380,20 @@ impl<I: Instance> AgentService for AgentSvc<I> {
                 "the workflow runner is not configured on this agent",
             ));
         };
-        let spec = request
-            .into_inner()
+        let req = request.into_inner();
+        // Same fence as CreateDatabase: a reassigned pod IP could route this
+        // seeding request — which truncates target tables — to another node
+        // incarnation. ABORTED: a routing accident, retry re-resolved.
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         self.workflows
@@ -392,6 +406,11 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         &self,
         request: Request<v1::StopWorkflowRequest>,
     ) -> Result<Response<v1::StopWorkflowResponse>, Status> {
+        if self.workflow_config.is_none() {
+            return Err(Status::unimplemented(
+                "the workflow runner is not configured on this agent",
+            ));
+        }
         let req = request.into_inner();
         if req.id.is_empty() {
             return Err(Status::invalid_argument("id is required"));
@@ -411,6 +430,11 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         &self,
         request: Request<v1::WatchWorkflowsRequest>,
     ) -> Result<Response<Self::WatchWorkflowsStream>, Status> {
+        if self.workflow_config.is_none() {
+            return Err(Status::unimplemented(
+                "the workflow runner is not configured on this agent",
+            ));
+        }
         let ids = request.into_inner().ids;
         let registry = self.workflows.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(16);

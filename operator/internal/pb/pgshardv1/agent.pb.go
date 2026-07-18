@@ -1552,8 +1552,12 @@ func (x *PrepareSourceResponse) GetWalHeadroomBytes() uint64 {
 }
 
 type StartWorkflowRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Spec          *WorkflowSpec          `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Spec  *WorkflowSpec          `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
+	// The Kubernetes UID of the pod this request is aimed at. Pod IPs are
+	// reusable; a mismatch answers ABORTED (routing accident — retry against a
+	// re-resolved address) before any destructive seeding work begins.
+	TargetPodUid  string `protobuf:"bytes,2,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1593,6 +1597,13 @@ func (x *StartWorkflowRequest) GetSpec() *WorkflowSpec {
 		return x.Spec
 	}
 	return nil
+}
+
+func (x *StartWorkflowRequest) GetTargetPodUid() string {
+	if x != nil {
+		return x.TargetPodUid
+	}
+	return ""
 }
 
 type StartWorkflowResponse struct {
@@ -2744,9 +2755,10 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\"a\n" +
 	"\x15PrepareSourceResponse\x121\n" +
 	"\x12wal_headroom_bytes\x18\x01 \x01(\x04H\x00R\x10walHeadroomBytes\x88\x01\x01B\x15\n" +
-	"\x13_wal_headroom_bytes\"D\n" +
+	"\x13_wal_headroom_bytes\"j\n" +
 	"\x14StartWorkflowRequest\x12,\n" +
-	"\x04spec\x18\x01 \x01(\v2\x18.pgshard.v1.WorkflowSpecR\x04spec\"\x17\n" +
+	"\x04spec\x18\x01 \x01(\v2\x18.pgshard.v1.WorkflowSpecR\x04spec\x12$\n" +
+	"\x0etarget_pod_uid\x18\x02 \x01(\tR\ftargetPodUid\"\x17\n" +
 	"\x15StartWorkflowResponse\"B\n" +
 	"\x13StopWorkflowRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1b\n" +

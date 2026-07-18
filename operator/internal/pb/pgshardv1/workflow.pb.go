@@ -365,8 +365,13 @@ type WorkflowSpec struct {
 	// The local database the worker seeds and applies into (the placed shard's
 	// database on this agent's node). Required.
 	TargetDatabase string `protobuf:"bytes,11,opt,name=target_database,json=targetDatabase,proto3" json:"target_database,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The target shard's provenance (its PgShardShard UID). Required: seeding
+	// TRUNCATES target tables, so the runner refuses to touch a database whose
+	// provenance marker (stamped by CreateDatabase) does not match — a typo'd
+	// target_database must fail before destructive DDL, not after.
+	ExpectProvenance string `protobuf:"bytes,12,opt,name=expect_provenance,json=expectProvenance,proto3" json:"expect_provenance,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *WorkflowSpec) Reset() {
@@ -472,6 +477,13 @@ func (x *WorkflowSpec) GetFilter() *RowFilter {
 func (x *WorkflowSpec) GetTargetDatabase() string {
 	if x != nil {
 		return x.TargetDatabase
+	}
+	return ""
+}
+
+func (x *WorkflowSpec) GetExpectProvenance() string {
+	if x != nil {
+		return x.ExpectProvenance
 	}
 	return ""
 }
@@ -650,7 +662,7 @@ const file_pgshard_v1_workflow_proto_rawDesc = "" +
 	"\tRowFilter\x12\x12\n" +
 	"\x03all\x18\x01 \x01(\bH\x00R\x03all\x129\n" +
 	"\tkey_range\x18\x02 \x01(\v2\x1a.pgshard.v1.KeyRangeFilterH\x00R\bkeyRangeB\b\n" +
-	"\x06filter\"\xee\x03\n" +
+	"\x06filter\"\x9b\x04\n" +
 	"\fWorkflowSpec\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.pgshard.v1.WorkflowKindR\x04kind\x12!\n" +
@@ -663,7 +675,8 @@ const file_pgshard_v1_workflow_proto_rawDesc = "" +
 	"\x06tables\x18\t \x03(\v2\x18.pgshard.v1.TableMappingR\x06tables\x12-\n" +
 	"\x06filter\x18\n" +
 	" \x01(\v2\x15.pgshard.v1.RowFilterR\x06filter\x12'\n" +
-	"\x0ftarget_database\x18\v \x01(\tR\x0etargetDatabase\"s\n" +
+	"\x0ftarget_database\x18\v \x01(\tR\x0etargetDatabase\x12+\n" +
+	"\x11expect_provenance\x18\f \x01(\tR\x10expectProvenance\"s\n" +
 	"\fCopyProgress\x12!\n" +
 	"\ftables_total\x18\x01 \x01(\rR\vtablesTotal\x12\x1f\n" +
 	"\vtables_done\x18\x02 \x01(\rR\n" +

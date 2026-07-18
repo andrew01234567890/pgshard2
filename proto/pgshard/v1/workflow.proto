@@ -58,6 +58,11 @@ message WorkflowSpec {
   // The local database the worker seeds and applies into (the placed shard's
   // database on this agent's node). Required.
   string target_database = 11;
+  // The target shard's provenance (its PgShardShard UID). Required: seeding
+  // TRUNCATES target tables, so the runner refuses to touch a database whose
+  // provenance marker (stamped by CreateDatabase) does not match — a typo'd
+  // target_database must fail before destructive DDL, not after.
+  string expect_provenance = 12;
 }
 
 enum WorkflowPhase {

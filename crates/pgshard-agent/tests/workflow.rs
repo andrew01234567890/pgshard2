@@ -15,6 +15,8 @@ fn in_upper_half(id: i32) -> bool {
     f.keyspace_id(&ScalarValue::Int64(id as i64)).0 >= UPPER_HALF
 }
 
+const TARGET_PROVENANCE: &str = "shard-uid-1";
+
 fn spec(pg: &Pg, id: &str, slot: &str) -> v1::WorkflowSpec {
     v1::WorkflowSpec {
         id: id.into(),
@@ -48,6 +50,7 @@ fn spec(pg: &Pg, id: &str, slot: &str) -> v1::WorkflowSpec {
             })),
         }),
         target_database: "shard_target".into(),
+        expect_provenance: TARGET_PROVENANCE.into(),
         ..Default::default()
     }
 }
@@ -87,6 +90,11 @@ async fn seeds_then_streams_only_the_target_keyrange() -> anyhow::Result<()> {
     // Separately: CREATE DATABASE cannot run inside the implicit transaction a
     // multi-statement batch gets.
     source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
     let target_conn = format!(
         "host={} port={} user=postgres password=postgres dbname=shard_target",
         pg.host(),
@@ -122,16 +130,16 @@ async fn seeds_then_streams_only_the_target_keyrange() -> anyhow::Result<()> {
     };
     let registry = WorkflowRegistry::default();
     registry
-        .start(&spec(&pg, "wf1", "wf1_slot"), &config)
+        .start(&spec(&pg, "wf1", "pgshard_wf1"), &config)
         .await?;
 
     // Idempotent re-start with the identical spec; a different spec under the
     // same id is a conflict.
     registry
-        .start(&spec(&pg, "wf1", "wf1_slot"), &config)
+        .start(&spec(&pg, "wf1", "pgshard_wf1"), &config)
         .await?;
     match registry
-        .start(&spec(&pg, "wf1", "other_slot"), &config)
+        .start(&spec(&pg, "wf1", "pgshard_other"), &config)
         .await
     {
         Err(WorkflowError::Conflict(_)) => {}
@@ -198,14 +206,14 @@ async fn rejects_specs_the_runner_cannot_execute_honestly() -> anyhow::Result<()
     };
     let registry = WorkflowRegistry::default();
 
-    let mut bad = spec(&pg, "wfx", "wfx_slot");
+    let mut bad = spec(&pg, "wfx", "pgshard_wfx");
     bad.tables[0].shard_key_type = "float".into();
     assert!(matches!(
         registry.start(&bad, &config).await,
         Err(WorkflowError::Invalid(_))
     ));
 
-    let mut renamed = spec(&pg, "wfy", "wfy_slot");
+    let mut renamed = spec(&pg, "wfy", "pgshard_wfy");
     renamed.tables[0].target = Some(v1::TableRef {
         schema: "public".into(),
         name: "orders_v2".into(),
@@ -215,7 +223,7 @@ async fn rejects_specs_the_runner_cannot_execute_honestly() -> anyhow::Result<()
         Err(WorkflowError::Unimplemented(..))
     ));
 
-    let mut standby = spec(&pg, "wfz", "wfz_slot");
+    let mut standby = spec(&pg, "wfz", "pgshard_wfz");
     standby.source_policy = v1::SourcePolicy::PreferStandby as i32;
     assert!(matches!(
         registry.start(&standby, &config).await,
@@ -228,5 +236,209 @@ async fn rejects_specs_the_runner_cannot_execute_honestly() -> anyhow::Result<()
         registry.start(&inject, &config).await,
         Err(WorkflowError::Invalid(_))
     ));
+
+    let mut unprefixed = spec(&pg, "wfp", "wfp_slot");
+    unprefixed.id = "wfp".into();
+    assert!(matches!(
+        registry.start(&unprefixed, &config).await,
+        Err(WorkflowError::Invalid(_))
+    ));
+
+    let mut wrong_kind = spec(&pg, "wfk", "pgshard_wfk");
+    wrong_kind.kind = v1::WorkflowKind::DdlShadow as i32;
+    assert!(matches!(
+        registry.start(&wrong_kind, &config).await,
+        Err(WorkflowError::Invalid(_))
+    ));
+
+    let mut no_provenance = spec(&pg, "wfv", "pgshard_wfv");
+    no_provenance.expect_provenance = String::new();
+    assert!(matches!(
+        registry.start(&no_provenance, &config).await,
+        Err(WorkflowError::Invalid(_))
+    ));
+    Ok(())
+}
+
+async fn wait_for_error(registry: &WorkflowRegistry, id: &str, needle: &str) -> String {
+    for _ in 0..300 {
+        if let Some(status) = registry.statuses(&[id.to_owned()]).await.into_iter().next()
+            && status.phase == v1::WorkflowPhase::Error as i32
+        {
+            assert!(
+                status.error.contains(needle),
+                "workflow {id} failed for the wrong reason: {}",
+                status.error
+            );
+            return status.error;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("workflow {id} never reached the error phase");
+}
+
+#[tokio::test]
+async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION seed_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
+    let target_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=shard_target",
+        pg.host(),
+        pg.port()
+    );
+    let (target, conn) = tokio_postgres::connect(&target_conn, tokio_postgres::NoTls).await?;
+    tokio::spawn(conn);
+    target
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             INSERT INTO orders VALUES (1, 'survivor')",
+        )
+        .await?;
+
+    let config = WorkflowConfig {
+        target: format!(
+            "host={} port={} user=postgres password=postgres",
+            pg.host(),
+            pg.port()
+        )
+        .parse()?,
+        source_user: "postgres".into(),
+        source_password: "postgres".into(),
+    };
+    let registry = WorkflowRegistry::default();
+
+    // Wrong provenance: the database is not the shard this workflow was
+    // aimed at; nothing may be truncated.
+    let mut foreign = spec(&pg, "wf_foreign", "pgshard_foreign");
+    foreign.expect_provenance = "some-other-shard".into();
+    registry.start(&foreign, &config).await?;
+    wait_for_error(&registry, "wf_foreign", "provenance").await;
+
+    // Declared shard-key type contradicting the real column type: hashing
+    // would place rows on the wrong shard.
+    let mut mistyped = spec(&pg, "wf_mistyped", "pgshard_mistyped");
+    mistyped.tables[0].shard_key_type = "text".into();
+    registry.start(&mistyped, &config).await?;
+    wait_for_error(&registry, "wf_mistyped", "cannot be hashed").await;
+
+    // A mapped table missing from the publication would be seeded once and
+    // then silently go stale.
+    let mut unpublished = spec(&pg, "wf_unpub", "pgshard_unpub");
+    unpublished.publication = "absent_pub".into();
+    registry.start(&unpublished, &config).await?;
+    wait_for_error(&registry, "wf_unpub", "publication").await;
+
+    let survivors: i64 = target
+        .query_one("SELECT count(*) FROM orders", &[])
+        .await?
+        .get(0);
+    assert_eq!(
+        survivors, 1,
+        "every refused start must leave the target untouched"
+    );
+
+    // A second RUNNING workflow under a different id may not seize the same
+    // target database.
+    registry
+        .start(&spec(&pg, "wf_a", "pgshard_wfa"), &config)
+        .await?;
+    match registry
+        .start(&spec2(&pg, "wf_b", "pgshard_wfb"), &config)
+        .await
+    {
+        Err(WorkflowError::TargetBusy(id, db)) => {
+            assert_eq!(id, "wf_a");
+            assert_eq!(db, "shard_target");
+        }
+        other => panic!("a busy target must be refused, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// Same as spec() but a genuinely different byte encoding under a new id, so
+/// the same-id idempotency path cannot mask the target-busy check.
+fn spec2(pg: &Pg, id: &str, slot: &str) -> v1::WorkflowSpec {
+    let mut s = spec(pg, id, slot);
+    s.source_shard = "src2".into();
+    s
+}
+
+#[tokio::test]
+async fn update_moving_the_shard_key_across_the_boundary_fails_loudly() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION seed_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
+    let target_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=shard_target",
+        pg.host(),
+        pg.port()
+    );
+    let (target, conn) = tokio_postgres::connect(&target_conn, tokio_postgres::NoTls).await?;
+    tokio::spawn(conn);
+    target
+        .batch_execute("CREATE TABLE orders (id int PRIMARY KEY, note text)")
+        .await?;
+
+    let out_of_range = (1..100).find(|id| !in_upper_half(*id)).unwrap();
+    let in_range = (1..100).find(|id| in_upper_half(*id)).unwrap();
+    source
+        .execute(
+            "INSERT INTO orders VALUES ($1, 'movable')",
+            &[&out_of_range],
+        )
+        .await?;
+
+    let config = WorkflowConfig {
+        target: format!(
+            "host={} port={} user=postgres password=postgres",
+            pg.host(),
+            pg.port()
+        )
+        .parse()?,
+        source_user: "postgres".into(),
+        source_password: "postgres".into(),
+    };
+    let registry = WorkflowRegistry::default();
+    registry
+        .start(&spec(&pg, "wf_move", "pgshard_move"), &config)
+        .await?;
+    wait_for(&registry, "wf_move", "the streaming phase", |s| {
+        s.phase == v1::WorkflowPhase::Streaming as i32
+    })
+    .await;
+
+    // The router forbids shard-key updates; a direct write bypasses it. The
+    // stream must refuse the boundary crossing instead of silently keeping a
+    // stale (or missing) target row.
+    source
+        .execute(
+            "UPDATE orders SET id = $1 WHERE id = $2",
+            &[&in_range, &out_of_range],
+        )
+        .await?;
+    wait_for_error(&registry, "wf_move", "across the target range boundary").await;
     Ok(())
 }

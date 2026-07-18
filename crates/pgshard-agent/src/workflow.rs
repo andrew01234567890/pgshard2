@@ -12,6 +12,16 @@
 //! is cleared — which is safe precisely because seeding targets are
 //! non-serving shards; once a target serves, the reshard has cut over and no
 //! seeding workflow may touch it again.
+//!
+//! Because seeding TRUNCATES target tables, every destructive step is behind a
+//! preflight: the target database must carry the expected provenance marker,
+//! the publication must cover exactly the mapped tables, and each table's
+//! shard-key column must have a PostgreSQL type matching its declared wire
+//! type and be covered by the replica identity. Applied transactions carry no
+//! replication origin yet: M1 never runs forward and reverse workflows over
+//! the same keyspace concurrently (reverse replication lands with the cutover
+//! slice, which brings origins), and the registry admits only one running
+//! workflow per target database.
 
 use std::collections::HashMap;
 
@@ -52,6 +62,7 @@ struct RunPlan {
     slot: String,
     publication: String,
     target_database: String,
+    expect_provenance: String,
     tables: Vec<TablePlan>,
     range: KeyRange,
     hash_function: String,
@@ -60,6 +71,10 @@ struct RunPlan {
 pub struct WorkflowHandle {
     /// Serialized spec, for idempotent StartWorkflow retries.
     spec_bytes: Vec<u8>,
+    /// The local database this workflow seeds — at most one RUNNING workflow
+    /// may hold a target database (seeding truncates; two workers would
+    /// destroy each other's copy).
+    target_database: String,
     status: watch::Receiver<v1::WorkflowStatus>,
     stop: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
@@ -76,6 +91,8 @@ pub enum WorkflowError {
     Invalid(String),
     #[error("workflow {0} is already running with a different spec")]
     Conflict(String),
+    #[error("workflow {0} is already seeding target database {1}")]
+    TargetBusy(String, String),
     #[error("{0} is not implemented in M1: {1}")]
     Unimplemented(&'static str, String),
 }
@@ -105,8 +122,25 @@ fn plan(spec: &v1::WorkflowSpec, config: &WorkflowConfig) -> Result<RunPlan, Wor
     if spec.id.is_empty() {
         return invalid("id is required".into());
     }
+    // Only the reshard runner exists; UNSPECIFIED or DDL_SHADOW must not fall
+    // through into a destructive re-seed.
+    if spec.kind != v1::WorkflowKind::Reshard as i32 {
+        return invalid(format!(
+            "workflow kind {} is not runnable here (only WORKFLOW_KIND_RESHARD)",
+            spec.kind
+        ));
+    }
     if !is_safe_ident(&spec.slot) {
         return invalid(format!("slot {:?} is not a safe identifier", spec.slot));
+    }
+    // The pgshard_ prefix reserves a slot namespace: INIT drops an inactive
+    // slot by this name, and it must never be able to name another system's
+    // slot (a legitimately disconnected consumer is also "inactive").
+    if !spec.slot.starts_with("pgshard_") {
+        return invalid(format!(
+            "slot {:?} must carry the pgshard_ prefix (INIT drops a stale slot by name)",
+            spec.slot
+        ));
     }
     if !is_safe_ident(&spec.publication) {
         return invalid(format!(
@@ -116,6 +150,13 @@ fn plan(spec: &v1::WorkflowSpec, config: &WorkflowConfig) -> Result<RunPlan, Wor
     }
     if spec.target_database.is_empty() || spec.target_database.len() > 63 {
         return invalid("target_database is required (and at most 63 bytes)".into());
+    }
+    if spec.expect_provenance.is_empty() {
+        return invalid(
+            "expect_provenance is required: seeding truncates the target, so the \
+             target database's provenance marker must be verified first"
+                .into(),
+        );
     }
     let source = spec
         .source_primary
@@ -199,6 +240,7 @@ fn plan(spec: &v1::WorkflowSpec, config: &WorkflowConfig) -> Result<RunPlan, Wor
         slot: spec.slot.clone(),
         publication: spec.publication.clone(),
         target_database: spec.target_database.clone(),
+        expect_provenance: spec.expect_provenance.clone(),
         tables,
         range,
         hash_function: hash,
@@ -227,6 +269,16 @@ impl WorkflowRegistry {
             }
             return Err(WorkflowError::Conflict(run.id));
         }
+        // One running workflow per target database: seeding truncates, so a
+        // second worker under a DIFFERENT id would destroy the first's copy.
+        if let Some((other, _)) = inner.iter().find(|(id, h)| {
+            **id != run.id && !h.join.is_finished() && h.target_database == run.target_database
+        }) {
+            return Err(WorkflowError::TargetBusy(
+                other.clone(),
+                run.target_database,
+            ));
+        }
         let (status_tx, status_rx) = watch::channel(v1::WorkflowStatus {
             id: run.id.clone(),
             phase: v1::WorkflowPhase::Init as i32,
@@ -235,6 +287,7 @@ impl WorkflowRegistry {
         let (stop_tx, stop_rx) = watch::channel(false);
         let cfg = config.clone();
         let id = run.id.clone();
+        let target_database = run.target_database.clone();
         let join = tokio::spawn(async move {
             if let Err(e) = run_workflow(run, cfg, status_tx.clone(), stop_rx).await {
                 status_tx.send_modify(|s| {
@@ -247,6 +300,7 @@ impl WorkflowRegistry {
             id,
             WorkflowHandle {
                 spec_bytes,
+                target_database,
                 status: status_rx,
                 stop: stop_tx,
                 join,
@@ -316,6 +370,192 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// PostgreSQL type OIDs a declared shard-key type may hash soundly. bpchar
+/// (1042) is deliberately absent from Text: char(n) pads with spaces, so the
+/// same logical value hashes differently than its text form would.
+fn allowed_key_oids(key_type: ScalarType) -> &'static [u32] {
+    match key_type {
+        ScalarType::Int => &[20, 21, 23],
+        ScalarType::Text => &[25, 1043],
+        ScalarType::Uuid => &[2950],
+        ScalarType::Bytea => &[17],
+    }
+}
+
+/// One preflighted table: its full column list (for the copy) after every
+/// destructive-work precondition held.
+struct TablePreflight {
+    columns: Vec<String>,
+}
+
+/// Everything that must hold BEFORE any destructive step (truncate, slot
+/// drop, checkpoint clear). A typo'd or misdeclared spec must fail here, with
+/// the target untouched.
+async fn preflight(
+    run: &RunPlan,
+    source_sql: &tokio_postgres::Client,
+    target_sql: &tokio_postgres::Client,
+) -> anyhow::Result<Vec<TablePreflight>> {
+    // The target database must be the shard this workflow was aimed at: its
+    // provenance marker is stamped by CreateDatabase and never by hand.
+    let marker: Option<String> = target_sql
+        .query_one(
+            "SELECT shobj_description(oid, 'pg_database') FROM pg_database
+             WHERE datname = current_database()",
+            &[],
+        )
+        .await?
+        .get(0);
+    let expected = format!("pgshard-provenance:{}", run.expect_provenance);
+    anyhow::ensure!(
+        marker.as_deref() == Some(expected.as_str()),
+        "target database {} carries provenance {:?}, expected {:?}: refusing to truncate a database this workflow does not own",
+        run.target_database,
+        marker.as_deref().unwrap_or("<none>"),
+        expected,
+    );
+
+    // The publication must cover EXACTLY the mapped tables: a mapped table
+    // missing from it would be seeded once and then silently never receive
+    // changes (stale data); an unmapped table in it would kill the stream
+    // mid-flight after seeding.
+    let published: Vec<(String, String)> = source_sql
+        .query(
+            "SELECT schemaname::text, tablename::text FROM pg_publication_tables
+             WHERE pubname = $1",
+            &[&run.publication],
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let pub_exists: bool = source_sql
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&run.publication],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        !published.is_empty() || pub_exists,
+        "publication {} does not exist on the source",
+        run.publication
+    );
+    for table in &run.tables {
+        anyhow::ensure!(
+            published
+                .iter()
+                .any(|(s, n)| *s == table.schema && *n == table.name),
+            "table {}.{} is not in publication {}: it would be seeded once and then never receive changes",
+            table.schema,
+            table.name,
+            run.publication
+        );
+    }
+    for (s, n) in &published {
+        anyhow::ensure!(
+            run.tables.iter().any(|t| t.schema == *s && t.name == *n),
+            "publication {} carries unmapped table {s}.{n}: the stream would fail after seeding",
+            run.publication
+        );
+    }
+
+    let mut plans = Vec::with_capacity(run.tables.len());
+    for table in &run.tables {
+        let cols: Vec<(String, u32)> = source_sql
+            .query(
+                "SELECT a.attname::text, a.atttypid::oid FROM pg_attribute a
+                 JOIN pg_class c ON c.oid = a.attrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2
+                   AND a.attnum > 0 AND NOT a.attisdropped
+                 ORDER BY a.attnum",
+                &[&table.schema, &table.name],
+            )
+            .await?
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        anyhow::ensure!(
+            !cols.is_empty(),
+            "source table {}.{} not found",
+            table.schema,
+            table.name
+        );
+        let key_oid = cols
+            .iter()
+            .find(|(name, _)| *name == table.shard_key_column)
+            .map(|(_, oid)| *oid)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shard key column {} not found in {}.{}",
+                    table.shard_key_column,
+                    table.schema,
+                    table.name
+                )
+            })?;
+        anyhow::ensure!(
+            allowed_key_oids(table.shard_key_type).contains(&key_oid),
+            "shard key {}.{}.{} has type oid {key_oid}, which cannot be hashed as declared {:?}: rows would land on the wrong shard",
+            table.schema,
+            table.name,
+            table.shard_key_column,
+            table.shard_key_type,
+        );
+
+        // The replica identity must cover the shard key: streamed UPDATE and
+        // DELETE are filtered by it, and a shard-key change is only visible
+        // when the identity carries the old key.
+        let replident: i8 = source_sql
+            .query_one(
+                "SELECT c.relreplident FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&table.schema, &table.name],
+            )
+            .await?
+            .get(0);
+        match replident as u8 {
+            b'f' => {}
+            b'd' | b'i' => {
+                let use_replident = replident as u8 == b'i';
+                let identity_cols: Vec<String> = source_sql
+                    .query(
+                        "SELECT a.attname::text FROM pg_index i
+                         JOIN pg_class c ON c.oid = i.indrelid
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         JOIN pg_attribute a
+                           ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                         WHERE n.nspname = $1 AND c.relname = $2
+                           AND (CASE WHEN $3 THEN i.indisreplident ELSE i.indisprimary END)",
+                        &[&table.schema, &table.name, &use_replident],
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|r| r.get(0))
+                    .collect();
+                anyhow::ensure!(
+                    identity_cols.contains(&table.shard_key_column),
+                    "replica identity of {}.{} does not cover shard key {}: updates and deletes could not be range-filtered",
+                    table.schema,
+                    table.name,
+                    table.shard_key_column
+                );
+            }
+            other => anyhow::bail!(
+                "table {}.{} has replica identity {:?}: updates and deletes could not be streamed",
+                table.schema,
+                table.name,
+                other as char
+            ),
+        }
+        plans.push(TablePreflight {
+            columns: cols.into_iter().map(|(name, _)| name).collect(),
+        });
+    }
+    Ok(plans)
+}
+
 async fn run_workflow(
     run: RunPlan,
     config: WorkflowConfig,
@@ -324,29 +564,42 @@ async fn run_workflow(
 ) -> anyhow::Result<()> {
     let shard_fn = shard_function(&run.hash_function).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // INIT: fresh slot + exported snapshot. A pre-existing slot from an
-    // earlier attempt is dropped — this run re-seeds from scratch — but an
-    // ACTIVE slot means another worker is live and this one must not race it.
+    // INIT: every destructive-work precondition is proven BEFORE anything is
+    // dropped, cleared, or truncated.
     let source_sql = connect_source_sql(&run).await?;
-    source_sql
-        .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND active = false",
-            &[&run.slot],
-        )
-        .await?;
-    let active: bool = source_sql
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+    let target_sql = connect_sql(&config.target, &run.target_database).await?;
+    let tables = preflight(&run, &source_sql, &target_sql).await?;
+
+    // A pre-existing slot from an earlier attempt is dropped — this run
+    // re-seeds from scratch — but only a slot that is provably ours: our
+    // database, the pgoutput plugin, and (via plan()) the pgshard_ name
+    // prefix. "Inactive" also describes a legitimately disconnected foreign
+    // consumer, whose restart position must never be destroyed. An ACTIVE
+    // slot means another worker is live and this one must not race it.
+    if let Some(row) = source_sql
+        .query_opt(
+            "SELECT active, plugin::text, database::text
+             FROM pg_replication_slots WHERE slot_name = $1",
             &[&run.slot],
         )
         .await?
-        .get(0);
-    anyhow::ensure!(
-        !active,
-        "slot {} is still active on the source: another worker holds it",
-        run.slot
-    );
+    {
+        let (active, plugin, database): (bool, String, String) =
+            (row.get(0), row.get(1), row.get(2));
+        anyhow::ensure!(
+            !active,
+            "slot {} is still active on the source: another worker holds it",
+            run.slot
+        );
+        anyhow::ensure!(
+            plugin == "pgoutput" && database == run.source.database,
+            "slot {} belongs to plugin {plugin:?} on database {database:?}, not this workflow: refusing to drop it",
+            run.slot
+        );
+        source_sql
+            .execute("SELECT pg_drop_replication_slot($1)", &[&run.slot])
+            .await?;
+    }
     let mut repl = ReplicationClient::connect(&run.source).await?;
     let snapshot = repl
         .create_logical_slot_exported(&run.slot, false)
@@ -363,18 +616,30 @@ async fn run_workflow(
             ..Default::default()
         });
     });
-    let target_sql = connect_sql(&config.target, &run.target_database).await?;
     // A re-seed is a fresh stream from a fresh slot: the consumer's old
     // checkpoint (if any) would fence every new apply as stale, so it is
-    // cleared. The table may not exist yet — the applier creates it.
-    let _ = target_sql
+    // cleared. Only a provably-missing progress table is ignorable (the
+    // applier creates it); any other failure could leave a HIGHER stale
+    // checkpoint alive, silently fencing out every commit of the new stream.
+    if let Err(e) = target_sql
         .execute(
             "DELETE FROM pgshard.repl_progress WHERE consumer = $1",
             &[&run.id],
         )
-        .await;
+        .await
+    {
+        let missing_table = e.code().is_some_and(|c| {
+            *c == tokio_postgres::error::SqlState::UNDEFINED_TABLE
+                || *c == tokio_postgres::error::SqlState::INVALID_SCHEMA_NAME
+        });
+        anyhow::ensure!(
+            missing_table,
+            "clearing stale checkpoint for {}: {e}",
+            run.id
+        );
+    }
     let mut rows_copied = 0u64;
-    for (done, table) in run.tables.iter().enumerate() {
+    for ((done, table), pre) in run.tables.iter().enumerate().zip(&tables) {
         if *stop.borrow() {
             status.send_modify(|s| s.phase = v1::WorkflowPhase::Stopped as i32);
             return Ok(());
@@ -387,26 +652,10 @@ async fn run_workflow(
         target_sql
             .batch_execute(&format!("TRUNCATE {qualified}"))
             .await?;
-        let columns: Vec<String> = source_sql
-            .query(
-                "SELECT column_name FROM information_schema.columns
-                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-                &[&table.schema, &table.name],
-            )
-            .await?
-            .into_iter()
-            .map(|r| r.get::<_, String>(0))
-            .collect();
-        anyhow::ensure!(
-            !columns.is_empty(),
-            "source table {}.{} not found",
-            table.schema,
-            table.name
-        );
         let spec = CopySpec {
             schema: &table.schema,
             table: &table.name,
-            columns: &columns,
+            columns: &pre.columns,
             shard_key_column: &table.shard_key_column,
             shard_key_type: table.shard_key_type,
             target_range: run.range,
@@ -462,10 +711,22 @@ async fn run_workflow(
                             rel.name
                         )
                     })?;
+                let key_index = shard_key_index(rel, &table.shard_key_column)?;
+                // A mid-stream ALTER COLUMN TYPE re-sends the Relation; the
+                // preflighted type soundness must hold for the LIVE type too.
+                let key_oid = rel.columns[key_index].type_oid;
+                anyhow::ensure!(
+                    allowed_key_oids(table.shard_key_type).contains(&key_oid),
+                    "stream reports shard key {}.{}.{} as type oid {key_oid}, which cannot be hashed as declared {:?}",
+                    rel.namespace,
+                    rel.name,
+                    table.shard_key_column,
+                    table.shard_key_type,
+                );
                 relations.insert(
                     rel.oid,
                     RelFilter {
-                        key_index: shard_key_index(rel, &table.shard_key_column)?,
+                        key_index,
                         key_type: table.shard_key_type,
                     },
                 );
@@ -484,15 +745,30 @@ async fn run_workflow(
                 }
             }
             LogicalRepMsg::Update(upd) => {
-                // The shard key is immutable, so the new tuple decides.
                 let f = rel_filter(&relations, upd.rel_oid)?;
-                if tuple_in_range(
+                let new_in = tuple_in_range(
                     &upd.new_tuple,
                     f.key_index,
                     f.key_type,
                     shard_fn,
                     &run.range,
-                )? {
+                )?;
+                // The router forbids shard-key updates, but triggers and
+                // direct writes do not go through the router. The replica
+                // identity covers the shard key (preflighted), so a key
+                // change always ships the old identity tuple; a row crossing
+                // the range boundary cannot be represented as an UPDATE on
+                // one side (in→out leaves a stale target row, out→in updates
+                // a row that is not there) — fail loudly.
+                if let Some(old) = upd.key.as_ref().or(upd.old.as_ref()) {
+                    let old_in =
+                        tuple_in_range(old, f.key_index, f.key_type, shard_fn, &run.range)?;
+                    anyhow::ensure!(
+                        old_in == new_in,
+                        "update moves a shard key across the target range boundary: the source row was written outside the router"
+                    );
+                }
+                if new_in {
                     applier.handle(&msg).await?;
                 }
             }
