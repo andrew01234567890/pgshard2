@@ -307,11 +307,15 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     ) -> Result<Response<Self::WatchWorkflowsStream>, Status> {
         Err(Status::unimplemented("watch_workflows"))
     }
+    // Run a checkpoint (e.g. post-promotion, so a demoted primary can pg_rewind).
     async fn checkpoint(
         &self,
-        _r: Request<v1::CheckpointRequest>,
+        _request: Request<v1::CheckpointRequest>,
     ) -> Result<Response<v1::CheckpointResponse>, Status> {
-        Err(Status::unimplemented("checkpoint"))
+        let lsn = self.instance.checkpoint().await.map_err(internal)?;
+        Ok(Response::new(v1::CheckpointResponse {
+            lsn: Some(v1::Lsn { value: lsn }),
+        }))
     }
     async fn emit_journal(
         &self,
@@ -778,5 +782,19 @@ mod tests {
             0,
             "no switch happens on rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_runs_and_returns_an_lsn() {
+        let instance = FakeInstance::primary();
+        instance.set(|s| s.write_lsn = 0x900);
+        let s = svc(instance);
+        let resp = s
+            .checkpoint(Request::new(v1::CheckpointRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.lsn.unwrap().value, 0x900);
+        assert_eq!(s.instance.checkpoints(), 1);
     }
 }

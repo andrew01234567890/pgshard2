@@ -33,6 +33,10 @@ async fn create_restore_point_and_switch_wal_on_a_real_primary() {
         "the switch LSN is at least the last point"
     );
 
+    // A checkpoint runs and returns the checkpoint LSN from the control file.
+    let checkpoint_lsn = instance.checkpoint().await.expect("checkpoint");
+    assert!(checkpoint_lsn > 0, "checkpoint returns a real LSN");
+
     // Waiting for archival is not implemented yet: it errors loudly rather than
     // return an unconfirmed LSN.
     assert!(

@@ -218,6 +218,21 @@ impl Instance for PgInstance {
             .get(0);
         Ok(parse_lsn(&lsn))
     }
+
+    async fn checkpoint(&self) -> anyhow::Result<u64> {
+        let client = self.connect().await?;
+        // CHECKPOINT forces a checkpoint on a primary and a restartpoint on a
+        // standby (both allowed); the resulting LSN is read from the control file.
+        client.batch_execute("CHECKPOINT").await?;
+        let lsn: String = client
+            .query_one(
+                "SELECT checkpoint_lsn::text FROM pg_control_checkpoint()",
+                &[],
+            )
+            .await?
+            .get(0);
+        Ok(parse_lsn(&lsn))
+    }
 }
 
 #[cfg(test)]

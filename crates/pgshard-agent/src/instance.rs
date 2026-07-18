@@ -71,6 +71,11 @@ pub trait Instance: Send + Sync + 'static {
     /// When `wait_archived`, block until that segment is confirmed archived so
     /// the point is immediately restorable. Only valid on a primary.
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
+
+    /// Run a `CHECKPOINT` (a restartpoint on a standby) and return the resulting
+    /// checkpoint LSN. Issued after a promotion so a demoted primary can rejoin
+    /// via pg_rewind; valid on either role.
+    async fn checkpoint(&self) -> anyhow::Result<u64>;
 }
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
@@ -93,6 +98,7 @@ pub mod fake {
         /// Restore points created, in order.
         restore_points: Mutex<Vec<String>>,
         wal_switches: std::sync::atomic::AtomicU32,
+        checkpoints: std::sync::atomic::AtomicU32,
     }
 
     impl FakeInstance {
@@ -148,6 +154,9 @@ pub mod fake {
         }
         pub fn wal_switches(&self) -> u32 {
             self.wal_switches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        pub fn checkpoints(&self) -> u32 {
+            self.checkpoints.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -223,6 +232,11 @@ pub mod fake {
             self.wal_switches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(s.write_lsn)
+        }
+        async fn checkpoint(&self) -> anyhow::Result<u64> {
+            self.checkpoints
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.state.lock().unwrap().write_lsn)
         }
     }
 }
