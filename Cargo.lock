@@ -2033,6 +2033,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures-util",
  "pgshard-core",
  "pgshard-testutil",
  "postgres-protocol",

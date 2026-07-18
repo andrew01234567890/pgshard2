@@ -7,6 +7,7 @@
 
 pub mod apply;
 pub mod client;
+pub mod copy;
 pub mod filter;
 pub mod pgoutput;
 pub mod stream;
