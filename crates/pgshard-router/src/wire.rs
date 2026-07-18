@@ -561,7 +561,6 @@ fn is_plain_column_target(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
-
 fn user_error(code: &str, message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
