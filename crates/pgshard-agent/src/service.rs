@@ -18,6 +18,7 @@ use crate::epoch::{EpochError, EpochGuard, Outcome};
 use crate::instance::{ForeignDatabase, Instance, RestorePoint};
 use crate::schema::{Claim, SchemaError, SchemaLog};
 use crate::status::to_status;
+use crate::workflow::{WorkflowConfig, WorkflowError, WorkflowRegistry};
 
 pub struct AgentSvc<I: Instance> {
     instance: Arc<I>,
@@ -41,6 +42,11 @@ pub struct AgentSvc<I: Instance> {
     /// after an agent restart is out of scope for M1.
     restore_points:
         tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<RestorePoint>>>>>,
+    /// Seeding workflows this agent runs (reshard target pull). A `None`
+    /// config means the runner is not wired (no replication credentials or
+    /// target conninfo) and the workflow RPCs answer Unimplemented.
+    workflows: Arc<WorkflowRegistry>,
+    workflow_config: Option<WorkflowConfig>,
 }
 
 impl<I: Instance> AgentSvc<I> {
@@ -56,7 +62,26 @@ impl<I: Instance> AgentSvc<I> {
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
             restore_points: tokio::sync::Mutex::new(HashMap::new()),
+            workflows: Arc::new(WorkflowRegistry::default()),
+            workflow_config: None,
         }
+    }
+
+    /// Enable the seeding-workflow runner (reshard target pull).
+    pub fn with_workflows(mut self, config: WorkflowConfig) -> Self {
+        self.workflow_config = Some(config);
+        self
+    }
+}
+
+fn workflow_status(err: WorkflowError) -> Status {
+    match err {
+        WorkflowError::Invalid(_) => Status::invalid_argument(err.to_string()),
+        WorkflowError::Conflict(_) | WorkflowError::TargetBusy(..) => {
+            Status::failed_precondition(err.to_string())
+        }
+        WorkflowError::Stopping(_) => Status::unavailable(err.to_string()),
+        WorkflowError::Unimplemented(..) => Status::unimplemented(err.to_string()),
     }
 }
 
@@ -349,22 +374,92 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn start_workflow(
         &self,
-        _r: Request<v1::StartWorkflowRequest>,
+        request: Request<v1::StartWorkflowRequest>,
     ) -> Result<Response<v1::StartWorkflowResponse>, Status> {
-        Err(Status::unimplemented("start_workflow"))
+        let Some(config) = &self.workflow_config else {
+            return Err(Status::unimplemented(
+                "the workflow runner is not configured on this agent",
+            ));
+        };
+        let req = request.into_inner();
+        // Same fence as CreateDatabase: a reassigned pod IP could route this
+        // seeding request — which truncates target tables — to another node
+        // incarnation. ABORTED: a routing accident, retry re-resolved.
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        self.workflows
+            .start(&spec, config)
+            .await
+            .map_err(workflow_status)?;
+        Ok(Response::new(v1::StartWorkflowResponse {}))
     }
     async fn stop_workflow(
         &self,
-        _r: Request<v1::StopWorkflowRequest>,
+        request: Request<v1::StopWorkflowRequest>,
     ) -> Result<Response<v1::StopWorkflowResponse>, Status> {
-        Err(Status::unimplemented("stop_workflow"))
+        if self.workflow_config.is_none() {
+            return Err(Status::unimplemented(
+                "the workflow runner is not configured on this agent",
+            ));
+        }
+        let req = request.into_inner();
+        if req.id.is_empty() {
+            return Err(Status::invalid_argument("id is required"));
+        }
+        // Slot cleanup is the source's DropSlot RPC; guessing at source
+        // credentials here would be a silent half-teardown.
+        if req.drop_slot {
+            return Err(Status::unimplemented(
+                "drop_slot is handled by the source agent's DropSlot",
+            ));
+        }
+        self.workflows.stop(&req.id).await;
+        Ok(Response::new(v1::StopWorkflowResponse {}))
     }
     type WatchWorkflowsStream = BoxStream<v1::WatchWorkflowsResponse>;
     async fn watch_workflows(
         &self,
-        _r: Request<v1::WatchWorkflowsRequest>,
+        request: Request<v1::WatchWorkflowsRequest>,
     ) -> Result<Response<Self::WatchWorkflowsStream>, Status> {
-        Err(Status::unimplemented("watch_workflows"))
+        if self.workflow_config.is_none() {
+            return Err(Status::unimplemented(
+                "the workflow runner is not configured on this agent",
+            ));
+        }
+        let ids = request.into_inner().ids;
+        let registry = self.workflows.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // Poll semantics (1s): status is a small snapshot and the operator is
+        // the only consumer; the stream ends when the client hangs up.
+        tokio::spawn(async move {
+            loop {
+                for status in registry.statuses(&ids).await {
+                    if tx
+                        .send(Ok(v1::WatchWorkflowsResponse {
+                            status: Some(status),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn checkpoint(
         &self,

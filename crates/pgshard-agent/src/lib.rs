@@ -12,3 +12,4 @@ pub mod pg;
 pub mod schema;
 pub mod service;
 pub mod status;
+pub mod workflow;

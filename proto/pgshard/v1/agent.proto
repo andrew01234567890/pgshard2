@@ -166,6 +166,10 @@ message PrepareSourceResponse {
 
 message StartWorkflowRequest {
   WorkflowSpec spec = 1;
+  // The Kubernetes UID of the pod this request is aimed at. Pod IPs are
+  // reusable; a mismatch answers ABORTED (routing accident — retry against a
+  // re-resolved address) before any destructive seeding work begins.
+  string target_pod_uid = 2;
 }
 
 message StartWorkflowResponse {}
