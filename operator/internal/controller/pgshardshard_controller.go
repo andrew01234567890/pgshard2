@@ -635,7 +635,11 @@ func (r *PgShardShardReconciler) aggregateStatus(
 			// into status (it could otherwise be preserved as CurrentPrimary).
 			continue
 		}
-		state := pgshardv1alpha1.InstanceState{Pod: pod.Name, Role: roleLabelReplica}
+		// Role is left unset until the agent explicitly confirms one. An
+		// unconfirmed role (unpolled, or reported UNSPECIFIED) is not silently
+		// treated as a replica: doing so would let a role-unknown ready pod be
+		// elected, counted toward readiness, or pruned.
+		state := pgshardv1alpha1.InstanceState{Pod: pod.Name}
 		view := instanceView{pod: pod.Name, host: pod.Status.PodIP}
 		if pod.Status.PodIP != "" {
 			pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -647,9 +651,13 @@ func (r *PgShardShardReconciler) aggregateStatus(
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)
 				view.walReceiver = status.WalReceiverActive
-				if status.Role == pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY {
+				switch status.Role {
+				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
 					state.Role = roleLabelPrimary
 					view.isPrimary = true
+				case pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY:
+					state.Role = roleLabelReplica
+					view.isStandby = true
 				}
 				state.WalWriteLSN = lsnString(status.WalWriteLsn)
 				state.WalReplayLSN = lsnString(status.WalReplayLsn)
@@ -703,7 +711,10 @@ func deriveShardStatus(
 	currentPrimary, primaries, anyReady := "", 0, 0
 	desiredReady := map[int32]bool{}
 	for _, s := range instances {
-		if s.Ready {
+		// A pod counts toward readiness only with a confirmed role: a ready pod
+		// whose role the agent has not confirmed must not mask a failed desired
+		// instance or drive the shard to Ready (which would enable pruning).
+		if s.Ready && (s.Role == roleLabelPrimary || s.Role == roleLabelReplica) {
 			anyReady++
 			// Only desired ordinals (< replicas) count toward readiness, so a
 			// failed desired instance is never masked by extra ready pods that
@@ -767,7 +778,11 @@ func lsnString(lsn *pgshardv1.Lsn) string {
 }
 
 // syncRoleLabels moves the primary/replica labels to match polled reality,
-// which is what points the -rw/-ro services.
+// which is what points the -rw/-ro services. Only the confirmed primary is
+// labeled primary and only a confirmed standby is labeled replica; a pod whose
+// role is unconfirmed this cycle is left unlabeled so it is in neither -rw nor
+// -ro. A possible writer (an unreachable or not-yet-classified ex-primary) must
+// not receive read traffic on -ro.
 func (r *PgShardShardReconciler) syncRoleLabels(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
 ) error {
@@ -777,21 +792,42 @@ func (r *PgShardShardReconciler) syncRoleLabels(
 		client.MatchingLabels(shardSelector(shard))); err != nil {
 		return err
 	}
+	confirmedStandby := map[string]bool{}
+	for _, s := range shard.Status.Instances {
+		if s.Role == roleLabelReplica {
+			confirmedStandby[s.Pod] = true
+		}
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, shard) {
 			continue
 		}
-		want := roleLabelReplica
-		if pod.Name == shard.Status.CurrentPrimary {
+		want := ""
+		switch {
+		case pod.Name == shard.Status.CurrentPrimary:
 			want = roleLabelPrimary
+		case confirmedStandby[pod.Name]:
+			want = roleLabelReplica
+		case pod.Labels[labelRole] == roleLabelReplica:
+			// Role unconfirmed this cycle (a transient poll blip), but the pod was
+			// a confirmed standby: keep it in -ro rather than flap a healthy replica
+			// out of read routing on a single hiccup. A possible writer is never
+			// kept sticky — a demoted or unreachable ex-primary still carries the
+			// primary label here (not replica), so it falls through to unlabeled.
+			want = roleLabelReplica
 		}
-		if pod.Labels[labelRole] != want {
-			patched := pod.DeepCopy()
+		if pod.Labels[labelRole] == want {
+			continue
+		}
+		patched := pod.DeepCopy()
+		if want == "" {
+			delete(patched.Labels, labelRole)
+		} else {
 			patched.Labels[labelRole] = want
-			if err := r.Patch(ctx, patched, client.MergeFrom(pod)); err != nil {
-				return err
-			}
+		}
+		if err := r.Patch(ctx, patched, client.MergeFrom(pod)); err != nil {
+			return err
 		}
 	}
 	return nil

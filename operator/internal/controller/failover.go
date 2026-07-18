@@ -71,10 +71,15 @@ type failoverDecision struct {
 }
 
 type instanceView struct {
-	pod         string
-	host        string
-	ready       bool
-	isPrimary   bool
+	pod       string
+	host      string
+	ready     bool
+	isPrimary bool
+	// isStandby is true only when the agent explicitly reported the STANDBY role.
+	// An observed instance that is neither isPrimary nor isStandby has an
+	// UNCONFIRMED role (agent reported UNSPECIFIED): its role is unknown, not
+	// "standby by default", so it must not be elected, ready-counted, or pruned.
+	isStandby   bool
 	receivedLSN uint64
 	walReceiver bool
 	// observed is true only when this instance's agent was successfully polled
@@ -83,53 +88,79 @@ type instanceView struct {
 	observed bool
 }
 
-func evaluateFailover(instances []instanceView, committedTarget string) failoverDecision {
-	hasReadyPrimary := false
-	anyClaimsPrimary := false
-	anyRunningUnobserved := false
-	anyReceiverActive := false
-	committedDrivable := false // committed target present, observed, not yet primary
-	var committedLSN, maxObservedLSN uint64
-	candidates := make([]instanceView, 0, len(instances))
+// instanceSummary is the fold of one failover snapshot: the flags and running
+// values evaluateFailover decides from.
+type instanceSummary struct {
+	hasReadyPrimary      bool
+	anyClaimsPrimary     bool
+	anyRunningUnobserved bool
+	anyRoleUnconfirmed   bool
+	anyReceiverActive    bool
+	committedDrivable    bool // committed target present, observed, not yet primary
+	committedLSN         uint64
+	maxObservedLSN       uint64
+	candidates           []instanceView
+}
+
+// summarizeInstances folds the polled instance views into the flags and values
+// the election decision reads.
+func summarizeInstances(instances []instanceView, committedTarget string) instanceSummary {
+	s := instanceSummary{candidates: make([]instanceView, 0, len(instances))}
 	for _, inst := range instances {
 		if inst.isPrimary {
-			anyClaimsPrimary = true
+			s.anyClaimsPrimary = true
 			if inst.ready {
-				hasReadyPrimary = true
+				s.hasReadyPrimary = true
 			}
 		}
-		if inst.observed && inst.receivedLSN > maxObservedLSN {
-			maxObservedLSN = inst.receivedLSN
+		if inst.observed && inst.receivedLSN > s.maxObservedLSN {
+			s.maxObservedLSN = inst.receivedLSN
 		}
 		// A pod that has an IP has run and may be a live primary or hold WAL only
 		// it has; if we could not poll it this cycle we must not elect around it.
 		// A pod with no IP has never started and cannot block.
 		if !inst.observed && inst.host != "" {
-			anyRunningUnobserved = true
+			s.anyRunningUnobserved = true
+		}
+		// A polled pod whose role is neither primary nor standby has an unknown
+		// role (it may be a primary that has not yet reported one); electing
+		// around it is as unsafe as electing around an unpolled pod. The committed
+		// target is excluded: we are already driving it to promotion, during which
+		// it legitimately reports no settled role, and the committed-target path
+		// governs whether to keep driving it or wait.
+		if inst.observed && !inst.isPrimary && !inst.isStandby && inst.pod != committedTarget {
+			s.anyRoleUnconfirmed = true
 		}
 		if inst.walReceiver {
-			anyReceiverActive = true
+			s.anyReceiverActive = true
 		}
-		if inst.ready && !inst.isPrimary {
-			candidates = append(candidates, inst)
+		// Only a confirmed standby is an election candidate. A ready pod with an
+		// unconfirmed role is not promoted on the assumption it is a replica.
+		if inst.ready && inst.isStandby {
+			s.candidates = append(s.candidates, inst)
 		}
 		if committedTarget != "" && inst.pod == committedTarget && inst.observed && !inst.isPrimary {
-			committedDrivable = true
-			committedLSN = inst.receivedLSN
+			s.committedDrivable = true
+			s.committedLSN = inst.receivedLSN
 		}
 	}
+	return s
+}
+
+func evaluateFailover(instances []instanceView, committedTarget string) failoverDecision {
+	s := summarizeInstances(instances, committedTarget)
 	// No failover while a ready primary exists.
-	if hasReadyPrimary {
+	if s.hasReadyPrimary {
 		return failoverDecision{}
 	}
 	// Nothing to act on: no ready replica to elect, no committed target to drive,
 	// and no outstanding commitment to wait for (provisioning or fully down).
-	if len(candidates) == 0 && !committedDrivable && committedTarget == "" {
+	if len(s.candidates) == 0 && !s.committedDrivable && committedTarget == "" {
 		return failoverDecision{}
 	}
 	// Only safe to promote from a no-claimant snapshot in which every started
-	// instance is accounted for and WAL has settled.
-	if anyClaimsPrimary || anyRunningUnobserved || anyReceiverActive {
+	// instance is accounted for, every role is confirmed, and WAL has settled.
+	if s.anyClaimsPrimary || s.anyRunningUnobserved || s.anyRoleUnconfirmed || s.anyReceiverActive {
 		return failoverDecision{warranted: true, wait: true}
 	}
 	// A durable commitment to a specific target governs the decision: keep driving
@@ -139,7 +170,7 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 	// driving to promotion.
 	if committedTarget != "" {
 		switch {
-		case !committedDrivable:
+		case !s.committedDrivable:
 			// Gone or without a pod IP this cycle: unaccounted for. It may return
 			// holding WAL only it has, or may already be promoted, so we park rather
 			// than promote a replacement. Because the operator durably committed to
@@ -147,7 +178,7 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 			// WAL watermark — is the data-safe choice; only STONITH/bounded-lag
 			// (deferred) may later abandon it.
 			return failoverDecision{warranted: true, wait: true}
-		case committedLSN < maxObservedLSN:
+		case s.committedLSN < s.maxObservedLSN:
 			// Present but behind an observed peer (e.g. rebuilt from an empty
 			// volume): never promote it as a laggard.
 			return failoverDecision{warranted: true, wait: true}
@@ -158,7 +189,7 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 		}
 	}
 	// Fresh election: the most-advanced ready candidate, ties broken by pod name.
-	slices.SortFunc(candidates, func(a, b instanceView) int {
+	slices.SortFunc(s.candidates, func(a, b instanceView) int {
 		if a.receivedLSN != b.receivedLSN {
 			return cmp.Compare(b.receivedLSN, a.receivedLSN)
 		}
@@ -167,10 +198,10 @@ func evaluateFailover(instances []instanceView, committedTarget string) failover
 	// Never promote a ready candidate behind a more-advanced observed instance
 	// (e.g. a not-ready standby that streamed further WAL before its readiness
 	// lapsed): those writes may be acknowledged and would be lost.
-	if candidates[0].receivedLSN < maxObservedLSN {
+	if s.candidates[0].receivedLSN < s.maxObservedLSN {
 		return failoverDecision{warranted: true, wait: true}
 	}
-	return failoverDecision{warranted: true, targetPrimary: candidates[0].pod}
+	return failoverDecision{warranted: true, targetPrimary: s.candidates[0].pod}
 }
 
 // reconcileFailover runs the target/current handshake for one shard. When a

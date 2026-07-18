@@ -19,6 +19,7 @@ package controller
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -115,6 +116,121 @@ var _ = Describe("PgShardNode failover", func() {
 		Expect(got.Status.CurrentPrimary).To(Equal("fonode-2"))
 		Expect(got.Status.TargetPrimary).To(BeEmpty())
 
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("records an unconfirmed role as empty, withholds readiness, and elects only once the role is confirmed", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		// The agent is up and ready but has not classified its role yet.
+		agent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_UNSPECIFIED)
+
+		dial := func(_ string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			return agent.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		Expect(k8sClient.Create(ctx, newNode("rolenode", 1))).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rolenode", Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rolenode", Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP("rolenode-0", primaryPodIP)
+
+		reconcile()
+		unconfirmed := get()
+		// An unconfirmed role is recorded as empty, never silently as replica.
+		Expect(unconfirmed.Status.Instances).To(HaveLen(1))
+		Expect(string(unconfirmed.Status.Instances[0].Role)).To(BeEmpty())
+		Expect(unconfirmed.Status.Instances[0].Ready).To(BeTrue())
+		// A ready pod with an unconfirmed role neither makes the node Ready nor is
+		// elected primary.
+		Expect(unconfirmed.Status.Phase).NotTo(Equal(pgshardv1alpha1.NodeReady))
+		Expect(unconfirmed.Status.CurrentPrimary).To(BeEmpty())
+		Expect(unconfirmed.Status.TargetPrimary).To(BeEmpty())
+		Expect(agent.AppliedEpoch()).To(Equal(uint64(0)))
+
+		// Once the agent confirms the standby role, the instance is elected primary.
+		agent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		reconcile() // election pass persists target + epoch
+		Expect(get().Status.TargetPrimary).To(Equal("rolenode-0"))
+		reconcile() // promote pass
+		Expect(agent.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("keeps a confirmed standby's replica label across a transient poll blip", func() {
+		primaryAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(primaryAgent.Stop)
+		replicaAgent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(replicaAgent.Stop)
+		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		replicaAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return primaryAgent.Client()
+			}
+			return replicaAgent.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		Expect(k8sClient.Create(ctx, newNode("stickynode", 2))).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "stickynode", Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		labelOf := func(pod string) string {
+			var p corev1.Pod
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: pod, Namespace: ns}, &p)).To(Succeed())
+			return p.Labels[labelRole]
+		}
+
+		reconcile()
+		stampPodIP("stickynode-0", primaryPodIP)
+		stampPodIP("stickynode-1", replicaPodIP)
+		reconcile()
+		Expect(labelOf("stickynode-1")).To(Equal(roleLabelReplica)) // confirmed standby -> -ro
+
+		// The replica's agent poll blips this cycle; its role is unconfirmed.
+		replicaAgent.SetEmptyStatus(true)
+		reconcile()
+		// A single hiccup must not flap a healthy replica out of read routing.
+		Expect(labelOf("stickynode-1")).To(Equal(roleLabelReplica))
+
+		// Now the PRIMARY's poll blips. An unconfirmed ex-primary is a possible
+		// writer: it must be pulled from -rw and never sticky-added to -ro, so it
+		// keeps neither label — unlike the replica, whose label was replica.
+		replicaAgent.SetEmptyStatus(false)
+		primaryAgent.SetEmptyStatus(true)
+		reconcile()
+		Expect(labelOf("stickynode-1")).To(Equal(roleLabelReplica)) // replica still serves reads
+		var exPrimary corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "stickynode-0", Namespace: ns}, &exPrimary)).To(Succeed())
+		Expect(exPrimary.Labels).NotTo(HaveKey(labelRole)) // out of both -rw and -ro
+
+		var got pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "stickynode", Namespace: ns}, &got)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 
