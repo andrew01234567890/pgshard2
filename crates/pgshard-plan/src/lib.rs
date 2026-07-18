@@ -29,6 +29,13 @@
 //!   `ON CONFLICT DO UPDATE`), `UPDATE ... FROM` / `DELETE ... USING`, and
 //!   MERGE/COPY are rejected with SQLSTATE `0A000`.
 //! - `search_path` is not modeled: an unqualified relation defaults to `public`.
+//! - A relation the sharding schema does not know is rejected (`42P01`) wherever
+//!   it appears — plain FROM, joins, subqueries, CTE bodies — rather than routed
+//!   by guesswork. The exception is qualified `pg_catalog`/`information_schema`
+//!   reads, which route to the system database: **catalog reads answer with the
+//!   system database's own catalogs**, not a per-shard merge — sufficient for
+//!   client handshakes and tooling probes, but shard-local statistics views
+//!   describe the system database only. This is a documented M1 contract.
 //! - Joins, subqueries, CTEs, and set operations over sharded tables are
 //!   rejected, not routed: key-routing needs a single plain sharded table in the
 //!   FROM, no subquery anywhere in the statement, and no `WITH` clause (which can
@@ -65,6 +72,7 @@ use extract::{
 /// SQLSTATE `feature_not_supported`: what a statement the router cannot route
 /// (a cross-shard write, an unsupported form) is rejected with.
 const CROSS_SHARD: &str = "0A000";
+const UNDEFINED_TABLE: &str = "42P01";
 
 /// Where the router should send a statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +213,27 @@ fn reject(reason: &str) -> Plan {
     }
 }
 
+/// System catalog schemas exist in every database and hold no user rows, so a
+/// read over them routes like a global table rather than being rejected as
+/// unknown. Only the qualified forms are exempt: an unqualified `pg_class`
+/// parses into `public` (v1 does not model `search_path`) and is treated like
+/// any other unknown relation.
+fn is_catalog_schema(t: &TableName) -> bool {
+    t.schema == "pg_catalog" || t.schema == "information_schema"
+}
+
+/// A relation the sharding schema does not know cannot be routed by guesswork:
+/// sending it to the system database would return that database's same-named
+/// table if one exists — plausible wrong rows instead of an error.
+fn reject_unknown(t: &TableName) -> Plan {
+    Plan::Reject {
+        code: UNDEFINED_TABLE,
+        reason: format!(
+            "relation {t} is not in the sharding configuration; qualify catalog reads with pg_catalog"
+        ),
+    }
+}
+
 /// How a set of shard-key values resolves against the catalog.
 enum Resolution {
     /// No usable shard-key constraint was found.
@@ -305,6 +334,17 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
 }
 
 fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
+    // Fail loud on any relation the schema does not know — a typo, or a table
+    // missing from the config — ANYWHERE in the statement: plain FROM, join
+    // arms, subqueries in any clause, CTE bodies, set-operation arms. Falling
+    // through to the system database could return a same-named table's rows
+    // there instead of an error. The walk is the complete serde traversal
+    // (nothing can hide from it); unqualified names that match a CTE the
+    // statement itself defines are the CTE, not a base relation. Runs before
+    // the set-operation dispatch so both paths are covered once.
+    if let Some(unknown) = unknown_relation(s, vschema) {
+        return reject_unknown(&unknown);
+    }
     // A set operation (UNION/INTERSECT/EXCEPT) nests its operands in larg/rarg and
     // leaves the top-level FROM empty, so the key-routing path below would see no
     // tables and mistake it for a session-local read — running the whole set
@@ -430,6 +470,27 @@ fn plan_set_op(s: &SelectStmt, vschema: &VSchema) -> Plan {
     }
 }
 
+/// The first relation reference anywhere in `tree` that is neither a configured
+/// table, a qualified catalog relation, nor an unqualified reference to a CTE
+/// the statement defines. A serialization failure (which a well-formed parse
+/// tree does not produce) reports a sentinel so the caller fails closed.
+fn unknown_relation<T: serde::Serialize>(tree: &T, vschema: &VSchema) -> Option<TableName> {
+    let resolve = |schema: &str, name: &str| -> bool {
+        let t = TableName::new(if schema.is_empty() { "public" } else { schema }, name);
+        is_catalog_schema(&t) || !matches!(placement(vschema, &t), Placement::Unknown)
+    };
+    extract::find_unresolved_relation(tree, &resolve).map(|(schema, name)| {
+        TableName::new(
+            if schema.is_empty() {
+                "public".to_owned()
+            } else {
+                schema
+            },
+            name,
+        )
+    })
+}
+
 /// The FROM relations of every arm of a (possibly nested) set operation, and
 /// whether every arm's FROM is plain. A set operation nests its operands in
 /// `larg`/`rarg`; only the leaf arms carry a FROM clause.
@@ -482,14 +543,31 @@ fn plan_insert(s: &InsertStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
             // `ON CONFLICT ... DO UPDATE` runs only on the shard the INSERT
             // routes to, but the conflicting row (found by an arbitrary arbiter)
             // may live on another shard, and the SET may even move the shard key.
-            // Neither is safe on a single shard, so reject any DO UPDATE (DO
-            // NOTHING is fine).
-            if let Some(oc) = s.on_conflict_clause.as_deref()
-                && oc.action == OnConflictAction::OnconflictUpdate as i32
-            {
-                return reject(&format!(
-                    "INSERT into sharded table {table} with ON CONFLICT DO UPDATE is not supported in M1"
-                ));
+            // Neither is safe on a single shard, so reject any DO UPDATE. DO
+            // NOTHING is only shard-local when its conflict target provably
+            // includes the shard key: conflicting rows then share the key value
+            // and live on the routed shard. A bare DO NOTHING (matches any
+            // constraint), an ON CONSTRAINT form (columns unknown here), or an
+            // arbiter without the key could match a unique constraint spanning
+            // shards — a conflict on another shard is invisible to this routed
+            // insert, which would then create a logical duplicate.
+            if let Some(oc) = s.on_conflict_clause.as_deref() {
+                if oc.action == OnConflictAction::OnconflictUpdate as i32 {
+                    return reject(&format!(
+                        "INSERT into sharded table {table} with ON CONFLICT DO UPDATE is not supported in M1"
+                    ));
+                }
+                let arbiter_includes_key = oc.infer.as_deref().is_some_and(|inf| {
+                    inf.conname.is_empty()
+                        && inf.index_elems.iter().any(
+                            |e| matches!(&e.node, Some(NodeEnum::IndexElem(el)) if el.name == key),
+                        )
+                });
+                if !arbiter_includes_key {
+                    return reject(&format!(
+                        "INSERT into sharded table {table} with ON CONFLICT requires a conflict target listing the shard key column {key}"
+                    ));
+                }
             }
             let Some(values) = extract::insert_key_values(s, key) else {
                 return reject(&format!(
@@ -1031,6 +1109,84 @@ mod tests {
         ] {
             assert!(is_reject(&plan1(sql)), "{sql}");
         }
+        // DO NOTHING whose arbiter cannot be proven shard-local is rejected: a
+        // non-shard-key unique constraint can conflict on ANOTHER shard, and the
+        // routed insert would create a logical duplicate there invisibly.
+        for sql in [
+            // Bare: matches any constraint, including cross-shard ones.
+            "INSERT INTO orders (customer_id) VALUES (1) ON CONFLICT DO NOTHING",
+            // Arbiter without the shard key.
+            "INSERT INTO orders (id, customer_id) VALUES (7, 1) ON CONFLICT (id) DO NOTHING",
+            // Named constraint: its columns are unknown here.
+            "INSERT INTO orders (customer_id) VALUES (1) ON CONFLICT ON CONSTRAINT orders_pk DO NOTHING",
+        ] {
+            assert!(is_reject(&plan1(sql)), "{sql}");
+        }
+        // A compound arbiter including the shard key is still shard-local.
+        assert_eq!(
+            plan1(
+                "INSERT INTO orders (customer_id, total) VALUES (1, 5) \
+                 ON CONFLICT (customer_id, total) DO NOTHING"
+            ),
+            Plan::SingleShard(shard_of(1))
+        );
+    }
+
+    #[test]
+    fn unknown_relations_are_rejected_not_routed_to_the_system_database() {
+        // A typo'd or unconfigured relation must error, not read a same-named
+        // table in the system database.
+        for sql in [
+            "SELECT * FROM orderz",
+            "SELECT * FROM orders o JOIN mystery m ON m.id = o.id WHERE o.customer_id = 1",
+            "SELECT * FROM settings UNION ALL SELECT * FROM mystery",
+            // Hidden references: a FROM subquery, an expression subquery, and a
+            // CTE body — the complete walk sees them all.
+            "SELECT * FROM (SELECT * FROM mystery) m",
+            "SELECT (SELECT count(*) FROM mystery)",
+            "WITH x AS (SELECT * FROM mystery) SELECT * FROM x",
+            // CTE visibility is scoped: without RECURSIVE a CTE sees only
+            // EARLIER siblings, so `mystery` inside `a` is a base relation —
+            // the later CTE of the same name must not mask it.
+            "WITH a AS (SELECT * FROM mystery), mystery AS (SELECT * FROM settings) SELECT * FROM a",
+            // A non-recursive self reference is a base relation too.
+            "WITH t AS (SELECT * FROM t) SELECT * FROM t",
+        ] {
+            assert!(
+                matches!(&plan1(sql), Plan::Reject { code, .. } if *code == UNDEFINED_TABLE),
+                "{sql}"
+            );
+        }
+        // Qualified catalog reads keep routing like globals (they exist in every
+        // database); unqualified ones fold to public and are unknown like any
+        // other relation.
+        assert_eq!(plan1("SELECT * FROM pg_catalog.pg_class"), Plan::Unsharded);
+        assert_eq!(
+            plan1("SELECT * FROM information_schema.tables"),
+            Plan::Unsharded
+        );
+        // A CTE over a known global table keeps working: the CTE's own name is
+        // not a base relation, and its body references only known tables.
+        assert_eq!(
+            plan1("WITH x AS (SELECT * FROM settings) SELECT * FROM x"),
+            Plan::Unsharded
+        );
+        // Ordered sibling visibility: a LATER CTE may reference an earlier one.
+        assert_eq!(
+            plan1(
+                "WITH mystery AS (SELECT * FROM settings), a AS (SELECT * FROM mystery) \
+                 SELECT * FROM a"
+            ),
+            Plan::Unsharded
+        );
+        // WITH RECURSIVE makes every name visible to every body.
+        assert_eq!(
+            plan1(
+                "WITH RECURSIVE a AS (SELECT * FROM mystery), \
+                 mystery AS (SELECT * FROM settings) SELECT * FROM a"
+            ),
+            Plan::Unsharded
+        );
     }
 
     #[test]
