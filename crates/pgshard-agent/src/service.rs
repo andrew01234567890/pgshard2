@@ -194,6 +194,40 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         }
     }
 
+    // Create a cross-shard consistency point on this (primary) instance.
+    async fn create_restore_point(
+        &self,
+        request: Request<v1::CreateRestorePointRequest>,
+    ) -> Result<Response<v1::CreateRestorePointResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("restore point name is required"));
+        }
+        let rp = self
+            .instance
+            .create_restore_point(&req.name)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::CreateRestorePointResponse {
+            lsn: Some(v1::Lsn { value: rp.lsn }),
+            timeline: rp.timeline,
+        }))
+    }
+
+    async fn switch_wal(
+        &self,
+        request: Request<v1::SwitchWalRequest>,
+    ) -> Result<Response<v1::SwitchWalResponse>, Status> {
+        let lsn = self
+            .instance
+            .switch_wal(request.into_inner().wait_archived)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::SwitchWalResponse {
+            lsn: Some(v1::Lsn { value: lsn }),
+        }))
+    }
+
     // ---- Not yet implemented (later steps) -------------------------------
 
     async fn reload_config(
@@ -201,18 +235,6 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         _r: Request<v1::ReloadConfigRequest>,
     ) -> Result<Response<v1::ReloadConfigResponse>, Status> {
         Err(Status::unimplemented("reload_config"))
-    }
-    async fn create_restore_point(
-        &self,
-        _r: Request<v1::CreateRestorePointRequest>,
-    ) -> Result<Response<v1::CreateRestorePointResponse>, Status> {
-        Err(Status::unimplemented("create_restore_point"))
-    }
-    async fn switch_wal(
-        &self,
-        _r: Request<v1::SwitchWalRequest>,
-    ) -> Result<Response<v1::SwitchWalResponse>, Status> {
-        Err(Status::unimplemented("switch_wal"))
     }
     async fn run_backup(
         &self,
@@ -620,5 +642,67 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn create_restore_point_records_and_returns_lsn_and_timeline() {
+        let instance = FakeInstance::primary();
+        instance.set(|s| {
+            s.write_lsn = 0x1234;
+            s.timeline = 3;
+        });
+        let s = svc(instance);
+        let resp = s
+            .create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                name: "pgshard_barrier_1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.lsn.unwrap().value, 0x1234);
+        assert_eq!(resp.timeline, 3);
+        assert_eq!(s.instance.restore_points(), vec!["pgshard_barrier_1"]);
+    }
+
+    #[tokio::test]
+    async fn create_restore_point_rejects_an_empty_name() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                name: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_restore_point_is_rejected_on_a_standby() {
+        // A restore point can only be created on a primary; a standby errors.
+        let s = svc(FakeInstance::standby());
+        let err = s
+            .create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                name: "pgshard_barrier_1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(s.instance.restore_points().is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_wal_returns_the_switch_lsn() {
+        let instance = FakeInstance::primary();
+        instance.set(|s| s.write_lsn = 0x5000);
+        let s = svc(instance);
+        let resp = s
+            .switch_wal(Request::new(v1::SwitchWalRequest {
+                wait_archived: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.lsn.unwrap().value, 0x5000);
+        assert_eq!(s.instance.wal_switches(), 1);
     }
 }

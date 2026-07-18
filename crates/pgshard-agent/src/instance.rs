@@ -5,6 +5,14 @@
 
 use async_trait::async_trait;
 
+/// A named consistency point created on the primary: the LSN it recorded and
+/// the timeline it was on. A cross-shard barrier records one of these per shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestorePoint {
+    pub lsn: u64,
+    pub timeline: u32,
+}
+
 /// A point-in-time reading of the local instance, from which the agent builds
 /// the `InstanceStatus` the operator polls.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +62,15 @@ pub trait Instance: Send + Sync + 'static {
     /// sessions still connected to it. Idempotent: succeeds when the database is
     /// already absent.
     async fn drop_database(&self, name: &str) -> anyhow::Result<()>;
+
+    /// Create a named restore point (`pg_create_restore_point`) and return its
+    /// LSN and timeline. Only valid on a primary — the caller targets one.
+    async fn create_restore_point(&self, name: &str) -> anyhow::Result<RestorePoint>;
+
+    /// Force a WAL segment switch (`pg_switch_wal`), returning the switch LSN.
+    /// When `wait_archived`, block until that segment is confirmed archived so
+    /// the point is immediately restorable. Only valid on a primary.
+    async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
 }
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
@@ -73,6 +90,9 @@ pub mod fake {
         executed: Mutex<Vec<String>>,
         /// Databases that exist, name -> owner (empty owner = bootstrap role).
         databases: Mutex<BTreeMap<String, String>>,
+        /// Restore points created, in order.
+        restore_points: Mutex<Vec<String>>,
+        wal_switches: std::sync::atomic::AtomicU32,
     }
 
     impl FakeInstance {
@@ -122,6 +142,12 @@ pub mod fake {
         }
         pub fn owner_of(&self, name: &str) -> Option<String> {
             self.databases.lock().unwrap().get(name).cloned()
+        }
+        pub fn restore_points(&self) -> Vec<String> {
+            self.restore_points.lock().unwrap().clone()
+        }
+        pub fn wal_switches(&self) -> u32 {
+            self.wal_switches.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -174,6 +200,23 @@ pub mod fake {
             }
             self.databases.lock().unwrap().remove(name);
             Ok(())
+        }
+        async fn create_restore_point(&self, name: &str) -> anyhow::Result<RestorePoint> {
+            let s = self.state.lock().unwrap();
+            // PostgreSQL rejects restore points during recovery; model that.
+            anyhow::ensure!(!s.in_recovery, "cannot create a restore point on a standby");
+            self.restore_points.lock().unwrap().push(name.to_owned());
+            Ok(RestorePoint {
+                lsn: s.write_lsn,
+                timeline: s.timeline,
+            })
+        }
+        async fn switch_wal(&self, _wait_archived: bool) -> anyhow::Result<u64> {
+            let s = self.state.lock().unwrap();
+            anyhow::ensure!(!s.in_recovery, "cannot switch WAL on a standby");
+            self.wal_switches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(s.write_lsn)
         }
     }
 }
