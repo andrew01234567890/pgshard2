@@ -81,9 +81,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     // Seed from the initial validation's own stamps: construction time here
-    // could be arbitrarily later than the read that produced the snapshot.
-    let freshness = pgshard_topo::Freshness::new();
-    freshness.install(&watcher.subscribe_validated().borrow());
+    // could be arbitrarily later than the read that produced the snapshot,
+    // and install()'s ordering guard would ignore the older (real) stamp.
+    let freshness = pgshard_topo::Freshness::seeded(&watcher.subscribe_validated().borrow());
     tokio::spawn(pgshard_router::watch_topology_leased(
         router.clone(),
         updates,

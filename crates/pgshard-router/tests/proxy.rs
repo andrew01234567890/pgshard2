@@ -614,7 +614,11 @@ async fn expired_write_lease_blocks_writes_but_not_reads() {
     assert_eq!(err.code().map(|c| c.code()), Some("25006"));
 
     // A successful refresh restores writes.
-    freshness.install(&pgshard_topo::ValidationClocks::before_read().stamp(1));
+    freshness.install(
+        &pgshard_topo::ValidationClocks::before_read()
+            .unwrap()
+            .stamp(1),
+    );
     client
         .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'again')")
         .await

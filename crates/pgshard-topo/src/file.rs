@@ -46,7 +46,9 @@ impl FileWatcher {
             ));
         }
         let path = path.into();
-        let initial_clocks = ValidationClocks::before_read();
+        let initial_clocks = ValidationClocks::before_read().ok_or_else(|| {
+            TopologyError::Invalid("boot clock unavailable; cannot stamp validations".into())
+        })?;
         let initial = load(&path).await?;
         let (sender, _) = watch::channel(Arc::new(initial));
         let sender = Arc::new(sender);
@@ -69,7 +71,10 @@ impl FileWatcher {
                 if poller.receiver_count() == 0 && Arc::strong_count(&poller) == 1 {
                     return; // watcher dropped, no consumers
                 }
-                let clocks = ValidationClocks::before_read();
+                let Some(clocks) = ValidationClocks::before_read() else {
+                    warn!("boot clock unavailable; skipping validation announcement");
+                    continue;
+                };
                 match load(&poll_path).await {
                     Ok(candidate) => {
                         // Clocks were captured BEFORE the read began; announce
@@ -99,7 +104,9 @@ impl FileWatcher {
     /// Re-reads the file immediately (tests use this instead of waiting for
     /// the poll tick). Returns whether the snapshot was applied.
     pub async fn reload(&self) -> Result<bool, TopologyError> {
-        let clocks = ValidationClocks::before_read();
+        let clocks = ValidationClocks::before_read().ok_or_else(|| {
+            TopologyError::Invalid("boot clock unavailable; cannot stamp validations".into())
+        })?;
         let candidate = load(&self.path).await?;
         let stamp = clocks.stamp(candidate.epoch);
         let applied = apply(&self.sender, candidate);
