@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio_postgres::NoTls;
 use tokio_postgres::error::SqlState;
 
-use crate::instance::{Instance, Snapshot};
+use crate::instance::{Instance, RestorePoint, Snapshot};
 
 pub struct PgInstance {
     conn_string: String,
@@ -167,6 +167,49 @@ impl Instance for PgInstance {
         let stmt = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", quote_ident(name));
         self.connect().await?.batch_execute(&stmt).await?;
         Ok(())
+    }
+
+    async fn create_restore_point(&self, name: &str) -> anyhow::Result<RestorePoint> {
+        let client = self.connect().await?;
+        // pg_create_restore_point returns the point's LSN; the timeline is read
+        // from that LSN's WAL file name, not pg_control_checkpoint() — the latter
+        // reflects the last completed checkpoint, so right after a promotion it
+        // would report the pre-promotion timeline while the new point sits on the
+        // new one (the same trap `promote` avoids). On a standby PostgreSQL errors
+        // ("recovery is in progress"), which propagates — the caller targets the
+        // primary.
+        let row = client
+            .query_one(
+                "SELECT lsn::text, ('x' || substr(pg_walfile_name(lsn), 1, 8))::bit(32)::int
+                 FROM pg_create_restore_point($1) AS lsn",
+                &[&name],
+            )
+            .await?;
+        let lsn: String = row.get(0);
+        let timeline: i32 = row.get(1);
+        Ok(RestorePoint {
+            lsn: parse_lsn(&lsn),
+            timeline: timeline as u32,
+        })
+    }
+
+    async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64> {
+        // Waiting for the switched segment to be confirmed archived (so the point
+        // is immediately restorable) needs a bounded poll of pg_stat_archiver
+        // against a correctly-identified segment; that lands with the barrier
+        // controller and its archiving-enabled e2e. Reject rather than silently
+        // return an unconfirmed LSN.
+        anyhow::ensure!(
+            !wait_archived,
+            "switch_wal with wait_archived is not implemented yet"
+        );
+        let lsn: String = self
+            .connect()
+            .await?
+            .query_one("SELECT pg_switch_wal()::text", &[])
+            .await?
+            .get(0);
+        Ok(parse_lsn(&lsn))
     }
 }
 

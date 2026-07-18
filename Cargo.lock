@@ -1971,6 +1971,7 @@ dependencies = [
  "async-trait",
  "clap",
  "pgshard-proto",
+ "pgshard-testutil",
  "prost 0.14.4",
  "thiserror 2.0.18",
  "tokio",
