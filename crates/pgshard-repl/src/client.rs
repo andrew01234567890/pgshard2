@@ -321,8 +321,13 @@ impl ReplicationClient {
     /// Record the consumer's durable position. Reported as the flushed/applied
     /// LSN in the next standby status, so the server advances the slot (and frees
     /// WAL) only up to what the consumer has committed — the invariant that makes
-    /// a restart replay exactly the un-applied tail. Never let this run ahead of a
-    /// durable checkpoint.
+    /// a restart replay exactly the un-applied tail.
+    ///
+    /// CONTRACT — passing a position past what the target has *durably committed*
+    /// silently breaks exactly-once (a crash then loses the gap). The only safe
+    /// argument is a checkpoint the consumer has committed, e.g.
+    /// `client.confirm(applier.checkpoint())` **after** `applier.handle` has
+    /// returned for a Commit — never a raw `wal_end`/`end_lsn` off the stream.
     pub fn confirm(&mut self, lsn: Lsn) {
         if lsn > self.confirmed_lsn {
             self.confirmed_lsn = lsn;

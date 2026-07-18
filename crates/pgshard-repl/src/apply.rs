@@ -79,21 +79,31 @@ impl Applier {
         let consumer = consumer.into();
         target
             .batch_execute(
-                "CREATE SCHEMA IF NOT EXISTS pgshard;
+                // Pin the settings the literal quoting depends on: with
+                // standard_conforming_strings on, only the single quote is special
+                // in a literal, so quote_literal is a complete escape. UTF-8 keeps
+                // the applied text bytes matching the source's.
+                "SET standard_conforming_strings = on;
+                 SET client_encoding = 'UTF8';
+                 CREATE SCHEMA IF NOT EXISTS pgshard;
                  CREATE TABLE IF NOT EXISTS pgshard.repl_progress (
                      consumer text PRIMARY KEY,
                      lsn bigint NOT NULL
                  )",
             )
             .await?;
-        let checkpoint = target
+        let checkpoint = match target
             .query_opt(
                 "SELECT lsn FROM pgshard.repl_progress WHERE consumer = $1",
                 &[&consumer],
             )
             .await?
-            .map(|row| Lsn(row.get::<_, i64>(0) as u64))
-            .unwrap_or(Lsn(0));
+        {
+            // try_get, not get: a pre-existing progress table with the wrong
+            // column type errors rather than panicking.
+            Some(row) => Lsn(row.try_get::<_, i64>(0)? as u64),
+            None => Lsn(0),
+        };
         Ok(Applier {
             target,
             relations: HashMap::new(),
@@ -156,8 +166,11 @@ impl Applier {
     }
 
     async fn commit(&mut self, commit_lsn: Lsn) -> Result<()> {
-        // Exactly-once: a commit at or before the durable checkpoint was already
-        // applied — the slot replayed it after a restart. Skip it.
+        // Exactly-once: skip a commit at or before the durable checkpoint — it was
+        // already applied and the slot replayed it after a restart. The comparison
+        // must be `<=`, not `<`: PostgreSQL only skips a transaction whose commit
+        // LSN is strictly below the slot's confirmed-flush, so the last-applied
+        // transaction (LSN == checkpoint) is re-sent and must be de-duplicated here.
         if commit_lsn <= self.checkpoint {
             self.pending.clear();
             return Ok(());
