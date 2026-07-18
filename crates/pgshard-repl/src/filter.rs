@@ -80,6 +80,20 @@ pub fn cell_keyspace_id(
         }
     };
     let text = std::str::from_utf8(bytes).map_err(|_| FilterError::InvalidUtf8)?;
+    text_keyspace_id(text, shard_key_type, shard_fn)
+}
+
+/// The keyspace id of a shard-key value already decoded to its text form.
+///
+/// This is the shared core of both the streaming filter ([`cell_keyspace_id`])
+/// and the initial snapshot [`crate::copy`]. Both must produce the same id for
+/// the same logical value so a row is copied by the snapshot pass iff it would
+/// also be kept by the stream — no gap or overlap at the snapshot/stream seam.
+pub fn text_keyspace_id(
+    text: &str,
+    shard_key_type: ScalarType,
+    shard_fn: &dyn ShardFunction,
+) -> Result<KeyspaceId, FilterError> {
     // The router hashes the value coerced to the column type, so `5` and `'5'`
     // land on one shard; coercing the text form here reproduces that exactly.
     let canonical = shard_key_type

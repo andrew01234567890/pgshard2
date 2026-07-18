@@ -260,6 +260,42 @@ impl ReplicationClient {
         }
     }
 
+    /// Create a logical replication slot that exports its snapshot, returning the
+    /// snapshot name to feed `SET TRANSACTION SNAPSHOT` for the initial copy.
+    ///
+    /// The slot's consistent point is exactly this snapshot, so a copy of the
+    /// snapshot followed by a stream from the slot has no gap or overlap at the
+    /// seam. The snapshot stays valid only while this connection is idle, so run
+    /// the copy before issuing any further command (including `START_REPLICATION`).
+    pub async fn create_logical_slot_exported(
+        &mut self,
+        name: &str,
+        temporary: bool,
+    ) -> Result<String> {
+        if !is_safe_ident(name) {
+            return Err(ClientError::Malformed(format!(
+                "unsafe replication slot name {name:?}"
+            )));
+        }
+        let temp = if temporary { "TEMPORARY " } else { "" };
+        let sql = format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput EXPORT_SNAPSHOT");
+        self.send_query(&sql).await?;
+        let mut snapshot = None;
+        loop {
+            let (tag, mut body) = self.read_control().await?;
+            match tag {
+                b'D' => snapshot = Some(snapshot_name_from_row(&mut body)?),
+                b'T' | b'C' | b'S' => continue,
+                b'Z' => break,
+                b'E' => return Err(server_error(&body)),
+                other => return Err(ClientError::Unexpected(other)),
+            }
+        }
+        snapshot.ok_or_else(|| {
+            ClientError::Malformed("CREATE_REPLICATION_SLOT returned no snapshot".to_owned())
+        })
+    }
+
     /// Begin streaming `slot` for `publication` at protocol v4. After this the
     /// connection is in `CopyBoth` mode; use [`Self::next`].
     pub async fn start_replication(&mut self, slot: &str, publication: &str) -> Result<()> {
@@ -433,6 +469,50 @@ fn read_i32(body: &mut BytesMut) -> Result<i32> {
         return Err(ClientError::Malformed("truncated int32".to_owned()));
     }
     Ok(body.get_i32())
+}
+
+/// Extract the `snapshot_name` (third field) from a CREATE_REPLICATION_SLOT
+/// DataRow: (slot_name, consistent_point, snapshot_name, output_plugin).
+fn snapshot_name_from_row(body: &mut BytesMut) -> Result<String> {
+    const SNAPSHOT_FIELD: u16 = 2;
+    if body.remaining() < 2 {
+        return Err(ClientError::Malformed("short slot DataRow".to_owned()));
+    }
+    let fields = body.get_u16();
+    if fields <= SNAPSHOT_FIELD {
+        return Err(ClientError::Malformed(
+            "CREATE_REPLICATION_SLOT row has too few fields".to_owned(),
+        ));
+    }
+    for i in 0..fields {
+        if body.remaining() < 4 {
+            return Err(ClientError::Malformed(
+                "truncated slot DataRow field".to_owned(),
+            ));
+        }
+        let len = body.get_i32();
+        if len < 0 {
+            if i == SNAPSHOT_FIELD {
+                return Err(ClientError::Malformed("snapshot name is null".to_owned()));
+            }
+            continue;
+        }
+        let len = len as usize;
+        if body.remaining() < len {
+            return Err(ClientError::Malformed(
+                "truncated slot DataRow value".to_owned(),
+            ));
+        }
+        if i == SNAPSHOT_FIELD {
+            let bytes = body.copy_to_bytes(len);
+            return String::from_utf8(bytes.to_vec())
+                .map_err(|_| ClientError::Malformed("snapshot name not UTF-8".to_owned()));
+        }
+        body.advance(len);
+    }
+    Err(ClientError::Malformed(
+        "no snapshot field in slot DataRow".to_owned(),
+    ))
 }
 
 /// The NUL-terminated mechanism names in an `AuthenticationSASL` body.

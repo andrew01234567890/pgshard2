@@ -12,6 +12,7 @@ bytes = "1.10.1"
 tokio = { version = "1.53.0", features = ["net", "io-util", "time", "rt", "macros"] }
 postgres-protocol = "0.6.12"
 tokio-postgres = "0.7.18"
+futures-util = { version = "0.3.32", default-features = false, features = ["async-await", "sink", "std"] }
 
 [lints]
 workspace = true
