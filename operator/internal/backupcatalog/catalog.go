@@ -14,18 +14,60 @@ import (
 )
 
 // TopologySnapshot is catalog/topology/gen-<N>.json — written on every
-// structural change (shard set or table catalog). Immutable.
+// structural change (shard set or table catalog). Immutable. It must be the
+// COMPLETE structural routing view: a restore into a fresh cluster
+// reconstructs routing from the snapshot alone (CRDs may be gone with the
+// cluster), so shard ranges without the hash function and table catalog
+// would leave the restored data unroutable — or, worse, routable under
+// different rules than the ones it was written with.
 type TopologySnapshot struct {
-	Generation int64           `json:"generation"`
-	ValidFrom  time.Time       `json:"validFrom"`
-	Epoch      int64           `json:"epoch"`
-	Shards     []ShardTopology `json:"shards"`
+	Generation int64     `json:"generation"`
+	ValidFrom  time.Time `json:"validFrom"`
+	Epoch      int64     `json:"epoch"`
+	// HashFunction is the cluster's shard function (the keyspace-id hash the
+	// shard ranges partition). Restoring data hashed with one function into a
+	// cluster routing with another silently misplaces every row.
+	HashFunction string          `json:"hashFunction"`
+	Shards       []ShardTopology `json:"shards"`
+	// Tables is the compiled table catalog live at this generation, projected
+	// from the same source as PgShardRouting.
+	Tables []TableTopology `json:"tables"`
 }
 
 type ShardTopology struct {
 	Name     string      `json:"name"`
 	KeyRange KeyRangeRef `json:"keyRange"`
 	Stanza   string      `json:"stanza"`
+	// Role: "data" or "system". Ranges alone cannot identify the sequence
+	// host (the system shard has no range, like a full-range data shard),
+	// and a restore that guessed would rebuild sequences on the wrong shard.
+	Role string `json:"role"`
+	// State is the compiled routing state at snapshot time (serving,
+	// buffered, readOnly, draining, hidden). Mid-reshard, sources and hidden
+	// targets hold OVERLAPPING ranges: without the state a fresh restore
+	// cannot know which side may serve, and publishing both would return
+	// duplicate or wrong rows.
+	State string `json:"state"`
+}
+
+// TableTopology mirrors the compiled RoutingTable structurally: everything a
+// restored cluster needs to route the table's data the way it was written.
+type TableTopology struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	// "sharded" or "global".
+	Type           string `json:"type"`
+	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
+	// Wire value of the shard-key column type (matches the router's
+	// ShardKeyType); required for sharded tables — hashing a literal as the
+	// wrong type routes it to the wrong shard.
+	ShardKeyType string             `json:"shardKeyType,omitempty"`
+	Sequences    []SequenceTopology `json:"sequences,omitempty"`
+}
+
+type SequenceTopology struct {
+	Column   string `json:"column"`
+	Sequence string `json:"sequence"`
 }
 
 type KeyRangeRef struct {
@@ -69,6 +111,25 @@ type BackupShard struct {
 	Timeline int32     `json:"timeline"`
 	StopTime time.Time `json:"stopTime"`
 }
+
+// Wire values for ShardTopology.Role, ShardTopology.State, and
+// TableTopology.Type, matching the compiled routing view.
+const (
+	RoleData      = "data"
+	RoleSystem    = "system"
+	StateServing  = "serving"
+	StateBuffered = "buffered"
+	StateReadOnly = "readOnly"
+	StateDraining = "draining"
+	StateHidden   = "hidden"
+	TableSharded  = "sharded"
+	TableGlobal   = "global"
+	HashXxhash64  = "xxhash64_v1"
+	KeyTypeInt    = "int"
+	KeyTypeText   = "text"
+	KeyTypeUUID   = "uuid"
+	KeyTypeBytea  = "bytea"
+)
 
 // Catalog is the full manifest set a resolver works over. Callers load it
 // from object storage; tests construct it directly.

@@ -134,6 +134,12 @@ pub mod fake {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    #[derive(Clone)]
+    pub struct RestorePointGate {
+        entered: Option<std::sync::Arc<tokio::sync::Notify>>,
+        gate: std::sync::Arc<tokio::sync::Notify>,
+    }
+
     #[derive(Default)]
     pub struct FakeInstance {
         state: Mutex<Snapshot>,
@@ -146,6 +152,11 @@ pub mod fake {
         databases: Mutex<BTreeMap<String, (String, Option<String>)>>,
         /// Restore points created, in order.
         restore_points: Mutex<Vec<String>>,
+        /// When set, create_restore_point signals `entered`, then parks on the
+        /// gate before executing (one-shot: the gate is consumed by the first
+        /// call that reaches it) — lets tests hold a call mid-flight to prove
+        /// single-flight and cancellation-safety semantics deterministically.
+        restore_point_gate: Mutex<Option<RestorePointGate>>,
         wal_switches: std::sync::atomic::AtomicU32,
     }
 
@@ -218,6 +229,26 @@ pub mod fake {
         }
         pub fn restore_points(&self) -> Vec<String> {
             self.restore_points.lock().unwrap().clone()
+        }
+        pub fn set_restore_point_gate(&self, gate: std::sync::Arc<tokio::sync::Notify>) {
+            *self.restore_point_gate.lock().unwrap() = Some(RestorePointGate {
+                entered: None,
+                gate,
+            });
+        }
+        /// Like [`Self::set_restore_point_gate`], additionally signalling
+        /// `entered` the moment the call reaches PostgreSQL — the handshake a
+        /// cancellation test needs to abort the caller at exactly the right
+        /// instant.
+        pub fn set_restore_point_gate_with_entered(
+            &self,
+            entered: std::sync::Arc<tokio::sync::Notify>,
+            gate: std::sync::Arc<tokio::sync::Notify>,
+        ) {
+            *self.restore_point_gate.lock().unwrap() = Some(RestorePointGate {
+                entered: Some(entered),
+                gate,
+            });
         }
         pub fn wal_switches(&self) -> u32 {
             self.wal_switches.load(std::sync::atomic::Ordering::SeqCst)
@@ -293,14 +324,21 @@ pub mod fake {
             Ok(())
         }
         async fn create_restore_point(&self, name: &str) -> anyhow::Result<RestorePoint> {
-            let s = self.state.lock().unwrap();
+            let (in_recovery, lsn, timeline) = {
+                let s = self.state.lock().unwrap();
+                (s.in_recovery, s.write_lsn, s.timeline)
+            };
             // PostgreSQL rejects restore points during recovery; model that.
-            anyhow::ensure!(!s.in_recovery, "cannot create a restore point on a standby");
+            anyhow::ensure!(!in_recovery, "cannot create a restore point on a standby");
+            let gate = self.restore_point_gate.lock().unwrap().take();
+            if let Some(g) = gate {
+                if let Some(entered) = &g.entered {
+                    entered.notify_one();
+                }
+                g.gate.notified().await;
+            }
             self.restore_points.lock().unwrap().push(name.to_owned());
-            Ok(RestorePoint {
-                lsn: s.write_lsn,
-                timeline: s.timeline,
-            })
+            Ok(RestorePoint { lsn, timeline })
         }
         async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64> {
             // Mirror the real instance's contract so the fast unit path enforces

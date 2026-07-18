@@ -3,14 +3,18 @@ package backupcatalog
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// pgBackRest --type values.
+// pgBackRest --type values. "none" is deliberately never emitted: pgBackRest
+// documents it as writing no recovery configuration at all — no recovery
+// target, no timeline selection, no promote — so what it reaches depends on
+// whatever WAL happens to be in the archive, not on the plan.
 const (
 	targetTypeName = "name"
 	targetTypeTime = "time"
-	targetTypeNone = "none"
+	targetTypeLSN  = "lsn"
 )
 
 // Target selects the restore point. Exactly one field is set.
@@ -27,10 +31,12 @@ type ShardPlan struct {
 	Stanza string
 	// pgBackRest --set: the backup set to restore from.
 	Set string
-	// pgBackRest --type: "name" (barrier restore point), "time", or
-	// "none" (recover to the end of the backup's WAL).
+	// pgBackRest --type: "name" (barrier restore point), "time", or "lsn"
+	// (a backup's recorded stop LSN). The executor always adds
+	// --target-action=promote: recovery must end at the plan's target, on a
+	// new timeline, never idle in recovery waiting for more WAL.
 	TargetType string
-	// --target value (restore point name or RFC3339 time); empty for none.
+	// --target value (restore point name, RFC3339 time, or LSN).
 	TargetValue string
 	// pgBackRest --target-timeline. For name/none targets this is the exact
 	// timeline recorded in the manifest. For a time target it is "latest":
@@ -42,6 +48,22 @@ type ShardPlan struct {
 	// from advancing an abandoned sibling timeline, and each restore lands on
 	// a fresh stanza, so a stanza's timelines form one linear failover chain.
 	TargetTimeline string
+	// TargetExclusive: the executor must add --target-exclusive. A backup's
+	// stop LSN is an END-of-record pointer, and inclusive LSN recovery stops
+	// only after applying the first record whose START is >= the target — a
+	// commit written between backup-end and the WAL switch would be silently
+	// included in "restore this backup". Exclusive recovery stops before it.
+	TargetExclusive bool
+	// VerifyLSN is the LSN recovery must have reached — EXACTLY — for the
+	// restore to be declared complete: the barrier's recorded LSN for name
+	// targets, the backup's stop LSN for lsn targets. Recovery-by-name stops
+	// at the FIRST matching restore point on the followed timeline, so a
+	// duplicate name at an earlier LSN would otherwise silently
+	// under-restore; and an over-shot recovery includes records the manifest
+	// never promised. The executor compares pg_last_wal_replay_lsn() against
+	// this after recovery and treats BOTH < and > as errors. Empty for time
+	// targets (no recorded expectation exists for an arbitrary timestamp).
+	VerifyLSN string
 }
 
 // RestorePlan materializes the topology at the target point.
@@ -123,6 +145,7 @@ func resolveBarrier(catalog Catalog, id string) (RestorePlan, error) {
 			TargetType:     targetTypeName,
 			TargetValue:    shard.RestorePoint,
 			TargetTimeline: timelineArg(shard.Timeline),
+			VerifyLSN:      shard.LSN,
 		})
 	}
 	return plan, sanity(plan)
@@ -182,12 +205,25 @@ func planFromBackup(catalog Catalog, backup BackupManifest) (RestorePlan, error)
 	}
 	plan := RestorePlan{Topology: topology}
 	for _, shard := range backup.Shards {
+		// "Restore this backup" means "the cluster exactly as the backup
+		// finished": recover to the recorded stop LSN and promote there. A
+		// manifest without one cannot be restored to a verifiable point.
+		if shard.StopLSN == "" {
+			return RestorePlan{}, errf(
+				"backup %s: shard %s records no stop LSN; refusing an unverifiable restore",
+				backup.ID, shard.Name)
+		}
 		plan.Shards = append(plan.Shards, ShardPlan{
-			Shard:          shard.Name,
-			Stanza:         shard.Stanza,
-			Set:            shard.Label,
-			TargetType:     targetTypeNone,
-			TargetTimeline: timelineArg(shard.Timeline),
+			Shard:      shard.Name,
+			Stanza:     shard.Stanza,
+			Set:        shard.Label,
+			TargetType: targetTypeLSN,
+			// StopLSN is an end-of-record pointer: exclusive recovery, or an
+			// unrelated record starting at exactly this LSN would be applied.
+			TargetValue:     shard.StopLSN,
+			TargetExclusive: true,
+			TargetTimeline:  timelineArg(shard.Timeline),
+			VerifyLSN:       shard.StopLSN,
 		})
 	}
 	return plan, sanity(plan)
@@ -293,6 +329,75 @@ func timelineArg(tl int32) string {
 	return strconv.FormatInt(int64(tl), 10)
 }
 
+// snapshotComplete checks the resolved generation is a COMPLETE structural
+// routing view. A fresh-cluster restore reconstructs routing from the
+// snapshot alone; restoring data without the hash function or shard-key
+// types it was written under would misroute rows instead of failing here.
+// Only the generation being restored is checked — an unrelated malformed
+// snapshot elsewhere in the catalog must not block a good restore.
+func snapshotComplete(topology TopologySnapshot) error {
+	if topology.HashFunction != HashXxhash64 {
+		return errf("topology generation %d records hash function %q; only %q is implemented, so this snapshot cannot rebuild usable routing",
+			topology.Generation, topology.HashFunction, HashXxhash64)
+	}
+	systemShards := 0
+	for _, sh := range topology.Shards {
+		switch sh.Role {
+		case RoleData:
+		case RoleSystem:
+			systemShards++
+		default:
+			return errf("topology generation %d: shard %s has unknown role %q (need data|system)",
+				topology.Generation, sh.Name, sh.Role)
+		}
+		switch sh.State {
+		case StateServing, StateBuffered, StateReadOnly, StateDraining, StateHidden:
+		default:
+			return errf("topology generation %d: shard %s has unknown routing state %q",
+				topology.Generation, sh.Name, sh.State)
+		}
+	}
+	// Exactly one system shard: it hosts the sequences and migration records
+	// a restored cluster cannot function without, and ranges alone cannot
+	// identify it (it has no range, like a full-range data shard).
+	if systemShards != 1 {
+		return errf("topology generation %d has %d system shards; a restorable snapshot records exactly one",
+			topology.Generation, systemShards)
+	}
+	seen := make(map[string]bool, len(topology.Tables))
+	for _, t := range topology.Tables {
+		if t.Schema == "" || t.Name == "" {
+			return errf("topology generation %d has a table entry without schema or name",
+				topology.Generation)
+		}
+		// PostgreSQL folds unquoted identifiers; the routing compiler
+		// deduplicates case-insensitively, so the snapshot must too.
+		key := strings.ToLower(t.Schema) + "." + strings.ToLower(t.Name)
+		if seen[key] {
+			return errf("topology generation %d lists table %s twice", topology.Generation, key)
+		}
+		seen[key] = true
+		switch t.Type {
+		case TableSharded:
+			if t.ShardKeyColumn == "" || t.ShardKeyType == "" {
+				return errf("topology generation %d: sharded table %s records no shard key column/type",
+					topology.Generation, key)
+			}
+			switch t.ShardKeyType {
+			case KeyTypeInt, KeyTypeText, KeyTypeUUID, KeyTypeBytea:
+			default:
+				return errf("topology generation %d: sharded table %s has unknown shard-key type %q (need int|text|uuid|bytea)",
+					topology.Generation, key, t.ShardKeyType)
+			}
+		case TableGlobal:
+		default:
+			return errf("topology generation %d: table %s has unknown type %q",
+				topology.Generation, key, t.Type)
+		}
+	}
+	return nil
+}
+
 // sanity validates the plan against its topology generation as the source of
 // truth: exactly one plan entry per topology shard, each restoring from the
 // stanza the topology records for that shard (not a stanza the manifest chose),
@@ -300,6 +405,9 @@ func timelineArg(tl int32) string {
 // manifest/topology disagreement into an error instead of a silent wrong or
 // cross-shard restore.
 func sanity(plan RestorePlan) error {
+	if err := snapshotComplete(plan.Topology); err != nil {
+		return err
+	}
 	if len(plan.Shards) != len(plan.Topology.Shards) {
 		return errf("plan covers %d shards but topology generation %d has %d",
 			len(plan.Shards), plan.Topology.Generation, len(plan.Topology.Shards))
@@ -342,8 +450,15 @@ func sanity(plan RestorePlan) error {
 		if p.Set == "" {
 			return errf("shard %s has no backup set", p.Shard)
 		}
-		if p.TargetType == targetTypeName && p.TargetValue == "" {
-			return errf("shard %s: name target with empty restore point", p.Shard)
+		if (p.TargetType == targetTypeName || p.TargetType == targetTypeLSN) && p.TargetValue == "" {
+			return errf("shard %s: %s target with empty target value", p.Shard, p.TargetType)
+		}
+		// Recovery-by-name stops at the FIRST matching restore point on the
+		// followed timeline; without a recorded LSN to compare against, a
+		// duplicate name at an earlier LSN silently under-restores.
+		if p.TargetType == targetTypeName && p.VerifyLSN == "" {
+			return errf("shard %s: restore point %q has no recorded LSN to verify against",
+				p.Shard, p.TargetValue)
 		}
 	}
 	for name := range topoStanza {
