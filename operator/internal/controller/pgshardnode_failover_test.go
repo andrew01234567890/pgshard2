@@ -321,10 +321,8 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
 		matchingAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
 		foreignAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
-		// The foreign instance carries another database's data (reused PVC):
-		// different system identifier, and the most advanced LSN — the exact
-		// candidate raw LSN comparison would wrongly elect.
-		foreignAgent.SetSystemID(9999)
+		// The most advanced LSN sits on the instance that will turn foreign —
+		// the exact candidate raw LSN comparison would wrongly elect.
 		foreignAgent.SetReceivedLSN(500)
 		matchingAgent.SetReceivedLSN(300)
 
@@ -375,8 +373,11 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		Expect(got.Status.SystemID).To(Equal("4242"))
 		Expect(got.Status.Timeline).To(Equal(int32(1)))
 
-		// Primary dies: the election must skip the foreign instance despite
-		// its higher LSN and choose the matching replica.
+		// idnode-2's volume is swapped for another database's (a reused PVC):
+		// different system identifier, highest LSN. Then the primary dies: the
+		// election must skip the foreign instance and choose the matching
+		// replica.
+		foreignAgent.SetSystemID(9999)
 		primaryAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
 		primaryAgent.SetReady(false)
 		reconcile() // election pass
@@ -395,6 +396,79 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		foreignAgent.SetTimeline(9)
 		reconcile()
 		Expect(get().Status.TargetPrimary).To(Equal("idnode-1"))
+
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
+	})
+
+	It("neither publishes nor latches a claimant while bootstrap identities conflict", func() {
+		const cfNode = "conflictnode"
+		claimant, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(claimant.Stop)
+		standby, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(standby.Stop)
+
+		// A fresh node whose pod 0 booted from a reused foreign volume and
+		// reports primary unsolicited, while pod 1 reports a different id.
+		// Without the conflict gate the first poll would publish pod 0 as
+		// CurrentPrimary and the second would trust and latch 9999 — silently
+		// resolving the dispute in the intruder's favor.
+		claimant.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		claimant.SetSystemID(9999)
+		standby.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return claimant.Client()
+			}
+			return standby.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: cfNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: cfNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cfNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP(cfNode+"-0", primaryPodIP)
+		stampPodIP(cfNode+"-1", replicaPodIP)
+
+		for range 3 {
+			reconcile()
+			got := get()
+			Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+				"no primary may be published while identities conflict")
+			Expect(got.Status.SystemID).To(BeEmpty(),
+				"no lineage may latch out of an unresolved conflict")
+			Expect(got.Status.TargetPrimary).To(BeEmpty())
+		}
+		cond := apimeta.FindStatusCondition(get().Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("IdentityConflict"))
+
+		// The intruder is rebuilt onto the right lineage: the conflict clears,
+		// the claimant is published, and the identity latches from it.
+		claimant.SetSystemID(4242)
+		reconcile()
+		Expect(get().Status.CurrentPrimary).To(Equal(cfNode + "-0"))
+		reconcile()
+		Expect(get().Status.SystemID).To(Equal("4242"))
 
 		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
 	})

@@ -113,56 +113,85 @@ type identityInputs struct {
 
 // identityAssessment classifies one poll's views against the latched lineage.
 type identityAssessment struct {
-	// kept is what the election may consider. A same-lineage rogue claimant
-	// stays in kept — its primary claim must keep blocking any election,
-	// because it may hold writes — even though it is also listed in rogues.
+	// kept is what the election works over. Same-lineage views whose identity
+	// is in question are not dropped from it — they are kept as ambiguity
+	// BLOCKERS (a claimant keeps its claim; a standby loses only its
+	// candidacy) so the election waits on them instead of electing around
+	// WAL they may hold. Only proven-foreign views are dropped: their WAL is
+	// another database's and can neither be lost nor elected.
 	kept []instanceView
-	// fenced holds "pod (reason)" for every view excluded from the election
-	// or refused recognition; exclusion must never be silent.
+	// fenced holds "pod (reason)" for every view refused recognition,
+	// candidacy, or comparison; a fence must never be silent.
 	fenced []string
-	// rogues are primary claimants whose identity is untrusted: the caller
-	// must strip their reported role so they are never published as
-	// CurrentPrimary — which the -rw service would route writes to.
-	rogues []string
+	// unrecognized are pods whose reported role must not be believed: the
+	// caller strips their role before status derivation and label sync, so
+	// they can never be published as CurrentPrimary (-rw) nor labeled into
+	// -ro read routing.
+	unrecognized []string
+	// suppressPrimary forces CurrentPrimary to stay unpublished this poll: a
+	// same-lineage claimant dispute (a rogue claimant, or a pre-latch
+	// identity conflict) means SOME live instance may be accepting writes we
+	// cannot vouch for, and routing must stay off until it is resolved.
+	suppressPrimary bool
 	// conflict is set before any identity is latched when observed instances
 	// report more than one distinct nonzero system id: there is no way to
 	// tell which lineage is this node's, so no election may run at all.
 	conflict bool
+	// anyStartedUnobserved: a pod with an assigned address could not be
+	// polled, so the identity attestation this poll is incomplete (a known
+	// rogue may merely be unreachable).
+	anyStartedUnobserved bool
 }
 
 func (a *identityAssessment) rogue(pod string) bool {
-	return slices.Contains(a.rogues, pod)
+	return slices.Contains(a.unrecognized, pod)
 }
 
-// assessIdentity fences views whose reported identity cannot belong to this
-// data lineage, so the election never compares WAL positions across unrelated
-// histories and a self-promoted or foreign instance is never served:
+// assessIdentity fences views whose reported identity cannot be vouched for,
+// so the election never compares WAL positions across unrelated histories and
+// a self-promoted or foreign instance is never served:
 //
 //   - a system identifier different from the latched one is FOREIGN data (a
-//     reused PVC, a restored volume) — its LSNs are meaningless here, and
-//     recognizing or electing it would serve another database's contents.
-//     After the latch, an instance that reports NO id is fenced the same way
-//     (identity unknown is not identity confirmed);
-//   - a timeline AHEAD of the recorded one without an operator-driven
-//     promotion means something promoted itself: a split-brain artifact,
-//     never electable and never recognized. A timeline BEHIND the recorded
-//     one is deliberately NOT fenced: a healthy standby legitimately lags the
-//     new timeline for a moment after every promotion, and telling that
-//     apart from an abandoned branch requires the timeline history file —
-//     agent work tracked with process supervision. The election's own
-//     most-advanced-LSN guard still applies to those;
+//     reused PVC, a restored volume). Foreign views are dropped entirely:
+//     never recognized, never electable, and never allowed to block this
+//     lineage's own election — their WAL is not ours;
+//   - a claimant is RECOGNIZED only when the operator can vouch for it: it is
+//     the previously confirmed primary, the committed election target, or it
+//     matches the latched id on exactly the recorded timeline (the
+//     poll-blip recovery case — a self-promotion always lands AHEAD of the
+//     timeline it split from, so an equal timeline is ours; the residual
+//     equal-NUMBER twin branch needs the timeline history file, deferred to
+//     process supervision). Any other claimant is a rogue: role stripped
+//     (never CurrentPrimary/-rw), kept as a claim so the election waits, and
+//     CurrentPrimary publication is suppressed while it lives — a
+//     same-lineage dispute means writes may be landing where we cannot see;
+//   - a same-lineage standby on an AHEAD timeline, or one reporting NO id
+//     after the latch, may hold acknowledged WAL of THIS lineage: it loses
+//     candidacy and recognition (role stripped, so no -ro reads) but stays
+//     in the views as an ambiguity blocker — electing around WAL it may
+//     hold could lose acknowledged writes. A timeline BEHIND the recorded
+//     one is not fenced for standbys: every promotion leaves healthy
+//     standbys momentarily behind;
 //   - the durably committed target is exempt from the timeline/unreported
 //     fences (never the foreign fence): pg_promote bumps the timeline before
 //     the role flips, so mid-promotion it reports standby-or-unspecified on
 //     an ahead timeline, and dropping it would strand the handshake.
 //
-// Before any identity is latched nothing can be compared; the one enforceable
-// invariant is agreement (see identityAssessment.conflict). Bootstrap is
-// trust-on-first-use one poll later — the first confirmed primary becomes
-// CurrentPrimary, then latches — backed by the PVC provenance labels that
-// keep a foreign volume from ever being mounted.
+// Before any identity is latched nothing can be compared; the enforceable
+// invariant is agreement. On a conflict every claimant is stripped and
+// publication suppressed — otherwise the first conflicting poll would
+// publish a claimant as CurrentPrimary and the next poll would trust and
+// latch it, silently resolving the dispute in the claimant's favor.
+// Bootstrap without conflict is trust-on-first-use one poll later — the
+// first confirmed primary becomes CurrentPrimary, then latches — backed by
+// the PVC provenance labels that keep a foreign volume from being mounted.
 func assessIdentity(views []instanceView, in identityInputs) identityAssessment {
 	a := identityAssessment{kept: make([]instanceView, 0, len(views))}
+	for _, v := range views {
+		if !v.observed && v.host != "" {
+			a.anyStartedUnobserved = true
+		}
+	}
 	if in.systemID == 0 {
 		ids := map[uint64]bool{}
 		for _, v := range views {
@@ -171,6 +200,16 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 			}
 		}
 		a.conflict = len(ids) > 1
+		if a.conflict {
+			for _, v := range views {
+				if v.isPrimary {
+					a.unrecognized = append(a.unrecognized, v.pod)
+					a.fenced = append(a.fenced, fmt.Sprintf(
+						"%s (claims primary during an unresolved identity conflict)", v.pod))
+				}
+			}
+			a.suppressPrimary = true
+		}
 		a.kept = append(a.kept, views...)
 		return a
 	}
@@ -178,41 +217,46 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 		foreign := v.systemID != 0 && v.systemID != in.systemID
 		unknown := v.observed && v.systemID == 0
 		ahead := in.timeline != 0 && v.timeline > in.timeline
+		vouched := v.pod == in.current ||
+			(v.systemID == in.systemID && in.timeline != 0 && v.timeline == in.timeline)
 		switch {
 		case v.pod == in.committed && in.committed != "" && !foreign:
 			a.kept = append(a.kept, v)
-		case v.isPrimary && foreign:
-			// A claimant on another lineage entirely. Never recognized, and —
-			// unlike a same-lineage rogue — never allowed to block this
-			// node's own election: its WAL is not ours, so it cannot hold
-			// writes this lineage acknowledged.
-			a.rogues = append(a.rogues, v.pod)
+		case foreign:
+			// Another lineage entirely: never recognized in ANY role (its
+			// reads are wrong data too), and dropped from the views — its WAL
+			// is not ours, so it can neither be lost nor block our election.
+			a.unrecognized = append(a.unrecognized, v.pod)
 			a.fenced = append(a.fenced,
 				fmt.Sprintf("%s (foreign system id %d)", v.pod, v.systemID))
-		case v.isPrimary && (v.pod == in.current || (!unknown && !ahead)):
+		case v.isPrimary && vouched:
 			a.kept = append(a.kept, v)
 		case v.isPrimary:
-			// Same lineage but self-promoted (ahead timeline) or refusing to
-			// report an id: a split-brain artifact that may hold writes.
-			// Blocks the election (kept as a claimant) but is never
-			// recognized, so -rw stays off it.
-			reason := fmt.Sprintf("timeline %d ahead of recorded %d without an operator-driven promotion",
+			reason := fmt.Sprintf(
+				"timeline %d does not match recorded %d and the pod is not the recognized primary",
 				v.timeline, in.timeline)
 			if unknown {
 				reason = "no system id reported after latch"
 			}
-			a.rogues = append(a.rogues, v.pod)
+			a.unrecognized = append(a.unrecognized, v.pod)
 			a.fenced = append(a.fenced,
 				fmt.Sprintf("%s (unrecognized primary claimant: %s)", v.pod, reason))
 			a.kept = append(a.kept, v)
-		case foreign:
-			a.fenced = append(a.fenced,
-				fmt.Sprintf("%s (foreign system id %d)", v.pod, v.systemID))
-		case unknown:
-			a.fenced = append(a.fenced, v.pod+" (no system id reported after latch)")
-		case ahead:
-			a.fenced = append(a.fenced,
-				fmt.Sprintf("%s (timeline %d ahead of recorded %d)", v.pod, v.timeline, in.timeline))
+			a.suppressPrimary = true
+		case unknown || ahead:
+			// Ambiguity blocker: strip candidacy and recognition but keep the
+			// view (with its LSN and receiver activity) so the election waits
+			// on it instead of losing WAL it may hold.
+			reason := fmt.Sprintf("timeline %d ahead of recorded %d", v.timeline, in.timeline)
+			if unknown {
+				reason = "no system id reported after latch"
+			}
+			a.unrecognized = append(a.unrecognized, v.pod)
+			a.fenced = append(a.fenced, fmt.Sprintf("%s (%s)", v.pod, reason))
+			blocked := v
+			blocked.isPrimary = false
+			blocked.isStandby = false
+			a.kept = append(a.kept, blocked)
 		default:
 			a.kept = append(a.kept, v)
 		}
@@ -221,13 +265,50 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 }
 
 // parseLatchedID parses the status-latched system id. Empty means "not
-// latched" (0); a nonempty value that does not parse is an error so a
-// corrupted latch fails closed instead of silently disabling the fence.
+// latched" (0); a nonempty value that does not parse — or parses to zero,
+// which no PostgreSQL instance reports — is an error so a corrupted latch
+// fails closed instead of silently disabling the fence.
 func parseLatchedID(s string) (uint64, error) {
 	if s == "" {
 		return 0, nil
 	}
-	return strconv.ParseUint(s, 10, 64)
+	id, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if id == 0 {
+		return 0, fmt.Errorf("latched system id is zero")
+	}
+	return id, nil
+}
+
+// latchIdentity latches the data-lineage id (never overwritten once set) and
+// maintains the recorded primary timeline — only from a TRUSTED claimant
+// whose reported id matches the latch: the pod the handshake already
+// recognizes as primary (current) or is promoting (committed). An unsolicited
+// claimant must not latch (a reused volume could imprint a foreign lineage
+// forever), and even a trusted pod NAME returning on a foreign volume must
+// not launder its timeline into the recorded one. Returns the possibly
+// just-latched id string, its parsed value, and the updated timeline.
+func latchIdentity(
+	views []instanceView, current, committed, latched string, timeline int32,
+) (systemID string, expectedID uint64, tl int32, parseErr error) {
+	systemID, tl = latched, timeline
+	expectedID, parseErr = parseLatchedID(latched)
+	for _, v := range views {
+		trusted := v.pod != "" && (v.pod == current || v.pod == committed)
+		if !v.isPrimary || !v.observed || !trusted || v.systemID == 0 {
+			continue
+		}
+		if parseErr == nil && expectedID == 0 {
+			systemID = strconv.FormatUint(v.systemID, 10)
+			expectedID = v.systemID
+		}
+		if v.systemID == expectedID && v.timeline != 0 {
+			tl = v.timeline
+		}
+	}
+	return systemID, expectedID, tl, parseErr
 }
 
 // identityConsistentCondition is the shared IdentityConsistent condition for
@@ -245,11 +326,18 @@ func identityConsistentCondition(
 	case a.conflict:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "IdentityConflict"
-		cond.Message = "instances report conflicting system ids before any identity was latched; election disabled until they agree"
+		cond.Message = "instances report conflicting system ids before any identity was latched; election and primary publication disabled until they agree"
 	case latched && len(a.fenced) > 0:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "ForeignInstance"
 		cond.Message = "instances fenced from election or recognition: " + strings.Join(a.fenced, ", ")
+	case latched && a.anyStartedUnobserved:
+		// A started instance could not be polled: a known rogue may merely be
+		// unreachable, so this poll cannot attest consistency — and must not
+		// erase a standing report by flapping to True.
+		cond.Status = metav1.ConditionUnknown
+		cond.Reason = "IncompleteObservation"
+		cond.Message = "a started instance could not be polled; identity attestation is incomplete this cycle"
 	case latched:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "Latched"

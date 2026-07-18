@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -103,11 +102,11 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	readyReplicas, err := r.aggregateStatus(ctx, &node)
+	readyReplicas, fenced, err := r.aggregateStatus(ctx, &node)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.syncRoleLabels(ctx, &node); err != nil {
+	if err := r.syncRoleLabels(ctx, &node, fenced); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Prune only the pods this reconcile confirmed are ready replicas — never a
@@ -413,12 +412,12 @@ func (r *PgShardNodeReconciler) instancePod(
 // bound to their polled UID.
 func (r *PgShardNodeReconciler) aggregateStatus(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
-) ([]corev1.Pod, error) {
+) ([]corev1.Pod, map[string]bool, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(node.Namespace),
 		client.MatchingLabels(nodeSelector(node))); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	before := node.Status.DeepCopy()
@@ -468,35 +467,21 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 		views = append(views, view)
 	}
 
-	// Latch the data-lineage identity (never overwritten once set) and keep
-	// the recorded primary timeline current — but only from a TRUSTED
-	// claimant: the pod this controller's own handshake already recognizes as
-	// primary or is promoting. An unsolicited claimant must not latch (a
-	// reused volume could imprint a foreign lineage forever) and must not
-	// launder its own timeline into the recorded one.
-	trusted := func(pod string) bool {
-		return pod != "" && (pod == before.CurrentPrimary || pod == before.TargetPrimary)
-	}
-	for _, v := range views {
-		if v.isPrimary && v.observed && trusted(v.pod) {
-			if v.systemID != 0 && node.Status.SystemID == "" {
-				node.Status.SystemID = strconv.FormatUint(v.systemID, 10)
-			}
-			if v.timeline != 0 {
-				node.Status.Timeline = v.timeline
-			}
-		}
-	}
-	expectedID, parseErr := parseLatchedID(node.Status.SystemID)
+	var expectedID uint64
+	var parseErr error
+	node.Status.SystemID, expectedID, node.Status.Timeline, parseErr = latchIdentity(
+		views, before.CurrentPrimary, before.TargetPrimary,
+		node.Status.SystemID, node.Status.Timeline)
 	assessment := assessIdentity(views, identityInputs{
 		systemID:  expectedID,
 		timeline:  node.Status.Timeline,
 		current:   before.CurrentPrimary,
 		committed: before.TargetPrimary,
 	})
-	// A rogue claimant's role is never recognized: publishing it would put
-	// CurrentPrimary — and with it the -rw write service — on data this
-	// lineage does not own.
+	// An unrecognized instance's role is never believed: publishing a rogue
+	// claimant would put CurrentPrimary — and the -rw write service — on data
+	// this lineage does not own, and a fenced standby's replica role would
+	// serve wrong reads via -ro.
 	for i := range views {
 		if assessment.rogue(views[i].pod) {
 			instances[i].Role = ""
@@ -513,6 +498,13 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	// writes to a stale primary).
 	node.Status.CurrentPrimary, node.Status.Phase =
 		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
+	// A same-lineage claimant dispute (or a pre-latch identity conflict)
+	// means writes may be landing somewhere we cannot vouch for: publish no
+	// primary at all until it is resolved.
+	if assessment.suppressPrimary {
+		node.Status.CurrentPrimary = ""
+		node.Status.Phase = pgshardv1alpha1.NodeDegraded
+	}
 
 	if cond := identityConsistentCondition(
 		&assessment, node.Status.SystemID != "", parseErr, node.Generation); cond != nil {
@@ -523,9 +515,13 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	// or elect and promote a replacement when it is gone. A pre-latch identity
 	// conflict or an unparseable latch disables the election entirely (fail
 	// closed) until a human resolves it; the condition above says why.
+	fencedPods := make(map[string]bool, len(assessment.unrecognized))
+	for _, pod := range assessment.unrecognized {
+		fencedPods[pod] = true
+	}
 	if parseErr == nil && !assessment.conflict {
 		if err := r.reconcileFailover(ctx, node, assessment.kept); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -543,9 +539,9 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	// with every commit) would re-enqueue immediately and spin a hot loop under
 	// write traffic.
 	if apiequality.Semantic.DeepEqual(before, &node.Status) {
-		return readyReplicas, nil
+		return readyReplicas, fencedPods, nil
 	}
-	return readyReplicas, client.IgnoreNotFound(r.Status().Update(ctx, node))
+	return readyReplicas, fencedPods, client.IgnoreNotFound(r.Status().Update(ctx, node))
 }
 
 // deriveNodeStatus computes the current primary and phase from polled instance
@@ -618,7 +614,7 @@ func (r *PgShardNodeReconciler) pollAgent(
 // -ro. A possible writer (an unreachable or not-yet-classified ex-primary) must
 // not receive read traffic on -ro.
 func (r *PgShardNodeReconciler) syncRoleLabels(
-	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, fenced map[string]bool,
 ) error {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
@@ -643,12 +639,13 @@ func (r *PgShardNodeReconciler) syncRoleLabels(
 			want = roleLabelPrimary
 		case confirmedStandby[pod.Name]:
 			want = roleLabelReplica
-		case pod.Labels[labelRole] == roleLabelReplica:
+		case pod.Labels[labelRole] == roleLabelReplica && !fenced[pod.Name]:
 			// Role unconfirmed this cycle (a transient poll blip), but the pod was
 			// a confirmed standby: keep it in -ro rather than flap a healthy replica
 			// out of read routing on a single hiccup. A possible writer is never
 			// kept sticky — a demoted or unreachable ex-primary still carries the
-			// primary label here (not replica), so it falls through to unlabeled.
+			// primary label here (not replica), so it falls through to unlabeled —
+			// and neither is an identity-fenced pod, whose reads are wrong data.
 			want = roleLabelReplica
 		}
 		if pod.Labels[labelRole] == want {
