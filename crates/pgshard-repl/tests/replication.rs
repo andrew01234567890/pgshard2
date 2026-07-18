@@ -117,3 +117,45 @@ async fn bytea_streams_as_hex_despite_source_escape_default() -> anyhow::Result<
     assert_eq!(values, vec![br"\xdeadbeef".to_vec()]);
     Ok(())
 }
+
+/// Persistent slots must be failover-enabled so the operator's slot
+/// synchronization carries them to standbys; a source-primary failover must not
+/// strand the consumer into a full reseed.
+#[tokio::test]
+async fn persistent_slots_are_failover_enabled() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let setup = pg.connect().await?;
+
+    let config = Config {
+        host: pg.host().to_owned(),
+        port: pg.port(),
+        user: "postgres".to_owned(),
+        password: "postgres".to_owned(),
+        database: "postgres".to_owned(),
+    };
+    let mut client = ReplicationClient::connect(&config).await?;
+    client
+        .create_logical_slot("pgshard_failover_slot", false)
+        .await?;
+
+    let failover: bool = setup
+        .query_one(
+            "SELECT failover FROM pg_replication_slots WHERE slot_name = 'pgshard_failover_slot'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        failover,
+        "persistent slot was not created with FAILOVER true"
+    );
+
+    drop(client);
+    setup
+        .execute(
+            "SELECT pg_drop_replication_slot('pgshard_failover_slot')",
+            &[],
+        )
+        .await?;
+    Ok(())
+}

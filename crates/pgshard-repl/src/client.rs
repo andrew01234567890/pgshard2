@@ -132,6 +132,15 @@ impl ReplicationClient {
                 // and under `bytea_output = escape` a bytea shard key would fail to
                 // coerce and the row could not be routed during a reshard seed.
                 ("bytea_output", "hex"),
+                // Pin every remaining GUC that shapes type-output text, so the
+                // stream is stable regardless of the source's session defaults:
+                // a `SQL, DMY` DateStyle would render 01/02/2026 that an MDY
+                // target parses as the wrong date, and shortened float output
+                // would lose precision. ISO date text parses unambiguously under
+                // any target setting.
+                ("DateStyle", "ISO"),
+                ("IntervalStyle", "postgres"),
+                ("extra_float_digits", "3"),
             ],
             &mut buf,
         )
@@ -238,15 +247,27 @@ impl ReplicationClient {
     /// slots are dropped when the connection ends (used by tests and one-shot
     /// consumers). Runs to `ReadyForQuery`; the slot's contents are consumed by a
     /// later [`Self::start_replication`].
+    ///
+    /// Persistent slots are created with `FAILOVER true` so the operator's slot
+    /// synchronization carries them to standbys and a source-primary failover
+    /// does not strand the consumer into a full reseed. PostgreSQL only
+    /// synchronizes slots explicitly marked for failover, and rejects the flag
+    /// on temporary slots.
     pub async fn create_logical_slot(&mut self, name: &str, temporary: bool) -> Result<()> {
         if !is_safe_ident(name) {
             return Err(ClientError::Malformed(format!(
                 "unsafe replication slot name {name:?}"
             )));
         }
-        let temp = if temporary { "TEMPORARY " } else { "" };
-        let sql =
-            format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput NOEXPORT_SNAPSHOT");
+        let sql = if temporary {
+            format!(
+                "CREATE_REPLICATION_SLOT {name} TEMPORARY LOGICAL pgoutput (SNAPSHOT 'nothing')"
+            )
+        } else {
+            format!(
+                "CREATE_REPLICATION_SLOT {name} LOGICAL pgoutput (SNAPSHOT 'nothing', FAILOVER true)"
+            )
+        };
         self.send_query(&sql).await?;
         // RowDescription / DataRow / CommandComplete, ending at ReadyForQuery.
         loop {
@@ -277,8 +298,13 @@ impl ReplicationClient {
                 "unsafe replication slot name {name:?}"
             )));
         }
-        let temp = if temporary { "TEMPORARY " } else { "" };
-        let sql = format!("CREATE_REPLICATION_SLOT {name} {temp}LOGICAL pgoutput EXPORT_SNAPSHOT");
+        let sql = if temporary {
+            format!("CREATE_REPLICATION_SLOT {name} TEMPORARY LOGICAL pgoutput (SNAPSHOT 'export')")
+        } else {
+            format!(
+                "CREATE_REPLICATION_SLOT {name} LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)"
+            )
+        };
         self.send_query(&sql).await?;
         let mut snapshot = None;
         loop {

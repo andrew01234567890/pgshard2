@@ -92,6 +92,12 @@ pub struct Applier {
     relations: HashMap<Oid, RelationInfo>,
     consumer: String,
     checkpoint: Lsn,
+    /// The durable end of the last applied (or replay-skipped) transaction —
+    /// the position to acknowledge to the server. Distinct from `checkpoint`
+    /// (the commit LSN used for de-duplication): acknowledging only the commit
+    /// LSN leaves the final transaction eternally re-sendable and pins the
+    /// slot's WAL horizon behind what is actually durable here.
+    ack: Lsn,
     pending: Vec<PendingChange>,
 }
 
@@ -105,42 +111,70 @@ impl Applier {
                 // Pin the settings the literal quoting depends on: with
                 // standard_conforming_strings on, only the single quote is special
                 // in a literal, so quote_literal is a complete escape. UTF-8 keeps
-                // the applied text bytes matching the source's.
-                "SET standard_conforming_strings = on;
+                // the applied text bytes matching the source's, and DateStyle=ISO
+                // parses the source's pinned ISO output unambiguously.
+                // session_replication_role=replica keeps the target's ordinary
+                // triggers and rules from re-firing on replicated rows — the
+                // source already materialized their effects, so re-running them
+                // would double-apply side effects. Requires a role permitted to
+                // set it (superuser / the agent's role), matching PostgreSQL's
+                // own logical-replication apply workers.
+                "SET session_replication_role = replica;
+                 SET standard_conforming_strings = on;
                  SET client_encoding = 'UTF8';
+                 SET DateStyle = 'ISO';
+                 SET IntervalStyle = 'postgres';
                  CREATE SCHEMA IF NOT EXISTS pgshard;
                  CREATE TABLE IF NOT EXISTS pgshard.repl_progress (
                      consumer text PRIMARY KEY,
-                     lsn bigint NOT NULL
-                 )",
+                     lsn bigint NOT NULL,
+                     end_lsn bigint NOT NULL DEFAULT 0
+                 );
+                 ALTER TABLE pgshard.repl_progress
+                     ADD COLUMN IF NOT EXISTS end_lsn bigint NOT NULL DEFAULT 0",
             )
             .await?;
-        let checkpoint = match target
+        let (checkpoint, ack) = match target
             .query_opt(
-                "SELECT lsn FROM pgshard.repl_progress WHERE consumer = $1",
+                "SELECT lsn, end_lsn FROM pgshard.repl_progress WHERE consumer = $1",
                 &[&consumer],
             )
             .await?
         {
             // try_get, not get: a pre-existing progress table with the wrong
             // column type errors rather than panicking.
-            Some(row) => Lsn(row.try_get::<_, i64>(0)? as u64),
-            None => Lsn(0),
+            Some(row) => {
+                let lsn = Lsn(row.try_get::<_, i64>(0)? as u64);
+                let end = Lsn(row.try_get::<_, i64>(1)? as u64);
+                // A pre-migration row has end_lsn 0; never acknowledge below the
+                // commit LSN we know is durable.
+                (lsn, end.max(lsn))
+            }
+            None => (Lsn(0), Lsn(0)),
         };
         Ok(Applier {
             target,
             relations: HashMap::new(),
             consumer,
             checkpoint,
+            ack,
             pending: Vec::new(),
         })
     }
 
-    /// The last durably-applied commit LSN. Feed this to
-    /// [`crate::client::ReplicationClient::confirm`] so the slot only advances to
-    /// what has been committed here.
+    /// The last durably-applied commit LSN — the de-duplication watermark. For
+    /// what to report to the server, use [`Self::ack_lsn`].
     pub fn checkpoint(&self) -> Lsn {
         self.checkpoint
+    }
+
+    /// The position to feed [`crate::client::ReplicationClient::confirm`]: the
+    /// durable end of the last applied (or already-applied and skipped)
+    /// transaction. Acknowledging the end rather than the commit LSN lets the
+    /// slot release the transaction's WAL and stops it re-sending an
+    /// already-applied final transaction on every reconnect.
+    pub fn ack_lsn(&self) -> Lsn {
+        self.ack
     }
 
     /// Handle one decoded message: track relations, buffer changes, and apply at
@@ -209,7 +243,7 @@ impl Applier {
                 });
                 Ok(())
             }
-            LogicalRepMsg::Commit(commit) => self.commit(commit.commit_lsn).await,
+            LogicalRepMsg::Commit(commit) => self.commit(commit.commit_lsn, commit.end_lsn).await,
             // Metadata the apply path does not act on directly.
             LogicalRepMsg::Origin(_) | LogicalRepMsg::Type(_) | LogicalRepMsg::Message(_) => Ok(()),
             // Fail closed rather than silently diverge — follow-ups.
@@ -220,13 +254,16 @@ impl Applier {
         }
     }
 
-    async fn commit(&mut self, commit_lsn: Lsn) -> Result<()> {
+    async fn commit(&mut self, commit_lsn: Lsn, end_lsn: Lsn) -> Result<()> {
         // Exactly-once: skip a commit at or before the durable checkpoint — it was
         // already applied and the slot replayed it after a restart. The comparison
         // must be `<=`, not `<`: PostgreSQL only skips a transaction whose commit
         // LSN is strictly below the slot's confirmed-flush, so the last-applied
         // transaction (LSN == checkpoint) is re-sent and must be de-duplicated here.
         if commit_lsn <= self.checkpoint {
+            // Already durably applied — still safe (and necessary) to acknowledge
+            // its end so the replay stops recurring.
+            self.ack = self.ack.max(end_lsn);
             self.pending.clear();
             return Ok(());
         }
@@ -272,14 +309,15 @@ impl Applier {
         // Advance the checkpoint in the SAME transaction as the changes: either
         // both land or neither does, which is what makes the apply exactly-once.
         txn.execute(
-            "INSERT INTO pgshard.repl_progress (consumer, lsn) VALUES ($1, $2) \
-             ON CONFLICT (consumer) DO UPDATE SET lsn = EXCLUDED.lsn",
-            &[&self.consumer, &(commit_lsn.0 as i64)],
+            "INSERT INTO pgshard.repl_progress (consumer, lsn, end_lsn) VALUES ($1, $2, $3) \
+             ON CONFLICT (consumer) DO UPDATE SET lsn = EXCLUDED.lsn, end_lsn = EXCLUDED.end_lsn",
+            &[&self.consumer, &(commit_lsn.0 as i64), &(end_lsn.0 as i64)],
         )
         .await?;
         txn.commit().await?;
 
         self.checkpoint = commit_lsn;
+        self.ack = self.ack.max(end_lsn);
         self.pending.clear();
         Ok(())
     }

@@ -103,17 +103,36 @@ pub async fn copy_filtered(
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(CopyError::Source)?;
+    // row_security=off makes RLS fail closed for the seed: if a policy would
+    // filter the table for this role, COPY errors instead of silently omitting
+    // rows that the stream (which reads WAL, not queries) would then never
+    // deliver either. The output-shaping GUCs mirror the replication client's
+    // startup pins so the copied text is byte-identical to the streamed text.
     let setup = source
         .batch_execute(&format!(
-            "SET TRANSACTION SNAPSHOT '{snapshot}'; SET bytea_output = 'hex'"
+            "SET TRANSACTION SNAPSHOT '{snapshot}'; \
+             SET LOCAL row_security = off; \
+             SET LOCAL bytea_output = 'hex'; \
+             SET LOCAL DateStyle = 'ISO'; \
+             SET LOCAL IntervalStyle = 'postgres'; \
+             SET LOCAL extra_float_digits = 3"
         ))
         .await
         .map_err(CopyError::Source);
 
     let result = match setup {
         Ok(()) => {
+            // replica role keeps the target's ordinary triggers from firing on
+            // seeded rows (COPY FROM invokes triggers); the source already
+            // materialized their effects. DateStyle=ISO parses the source's
+            // pinned ISO output unambiguously whatever the target's default.
             target
-                .batch_execute("BEGIN")
+                .batch_execute(
+                    "BEGIN; \
+                     SET LOCAL session_replication_role = replica; \
+                     SET LOCAL DateStyle = 'ISO'; \
+                     SET LOCAL IntervalStyle = 'postgres'",
+                )
                 .await
                 .map_err(CopyError::Target)?;
             let copied =
