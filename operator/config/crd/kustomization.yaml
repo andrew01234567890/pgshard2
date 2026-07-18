@@ -7,6 +7,7 @@ resources:
 - bases/pgshard.dev_pgshardnodes.yaml
 - bases/pgshard.dev_pgshardroutings.yaml
 - bases/pgshard.dev_pgshardtableconfigs.yaml
+- bases/pgshard.dev_pgshardreshards.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
