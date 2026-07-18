@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
@@ -184,6 +185,46 @@ var _ = Describe("PgShardNode storage provenance", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &pod)).To(Succeed())
 		Expect(pod.Labels[labelNodeUID]).To(Equal(string(node.UID)),
 			"a pre-upgrade pod must be backfilled, not silently unrouted")
+
+		// An EXCESS scale-down pod (beyond spec.replicas) is covered too: the
+		// pruning logic deliberately retains such pods, and only the storage
+		// preflight sees them.
+		excessPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName + "-1-data", Namespace: ns,
+				Labels: map[string]string{labelNode: nodeName, labelNodeUID: string(node.UID)},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, excessPVC)).To(Succeed())
+		excess := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName + "-1", Namespace: ns,
+				Labels: map[string]string{labelNode: nodeName},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: portNamePostgres, Image: "pg"}},
+				Volumes: []corev1.Volume{{
+					Name: volNameData,
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: nodeName + "-1-data",
+						},
+					},
+				}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(node, excess, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, excess)).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-1", Namespace: ns}, excess)).To(Succeed())
+		Expect(excess.Labels[labelNodeUID]).To(Equal(string(node.UID)),
+			"a verified excess pod must be backfilled too")
 
 		var got pgshardv1alpha1.PgShardNode
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
@@ -344,9 +385,21 @@ var _ = Describe("PgShardNode storage provenance", func() {
 		var refetched corev1.Pod
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &refetched)).To(Succeed())
 		Expect(refetched.Labels).NotTo(HaveKey(labelRole),
-			"a running pod on a foreign volume must be pulled out of routing")
+			"a running pod on a foreign volume must be pulled out of -rw/-ro")
+		Expect(refetched.Labels).NotTo(HaveKey(labelNodeUID),
+			"-r and the headless service select by incarnation alone, so the pod must be quarantined from those too")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
+
+		// Re-adopting the volume restores service membership: the preflight
+		// backfills the incarnation label once the claims verify again.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0-data", Namespace: ns}, pvc)).To(Succeed())
+		pvc.Labels[labelNodeUID] = string(got.UID)
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &refetched)).To(Succeed())
+		Expect(refetched.Labels[labelNodeUID]).To(Equal(string(got.UID)),
+			"a re-verified pod returns to its incarnation's services")
 
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})

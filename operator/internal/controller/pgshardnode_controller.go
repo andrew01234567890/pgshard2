@@ -262,23 +262,11 @@ func (r *PgShardNodeReconciler) ensureInstance(
 		if !metav1.IsControlledBy(&pod, node) {
 			return fmt.Errorf("pod %s exists but is not controlled by node %s", name, node.Name)
 		}
-		// Service selectors pin the node UID; a controlled pod created before
-		// that label existed (operator upgrade) is provably this incarnation's
-		// — its owner UID says so — and is backfilled rather than silently
-		// dropped from every service.
-		if pod.Labels[labelNodeUID] != string(node.UID) {
-			patched := pod.DeepCopy()
-			if patched.Labels == nil {
-				patched.Labels = map[string]string{}
-			}
-			patched.Labels[labelNodeUID] = string(node.UID)
-			if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
-				return fmt.Errorf("backfilling node-uid label on pod %s: %w", name, err)
-			}
-		}
 		// A config/image/storage change (including toggling walSeparate on an
 		// existing instance) is rolled out separately — replicas first, primary
-		// last via switchover — never by blind recreation here.
+		// last via switchover — never by blind recreation here. (Incarnation-
+		// label backfill for verified pods lives in the storage preflight,
+		// which also covers excess scale-down pods.)
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -387,6 +375,7 @@ func (r *PgShardNodeReconciler) preflightStorage(
 	}
 	slices.Sort(names)
 	var foreigns []*foreignPVCError
+	foreignPods := map[string]bool{}
 	for _, name := range names {
 		claims := claimsByPod[name]
 		if len(claims) == 0 {
@@ -403,10 +392,33 @@ func (r *PgShardNodeReconciler) preflightStorage(
 				if errors.As(err, &foreign) {
 					foreign.pod = name
 					foreigns = append(foreigns, foreign)
+					foreignPods[name] = true
 					continue
 				}
 				return nil, err
 			}
+		}
+	}
+	// Backfill the incarnation label on every VERIFIED controlled pod (a
+	// pre-upgrade pod, or one restored after a quarantine): excess scale-down
+	// pods are covered here too — the uid-scoped services would otherwise
+	// silently drop them while the node reads Ready. A pod whose claims are
+	// foreign stays quarantined.
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, node) || foreignPods[pod.Name] {
+			continue
+		}
+		if pod.Labels[labelNodeUID] == string(node.UID) {
+			continue
+		}
+		patched := pod.DeepCopy()
+		if patched.Labels == nil {
+			patched.Labels = map[string]string{}
+		}
+		patched.Labels[labelNodeUID] = string(node.UID)
+		if err := r.Patch(ctx, patched, client.MergeFrom(pod)); err != nil {
+			return nil, fmt.Errorf("backfilling node-uid label on pod %s: %w", pod.Name, err)
 		}
 	}
 	return foreigns, nil
@@ -442,9 +454,15 @@ func (r *PgShardNodeReconciler) degradeForeignStorage(
 		var pod corev1.Pod
 		err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: foreign.pod}, &pod)
 		switch {
-		case err == nil && metav1.IsControlledBy(&pod, node) && pod.Labels[labelRole] != "":
+		case err == nil && metav1.IsControlledBy(&pod, node) &&
+			(pod.Labels[labelRole] != "" || pod.Labels[labelNodeUID] != ""):
+			// Quarantine from EVERY service: -rw/-ro select by role, but -r
+			// and the headless service select by incarnation alone, so the
+			// incarnation label comes off too. Verification restores it (the
+			// preflight backfills the label once the claims are clean again).
 			patched := pod.DeepCopy()
 			delete(patched.Labels, labelRole)
+			delete(patched.Labels, labelNodeUID)
 			if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
 				return ctrl.Result{}, err
 			}
