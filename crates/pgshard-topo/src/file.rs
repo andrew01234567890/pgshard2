@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::model::Topology;
-use crate::{SourceValidation, TopologyError, TopologyWatcher, validate};
+use crate::{SourceValidation, TopologyError, TopologyWatcher, ValidationClocks, validate};
 
 pub struct FileWatcher {
     sender: Arc<watch::Sender<Arc<Topology>>>,
@@ -46,11 +46,12 @@ impl FileWatcher {
             ));
         }
         let path = path.into();
+        let initial_clocks = ValidationClocks::before_read();
         let initial = load(&path).await?;
-        let initial_epoch = initial.epoch;
         let (sender, _) = watch::channel(Arc::new(initial));
         let sender = Arc::new(sender);
-        let (validated, _) = watch::channel(SourceValidation::now(initial_epoch));
+        let initial_epoch = sender.borrow().epoch;
+        let (validated, _) = watch::channel(initial_clocks.stamp(initial_epoch));
         let validated = Arc::new(validated);
 
         let poller = Arc::clone(&sender);
@@ -68,14 +69,15 @@ impl FileWatcher {
                 if poller.receiver_count() == 0 && Arc::strong_count(&poller) == 1 {
                     return; // watcher dropped, no consumers
                 }
+                let clocks = ValidationClocks::before_read();
                 match load(&poll_path).await {
                     Ok(candidate) => {
-                        // Stamp at validation time, announce AFTER applying so
-                        // a consumer never observes the announcement before the
-                        // snapshot it refers to is available. An error
-                        // deliberately announces nothing, so lease-style
-                        // consumers see their view age.
-                        let stamp = SourceValidation::now(candidate.epoch);
+                        // Clocks were captured BEFORE the read began; announce
+                        // AFTER applying so a consumer never observes the
+                        // announcement before the snapshot it refers to is
+                        // available. An error deliberately announces nothing,
+                        // so lease-style consumers see their view age.
+                        let stamp = clocks.stamp(candidate.epoch);
                         apply(&poller, candidate);
                         poll_validated.send_replace(stamp);
                     }
@@ -97,8 +99,9 @@ impl FileWatcher {
     /// Re-reads the file immediately (tests use this instead of waiting for
     /// the poll tick). Returns whether the snapshot was applied.
     pub async fn reload(&self) -> Result<bool, TopologyError> {
+        let clocks = ValidationClocks::before_read();
         let candidate = load(&self.path).await?;
-        let stamp = SourceValidation::now(candidate.epoch);
+        let stamp = clocks.stamp(candidate.epoch);
         let applied = apply(&self.sender, candidate);
         self.validated.send_replace(stamp);
         Ok(applied)
