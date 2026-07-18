@@ -950,6 +950,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_caller_does_not_lose_or_duplicate_the_restore_point() {
         let s = Arc::new(svc(FakeInstance::primary()));
+        s.instance.set(|st| st.write_lsn = 0xAA);
         let entered = Arc::new(tokio::sync::Notify::new());
         let gate = Arc::new(tokio::sync::Notify::new());
         s.instance
@@ -982,6 +983,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        // A re-create would now land at a DIFFERENT LSN; the retry must
+        // replay the stored 0xAA, proving the point was never re-created.
+        s.instance.set(|st| st.write_lsn = 0xBB);
         let retry = s
             .create_restore_point(Request::new(v1::CreateRestorePointRequest {
                 name: "pgshard_cancel".into(),
@@ -994,7 +998,7 @@ mod tests {
             vec!["pgshard_cancel".to_string()],
             "exactly one point: the retry replays, never re-creates"
         );
-        assert!(retry.lsn.is_some());
+        assert_eq!(retry.lsn.unwrap().value, 0xAA);
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ var (
 func driftTables() []TableTopology {
 	return []TableTopology{
 		{Schema: "public", Name: "orders", Type: TableSharded,
-			ShardKeyColumn: "customer_id", ShardKeyType: "int8",
+			ShardKeyColumn: "customer_id", ShardKeyType: "int",
 			Sequences: []SequenceTopology{{Column: "id", Sequence: "orders_id"}}},
 		{Schema: "public", Name: "currencies", Type: TableGlobal},
 	}
@@ -222,6 +222,18 @@ func TestIncompleteTopologySnapshotIsRejected(t *testing.T) {
 		t.Fatal("a snapshot without the hash function cannot reconstruct routing")
 	}
 
+	badHash := driftCatalog()
+	badHash.Topologies[0].HashFunction = "murmur3"
+	if _, err := Resolve(badHash, Target{BackupID: backup1}); err == nil {
+		t.Fatal("snapshot with an unimplemented hash function must be rejected")
+	}
+
+	badKeyType := driftCatalog()
+	badKeyType.Topologies[0].Tables[0].ShardKeyType = "int8"
+	if _, err := Resolve(badKeyType, Target{BackupID: backup1}); err == nil {
+		t.Fatal("snapshot with an unknown shard-key type must be rejected")
+	}
+
 	noKeyType := driftCatalog()
 	noKeyType.Topologies[0].Tables[0].ShardKeyType = ""
 	if _, err := Resolve(noKeyType, Target{BackupID: backup1}); err == nil {
@@ -270,7 +282,7 @@ func TestIncompleteTopologySnapshotIsRejected(t *testing.T) {
 	caseDup := driftCatalog()
 	caseDup.Topologies[0].Tables = append(caseDup.Topologies[0].Tables, TableTopology{
 		Schema: "PUBLIC", Name: "Orders", Type: TableSharded,
-		ShardKeyColumn: "customer_id", ShardKeyType: "int8",
+		ShardKeyColumn: "customer_id", ShardKeyType: "int",
 	})
 	if _, err := Resolve(caseDup, Target{BackupID: backup1}); err == nil {
 		t.Fatal("PostgreSQL folds unquoted identifiers: a case-variant duplicate table is the same table")

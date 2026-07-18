@@ -124,6 +124,11 @@ const (
 	StateHidden   = "hidden"
 	TableSharded  = "sharded"
 	TableGlobal   = "global"
+	HashXxhash64  = "xxhash64_v1"
+	KeyTypeInt    = "int"
+	KeyTypeText   = "text"
+	KeyTypeUUID   = "uuid"
+	KeyTypeBytea  = "bytea"
 )
 
 // Catalog is the full manifest set a resolver works over. Callers load it

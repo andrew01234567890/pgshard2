@@ -336,9 +336,9 @@ func timelineArg(tl int32) string {
 // Only the generation being restored is checked — an unrelated malformed
 // snapshot elsewhere in the catalog must not block a good restore.
 func snapshotComplete(topology TopologySnapshot) error {
-	if topology.HashFunction == "" {
-		return errf("topology generation %d records no hash function; a restored cluster could not route its data",
-			topology.Generation)
+	if topology.HashFunction != HashXxhash64 {
+		return errf("topology generation %d records hash function %q; only %q is implemented, so this snapshot cannot rebuild usable routing",
+			topology.Generation, topology.HashFunction, HashXxhash64)
 	}
 	systemShards := 0
 	for _, sh := range topology.Shards {
@@ -382,6 +382,12 @@ func snapshotComplete(topology TopologySnapshot) error {
 			if t.ShardKeyColumn == "" || t.ShardKeyType == "" {
 				return errf("topology generation %d: sharded table %s records no shard key column/type",
 					topology.Generation, key)
+			}
+			switch t.ShardKeyType {
+			case KeyTypeInt, KeyTypeText, KeyTypeUUID, KeyTypeBytea:
+			default:
+				return errf("topology generation %d: sharded table %s has unknown shard-key type %q (need int|text|uuid|bytea)",
+					topology.Generation, key, t.ShardKeyType)
 			}
 		case TableGlobal:
 		default:
