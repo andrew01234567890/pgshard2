@@ -16,11 +16,18 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::model::Topology;
-use crate::{TopologyError, TopologyWatcher, validate};
+use crate::{SourceValidation, TopologyError, TopologyWatcher, ValidationClocks, validate};
 
 pub struct FileWatcher {
     sender: Arc<watch::Sender<Arc<Topology>>>,
     path: PathBuf,
+    /// The epoch of the last successful read+validate of the source, sent on
+    /// EVERY successful poll (same-epoch included). Consumers decide what a
+    /// validation means for them: the router renews its write lease only when
+    /// this epoch matches its ACTIVE snapshot (or when a newer epoch actually
+    /// builds and swaps) — a source the router cannot accept must not keep its
+    /// lease alive.
+    validated: Arc<watch::Sender<SourceValidation>>,
 }
 
 impl FileWatcher {
@@ -39,11 +46,18 @@ impl FileWatcher {
             ));
         }
         let path = path.into();
+        let initial_clocks = ValidationClocks::before_read().ok_or_else(|| {
+            TopologyError::Invalid("boot clock unavailable; cannot stamp validations".into())
+        })?;
         let initial = load(&path).await?;
         let (sender, _) = watch::channel(Arc::new(initial));
         let sender = Arc::new(sender);
+        let initial_epoch = sender.borrow().epoch;
+        let (validated, _) = watch::channel(initial_clocks.stamp(initial_epoch));
+        let validated = Arc::new(validated);
 
         let poller = Arc::clone(&sender);
+        let poll_validated = Arc::clone(&validated);
         let poll_path = path.clone();
         tokio::spawn(async move {
             // First tick after a full interval, not immediately: the initial
@@ -57,9 +71,20 @@ impl FileWatcher {
                 if poller.receiver_count() == 0 && Arc::strong_count(&poller) == 1 {
                     return; // watcher dropped, no consumers
                 }
+                let Some(clocks) = ValidationClocks::before_read() else {
+                    warn!("boot clock unavailable; skipping validation announcement");
+                    continue;
+                };
                 match load(&poll_path).await {
                     Ok(candidate) => {
+                        // Clocks were captured BEFORE the read began; announce
+                        // AFTER applying so a consumer never observes the
+                        // announcement before the snapshot it refers to is
+                        // available. An error deliberately announces nothing,
+                        // so lease-style consumers see their view age.
+                        let stamp = clocks.stamp(candidate.epoch);
                         apply(&poller, candidate);
+                        poll_validated.send_replace(stamp);
                     }
                     Err(err) => {
                         warn!(path = %poll_path.display(), error = %err,
@@ -69,14 +94,31 @@ impl FileWatcher {
             }
         });
 
-        Ok(FileWatcher { sender, path })
+        Ok(FileWatcher {
+            sender,
+            path,
+            validated,
+        })
     }
 
     /// Re-reads the file immediately (tests use this instead of waiting for
     /// the poll tick). Returns whether the snapshot was applied.
     pub async fn reload(&self) -> Result<bool, TopologyError> {
+        let clocks = ValidationClocks::before_read().ok_or_else(|| {
+            TopologyError::Invalid("boot clock unavailable; cannot stamp validations".into())
+        })?;
         let candidate = load(&self.path).await?;
-        Ok(apply(&self.sender, candidate))
+        let stamp = clocks.stamp(candidate.epoch);
+        let applied = apply(&self.sender, candidate);
+        self.validated.send_replace(stamp);
+        Ok(applied)
+    }
+
+    /// The last successful source read+validate (epoch + validation-time
+    /// clocks), updated on every successful poll. The router's write-lease
+    /// renewal subscribes here.
+    pub fn subscribe_validated(&self) -> watch::Receiver<SourceValidation> {
+        self.validated.subscribe()
     }
 }
 

@@ -97,6 +97,9 @@ pub struct Router {
     primaries: BTreeMap<ShardId, Option<Endpoint>>,
     /// The system (unsharded) database endpoint, if known.
     system: Option<Endpoint>,
+    /// How stale the topology view may be before writes must stop (the
+    /// cluster's writeLeaseSeconds).
+    write_lease: std::time::Duration,
 }
 
 impl Router {
@@ -143,11 +146,19 @@ impl Router {
             catalog,
             primaries,
             system: topo.sequence_endpoint.clone(),
+            write_lease: std::time::Duration::from_secs(u64::from(topo.write_lease_seconds)),
         })
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The bound on topology staleness beyond which writes must stop: a router
+    /// that cannot confirm its view is current within this window may be
+    /// routing against a world that has moved on (a cutover it never saw).
+    pub fn write_lease(&self) -> std::time::Duration {
+        self.write_lease
     }
 
     /// Any serving shard with a primary, as a connection [`Target`]. Used to run
@@ -247,13 +258,96 @@ pub fn shared(router: Router) -> SharedRouter {
 /// topology that fails to build — e.g. a transient reshard state whose serving
 /// shards do not yet partition the keyspace — is logged and skipped, keeping the
 /// last good router. Returns when the watcher is dropped.
-pub async fn watch_topology(target: SharedRouter, mut updates: watch::Receiver<Arc<Topology>>) {
-    while updates.changed().await.is_ok() {
+pub async fn watch_topology(target: SharedRouter, updates: watch::Receiver<Arc<Topology>>) {
+    watch_topology_leased(target, updates, None).await;
+}
+
+/// [`watch_topology`] plus write-lease renewal. `lease` pairs the watcher's
+/// validated-epoch stream with the proxy's [`pgshard_topo::Freshness`] stamp.
+///
+/// The lease renews only when the ACTIVE router's view is re-confirmed:
+/// either the source re-validates at exactly the active epoch, or a newer
+/// epoch arrives AND builds AND swaps in. A source the router cannot accept —
+/// a gated topology, a build error, a file frozen at a different epoch — does
+/// NOT renew, so writes stop once the lease expires. That is the fail-safe: a
+/// router that cannot follow its topology forward must not keep writing
+/// against the world it last saw.
+pub async fn watch_topology_leased(
+    target: SharedRouter,
+    mut updates: watch::Receiver<Arc<Topology>>,
+    lease: Option<LeaseWiring>,
+) {
+    let (mut validated, freshness, poll) = match lease {
+        Some(w) => (Some(w.validated), Some(w.freshness), Some(w.poll_interval)),
+        None => (None, None, None),
+    };
+    loop {
+        let changed = async {
+            match &mut validated {
+                Some(v) => {
+                    tokio::select! {
+                        r = updates.changed() => r.map(|()| true),
+                        r = v.changed() => r.map(|()| false),
+                    }
+                }
+                None => updates.changed().await.map(|()| true),
+            }
+        };
+        let Ok(is_update) = changed.await else {
+            return; // watcher dropped
+        };
+        if !is_update {
+            // A validation announcement: renew the lease only if it confirms
+            // the epoch this router is actually serving, and install the
+            // stamps captured AT VALIDATION — never delivery time, so a
+            // delivery delayed across a suspend cannot launder a pre-suspend
+            // read into a fresh confirmation. A swap never renews by itself;
+            // its poll's announcement (sent after apply) does.
+            let stamp = *validated
+                .as_mut()
+                .expect("validated stream")
+                .borrow_and_update();
+            if stamp.epoch == target.load().epoch()
+                && let Some(f) = &freshness
+            {
+                f.install(&stamp);
+            }
+            continue;
+        }
         let topology = updates.borrow_and_update().clone();
         match Router::build(&topology) {
             Ok(router) => {
                 let epoch = router.epoch();
+                if let Some(poll) = poll
+                    && router.write_lease() <= poll
+                {
+                    // Startup validated the initial pairing; a later epoch can
+                    // still shrink the lease below the poll cadence, which
+                    // would flap writes off between healthy polls. The lease
+                    // is the operator's call, so warn loudly rather than
+                    // refuse the epoch.
+                    tracing::warn!(
+                        lease_secs = router.write_lease().as_secs(),
+                        poll_secs = poll.as_secs(),
+                        "writeLeaseSeconds is not longer than the poll interval; writes will flap off between polls"
+                    );
+                }
                 target.store(Arc::new(router));
+                // Both channels fire from one poll, and select! may consume
+                // the validation announcement BEFORE this swap — with the old
+                // epoch active it installed nothing, and no further event
+                // would come. Consult the latest announcement now: if it
+                // confirms the epoch just swapped in, install its stamps.
+                // (If the announcement has not been sent yet, its pending
+                // event arrives next and matches the now-active epoch.)
+                if let Some(v) = &validated {
+                    let stamp = *v.borrow();
+                    if stamp.epoch == epoch
+                        && let Some(f) = &freshness
+                    {
+                        f.install(&stamp);
+                    }
+                }
                 tracing::info!(epoch, "applied topology update");
             }
             Err(err) => {
@@ -261,6 +355,15 @@ pub async fn watch_topology(target: SharedRouter, mut updates: watch::Receiver<A
             }
         }
     }
+}
+
+/// The plumbing [`watch_topology_leased`] needs to renew a write lease: the
+/// watcher's validation announcements, the proxy's freshness stamp, and the
+/// watcher's poll cadence (for the lease-vs-poll sanity warning).
+pub struct LeaseWiring {
+    pub validated: watch::Receiver<pgshard_topo::SourceValidation>,
+    pub freshness: pgshard_topo::Freshness,
+    pub poll_interval: std::time::Duration,
 }
 
 fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {

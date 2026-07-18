@@ -66,7 +66,42 @@ async fn main() -> anyhow::Result<()> {
         Router::build(&initial).context("building router from the initial topology")?,
     );
     tracing::info!(epoch = router.load().epoch(), "loaded initial topology");
-    tokio::spawn(pgshard_router::watch_topology(router.clone(), updates));
+
+    // The write lease renews only when the ACTIVE router's view is
+    // re-confirmed (see watch_topology_leased). A poll interval at or beyond
+    // the lease would make writes flap off between polls even when everything
+    // is healthy — refuse the misconfiguration at startup.
+    let lease = router.load().write_lease();
+    if Duration::from_secs(args.poll_seconds) >= lease {
+        anyhow::bail!(
+            "poll interval ({}s) must be shorter than the topology's writeLeaseSeconds ({}s): \
+             a healthy router could not renew its write lease between polls",
+            args.poll_seconds,
+            lease.as_secs()
+        );
+    }
+    // Seed from the initial validation's own stamps: construction time here
+    // could be arbitrarily later than the read that produced the snapshot,
+    // and install()'s ordering guard would ignore the older (real) stamp. The
+    // seed must confirm the epoch THIS router serves — a poll may already have
+    // validated a newer source the router has not (or cannot) build — so a
+    // mismatched epoch starts unconfirmed and the leased watch loop earns the
+    // first confirmation instead.
+    let initial_validation = *watcher.subscribe_validated().borrow();
+    let freshness = if initial_validation.epoch == router.load().epoch() {
+        pgshard_topo::Freshness::seeded(&initial_validation)
+    } else {
+        pgshard_topo::Freshness::unconfirmed()
+    };
+    tokio::spawn(pgshard_router::watch_topology_leased(
+        router.clone(),
+        updates,
+        Some(pgshard_router::LeaseWiring {
+            validated: watcher.subscribe_validated(),
+            freshness: freshness.clone(),
+            poll_interval: Duration::from_secs(args.poll_seconds),
+        }),
+    ));
 
     let backend = Backend {
         user: args.backend_user,
@@ -88,14 +123,17 @@ async fn main() -> anyhow::Result<()> {
             &backend.system_database,
         )
     });
-    let proxy = std::sync::Arc::new(match system_conn {
-        Some(conn) => {
-            let seq = std::sync::Arc::new(SequenceCache::new(PgBlockReserver::new(conn)));
-            tracing::info!("sequence allocation enabled via the system database");
-            Proxy::with_sequences(router, backend, seq)
+    let proxy = std::sync::Arc::new(
+        match system_conn {
+            Some(conn) => {
+                let seq = std::sync::Arc::new(SequenceCache::new(PgBlockReserver::new(conn)));
+                tracing::info!("sequence allocation enabled via the system database");
+                Proxy::with_sequences(router, backend, seq)
+            }
+            None => Proxy::new(router, backend),
         }
-        None => Proxy::new(router, backend),
-    });
+        .with_freshness(freshness),
+    );
 
     let listener = TcpListener::bind(args.listen)
         .await

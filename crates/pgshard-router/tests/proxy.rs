@@ -11,6 +11,7 @@ use pgshard_seq::SequenceCache;
 use pgshard_testutil::Pg;
 use pgshard_topo::{
     Instance, Sequence, ShardEntry, ShardKeyType, ShardState, TableEntry, TableType, Topology,
+    TopologyWatcher,
 };
 use tokio::net::TcpListener;
 
@@ -541,4 +542,245 @@ async fn no_primary_fails_local_statements_instead_of_fabricating_success() {
 
     let err = client.simple_query("SELECT 1").await.unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("57P01"));
+}
+
+/// The write lease: a router whose topology view cannot be confirmed current
+/// within the lease refuses writes (a stale writer is the split-brain window
+/// the lease bounds) while reads keep answering.
+#[tokio::test]
+async fn expired_write_lease_blocks_writes_but_not_reads() {
+    let pg = Pg::start().await.expect("start postgres");
+    let backend = pg.connect().await.unwrap();
+    backend
+        .batch_execute("CREATE TABLE orders (customer_id int, note text)")
+        .await
+        .unwrap();
+
+    // write_lease_seconds is 10 in the fixture topology.
+    let router = pgshard_router::shared(
+        Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+    );
+    let freshness = pgshard_topo::Freshness::new();
+    let proxy = Arc::new(
+        Proxy::new(
+            router,
+            Backend {
+                user: "postgres".into(),
+                password: "postgres".into(),
+                system_database: "postgres".into(),
+            },
+        )
+        .with_freshness(freshness.clone()),
+    );
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // Fresh: the write goes through.
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'ok')")
+        .await
+        .unwrap();
+
+    // Stale beyond the lease: writes refuse, reads still answer.
+    freshness.backdate(std::time::Duration::from_secs(11));
+    let err = client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'no')")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("57P01"));
+    let rows = client
+        .simple_query("SELECT note FROM orders WHERE customer_id = 1")
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|m| matches!(m,
+        tokio_postgres::SimpleQueryMessage::Row(r) if r.get("note") == Some("ok"))));
+
+    // A stale read cannot smuggle a write through a function body: the
+    // backend session is read-only, so PostgreSQL itself refuses.
+    backend
+        .batch_execute(
+            "CREATE FUNCTION sneaky_write() RETURNS int LANGUAGE sql AS \
+             $$ INSERT INTO orders (customer_id, note) VALUES (9, 'sneak') RETURNING 1 $$",
+        )
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SELECT sneaky_write()")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("25006"));
+
+    // A successful refresh restores writes.
+    freshness.install(
+        &pgshard_topo::ValidationClocks::before_read()
+            .unwrap()
+            .stamp(1),
+    );
+    client
+        .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'again')")
+        .await
+        .unwrap();
+
+    // The text (tokio-postgres) backend enforces the same stale read-only
+    // session via connection options.
+    let text_proxy = Arc::new(
+        Proxy::new(
+            pgshard_router::shared(
+                Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+            ),
+            Backend {
+                user: "postgres".into(),
+                password: "postgres".into(),
+                system_database: "postgres".into(),
+            },
+        )
+        .text()
+        .with_freshness(freshness.clone()),
+    );
+    let conn2 = spawn_router(text_proxy).await;
+    let (client2, connection2) = tokio_postgres::connect(&conn2, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection2);
+    freshness.backdate(std::time::Duration::from_secs(11));
+    let err = client2
+        .simple_query("SELECT sneaky_write()")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("25006"));
+}
+
+/// The production lease path end to end: the lease renews only when the ACTIVE
+/// router's view is re-confirmed. A source the router cannot accept — here a
+/// gated topology, which Router::build refuses — must NOT keep the lease
+/// alive; writes stop until the source becomes acceptable again.
+#[tokio::test]
+async fn lease_renews_only_when_the_active_view_is_confirmed() {
+    use std::time::Duration;
+
+    let pg = Pg::start().await.expect("start postgres");
+    let backend = pg.connect().await.unwrap();
+    backend
+        .batch_execute("CREATE TABLE orders (customer_id int, note text)")
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("pgshard-lease-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("topology.json");
+    let write_topo = |t: &Topology| {
+        let tmp = dir.join("topology.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(t).unwrap()).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    };
+
+    let mut epoch1 = single_shard_topology(pg.host(), pg.port());
+    epoch1.epoch = 1;
+    write_topo(&epoch1);
+
+    // A very long poll interval: the test drives refreshes via reload().
+    let watcher = pgshard_topo::FileWatcher::start(&path, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let initial = watcher.subscribe().borrow().clone();
+    let router = pgshard_router::shared(Router::build(&initial).unwrap());
+    let freshness = pgshard_topo::Freshness::new();
+    tokio::spawn(pgshard_router::watch_topology_leased(
+        router.clone(),
+        watcher.subscribe(),
+        Some(pgshard_router::LeaseWiring {
+            validated: watcher.subscribe_validated(),
+            freshness: freshness.clone(),
+            poll_interval: Duration::from_secs(1),
+        }),
+    ));
+    let proxy = Arc::new(
+        Proxy::new(
+            router,
+            Backend {
+                user: "postgres".into(),
+                password: "postgres".into(),
+                system_database: "postgres".into(),
+            },
+        )
+        .with_freshness(freshness.clone()),
+    );
+    let conn = spawn_router(proxy).await;
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    async fn write_ok(client: &tokio_postgres::Client) -> bool {
+        client
+            .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'x')")
+            .await
+            .is_ok()
+    }
+    // Retry helper: the watch task applies events asynchronously.
+    async fn eventually<F, Fut>(mut f: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..100 {
+            if f().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    // Fresh: writes flow.
+    assert!(write_ok(&client).await);
+
+    // Expired, then a SAME-EPOCH revalidation renews the lease.
+    freshness.backdate(Duration::from_secs(11));
+    assert!(!write_ok(&client).await, "expired lease must refuse writes");
+    watcher.reload().await.unwrap();
+    assert!(
+        eventually(|| write_ok(&client)).await,
+        "a same-epoch revalidation must renew the lease"
+    );
+
+    // A gated epoch validates at the source but the router refuses it: the
+    // lease must NOT renew from it.
+    let mut gated = single_shard_topology(pg.host(), pg.port());
+    gated.epoch = 2;
+    gated.gates.push(pgshard_topo::GateSpec {
+        id: "cutover".into(),
+        match_: pgshard_topo::GateMatch {
+            all: true,
+            tables: Vec::new(),
+            key_ranges: Vec::new(),
+        },
+        mode: pgshard_topo::GateMode::BufferWrites,
+        deadline: "2026-07-18T00:00:00Z".into(),
+        min_topology_generation: 0,
+    });
+    write_topo(&gated);
+    watcher.reload().await.unwrap();
+    freshness.backdate(Duration::from_secs(11));
+    // Give the watch task time to (wrongly) renew if it were going to.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    watcher.reload().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !write_ok(&client).await,
+        "a source the router cannot accept must not keep the lease alive"
+    );
+
+    // An acceptable newer epoch builds, swaps, and restores writes.
+    let mut epoch3 = single_shard_topology(pg.host(), pg.port());
+    epoch3.epoch = 3;
+    write_topo(&epoch3);
+    watcher.reload().await.unwrap();
+    assert!(
+        eventually(|| write_ok(&client)).await,
+        "an accepted newer epoch must renew the lease"
+    );
 }

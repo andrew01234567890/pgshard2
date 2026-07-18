@@ -76,6 +76,13 @@ pub struct Proxy {
     /// `None` disables injection (such an INSERT then errors rather than routing
     /// a row with a missing id).
     seq: Option<SequenceAllocator>,
+    /// The topology watcher's last-successful-validation stamp. When present,
+    /// writes are refused once its age exceeds the router's write lease: a
+    /// router that cannot confirm its view is current may be routing against a
+    /// world that has moved on (a cutover it never saw), and a stale writer is
+    /// exactly the split-brain window the lease bounds. `None` (tests, direct
+    /// construction) disables the gate.
+    freshness: Option<pgshard_topo::Freshness>,
 }
 
 impl Proxy {
@@ -85,6 +92,7 @@ impl Proxy {
             router,
             backend,
             seq: None,
+            freshness: None,
         }
     }
 
@@ -96,7 +104,15 @@ impl Proxy {
             router,
             backend,
             seq: Some(seq),
+            freshness: None,
         }
+    }
+
+    /// Enforce the write lease against this freshness stamp (the topology
+    /// watcher's last successful source validation).
+    pub fn with_freshness(mut self, freshness: pgshard_topo::Freshness) -> Self {
+        self.freshness = Some(freshness);
+        self
     }
 
     /// Route backend traffic through the text-mode tokio-postgres backend instead
@@ -113,8 +129,9 @@ impl Proxy {
         endpoint: &Endpoint,
         database: &str,
         query: &str,
+        read_only: bool,
     ) -> PgWireResult<Vec<Response>> {
-        let results = self.conn.run(endpoint, database, query).await?;
+        let results = self.conn.run(endpoint, database, query, read_only).await?;
         Ok(results.into_iter().map(response_from).collect())
     }
 
@@ -182,10 +199,11 @@ impl Proxy {
         &self,
         targets: &[Target],
         query: &str,
+        read_only: bool,
     ) -> PgWireResult<Option<(Arc<Vec<FieldInfo>>, Vec<DataRow>)>> {
         let fetches = targets
             .iter()
-            .map(|t| self.conn.run(&t.endpoint, &t.database, query));
+            .map(|t| self.conn.run(&t.endpoint, &t.database, query, read_only));
         let results = futures::future::join_all(fetches).await;
 
         let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
@@ -225,8 +243,13 @@ impl Proxy {
 
     /// A plain scatter read: concatenate every shard's rows in any order (valid
     /// only when the read needs no ordering — checked by the caller).
-    async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
-        match self.collect_scatter(targets, query).await? {
+    async fn run_scatter(
+        &self,
+        targets: &[Target],
+        query: &str,
+        read_only: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        match self.collect_scatter(targets, query, read_only).await? {
             // A scatter is a plain SELECT, so it keeps the default `SELECT n` tag.
             Some((schema, rows)) => Ok(vec![rows_response(schema, rows, None)]),
             None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
@@ -242,8 +265,9 @@ impl Proxy {
         targets: &[Target],
         query: &str,
         keys: &[merge::SortKey],
+        read_only: bool,
     ) -> PgWireResult<Vec<Response>> {
-        match self.collect_scatter(targets, query).await? {
+        match self.collect_scatter(targets, query, read_only).await? {
             Some((schema, rows)) => {
                 let merged = merge::merge_ordered(&schema, rows, keys)?;
                 Ok(vec![rows_response(schema, merged, None)])
@@ -319,6 +343,25 @@ fn is_transaction_control(parsed: &Parsed) -> bool {
     })
 }
 
+/// Statement kinds that mutate data or schema — what the write lease gates.
+/// Reads stay allowed on a stale view (the plan's lease semantics): a stale
+/// read is bounded-stale data, but a stale WRITE can land on a shard that a
+/// cutover this router never saw has already retired.
+fn is_write(parsed: &Parsed) -> bool {
+    parsed.statements().iter().any(|s| {
+        matches!(
+            s,
+            StatementKind::Insert
+                | StatementKind::Update
+                | StatementKind::Delete
+                | StatementKind::Ddl
+                | StatementKind::Merge
+                | StatementKind::Copy
+                | StatementKind::Other
+        )
+    })
+}
+
 impl Proxy {
     async fn dispatch(
         &self,
@@ -327,15 +370,52 @@ impl Proxy {
         route: Route,
         query: &str,
     ) -> PgWireResult<Vec<Response>> {
+        // The write lease: once the view's last confirmation is older than the
+        // lease, this router can no longer prove its routing is current —
+        // (The freshness stamp is deliberately not epoch-bound to this
+        // request's pinned router snapshot: a request in flight across an
+        // epoch swap completes on the outgoing snapshot by the router's own
+        // hot-swap semantics, lease or no lease — that window is one request's
+        // latency, not the staleness the lease bounds.)
+        // refuse write statements outright, and run everything that remains
+        // (reads) under a backend-enforced read-only transaction, so even a
+        // write hidden inside a function body the router cannot see is refused
+        // by PostgreSQL itself rather than landing on a possibly-retired shard.
+        let stale = match &self.freshness {
+            Some(freshness) => {
+                let age = freshness.age();
+                let lease = router.write_lease();
+                if age > lease {
+                    if is_write(parsed) {
+                        return Err(user_error(
+                            "57P01",
+                            format!(
+                                "write lease expired: topology last confirmed {}s ago (limit {}s); \
+                                 refusing writes until the view refreshes",
+                                age.as_secs(),
+                                lease.as_secs()
+                            ),
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
         match route {
             Route::Shard(t) => {
                 // An INSERT omitting a sequence-bound column has its id(s) filled
                 // in here; every other statement forwards unchanged.
                 let injected = self.inject_sequences(router, parsed).await?;
                 let sql = injected.as_deref().unwrap_or(query);
-                self.run_on(&t.endpoint, &t.database, sql).await
+                self.run_on(&t.endpoint, &t.database, sql, stale).await
             }
-            Route::System(ep) => self.run_on(&ep, &self.backend.system_database, query).await,
+            Route::System(ep) => {
+                self.run_on(&ep, &self.backend.system_database, query, stale)
+                    .await
+            }
             // Session-local statements: reject transaction control (it would break
             // atomicity across per-query connections), and run everything else
             // (`SELECT 1`, `SHOW`, `SET`) on any shard so reads return real rows.
@@ -346,7 +426,7 @@ impl Proxy {
                 "transactions are not supported by this router version".to_owned(),
             )),
             Route::Local => match router.any_shard_target() {
-                Some(t) => self.run_on(&t.endpoint, &t.database, query).await,
+                Some(t) => self.run_on(&t.endpoint, &t.database, query, stale).await,
                 // No serving primary anywhere (e.g. a total failover in flight):
                 // fabricating a CommandComplete would report success for work
                 // that never ran — fail like any other unavailable route.
@@ -361,9 +441,10 @@ impl Proxy {
             // or merged by its sort keys; a limit/grouping/aggregation scatter
             // still needs work the router does not do and is rejected.
             Route::Scatter(targets) => match classify_scatter(query) {
-                ScatterPlan::Concat => self.run_scatter(&targets, query).await,
+                ScatterPlan::Concat => self.run_scatter(&targets, query, stale).await,
                 ScatterPlan::Ordered(keys) => {
-                    self.run_ordered_scatter(&targets, query, &keys).await
+                    self.run_ordered_scatter(&targets, query, &keys, stale)
+                        .await
                 }
                 ScatterPlan::Unsupported => Err(user_error(
                     "0A000",

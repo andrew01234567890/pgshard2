@@ -330,6 +330,8 @@ spec:
               writeLeaseSeconds:
                 default: 10
                 format: int32
+                maximum: 60
+                minimum: 1
                 type: integer
             required:
             - epoch
