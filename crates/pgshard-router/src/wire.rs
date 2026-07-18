@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{Sink, stream};
 use pgshard_seq::SequenceCache;
-use pgshard_sql::Parsed;
+use pgshard_sql::{Parsed, StatementKind};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
@@ -302,11 +302,21 @@ impl SimpleQueryHandler for Proxy {
 /// fresh backend connection per query: a `BEGIN` would silently autocommit its
 /// following statements. They are rejected rather than falsely acknowledged
 /// until session pinning lands.
-fn is_transaction_control(query: &str) -> bool {
-    matches!(
-        command_tag(query).as_str(),
-        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
-    )
+///
+/// Classified from the parsed AST, never from the query's leading token: a
+/// leading comment (`/*x*/ BEGIN`) defeats any lexical check, and a client that
+/// believes it opened a transaction while its statements autocommit is a
+/// wrong-data outcome.
+fn is_transaction_control(parsed: &Parsed) -> bool {
+    parsed.statements().iter().any(|s| {
+        matches!(
+            s,
+            StatementKind::TxnBegin
+                | StatementKind::TxnCommit
+                | StatementKind::TxnRollback
+                | StatementKind::TxnOther
+        )
+    })
 }
 
 impl Proxy {
@@ -331,13 +341,19 @@ impl Proxy {
             // (`SELECT 1`, `SHOW`, `SET`) on any shard so reads return real rows.
             // A `SET` there does not persist across queries yet — a documented
             // limitation until session state lands.
-            Route::Local if is_transaction_control(query) => Err(user_error(
+            Route::Local if is_transaction_control(parsed) => Err(user_error(
                 "0A000",
                 "transactions are not supported by this router version".to_owned(),
             )),
             Route::Local => match router.any_shard_target() {
                 Some(t) => self.run_on(&t.endpoint, &t.database, query).await,
-                None => Ok(vec![Response::Execution(Tag::new(&command_tag(query)))]),
+                // No serving primary anywhere (e.g. a total failover in flight):
+                // fabricating a CommandComplete would report success for work
+                // that never ran — fail like any other unavailable route.
+                None => Err(user_error(
+                    "57P01",
+                    "no serving shard primary is available to run this statement".to_owned(),
+                )),
             },
             Route::Reject { code, reason } => Err(user_error(code, reason)),
             Route::Unavailable(reason) => Err(user_error("57P01", reason)),
