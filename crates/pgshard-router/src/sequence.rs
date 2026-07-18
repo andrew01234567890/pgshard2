@@ -38,15 +38,18 @@ const RESERVE_SQL: &str = "\
 /// connection, reconnecting on error. Cloneable connection config; the live
 /// connection is lazily established on the first reservation.
 pub struct PgBlockReserver {
-    conn: String,
+    conn: postgres::Config,
     client: Mutex<Option<Client>>,
 }
 
 impl PgBlockReserver {
-    /// `conn` is a libpq connection string pointing at the system database.
-    pub fn new(conn: impl Into<String>) -> Self {
+    /// `conn` is a typed connection config pointing at the system database.
+    /// Typed — not a libpq conninfo string — so a credential containing
+    /// whitespace or quotes can never split into extra connection options or
+    /// redirect the reservation (overlapping ID blocks would follow).
+    pub fn new(conn: postgres::Config) -> Self {
         Self {
-            conn: conn.into(),
+            conn,
             client: Mutex::new(None),
         }
     }
@@ -91,10 +94,32 @@ impl BlockReserver for PgBlockReserver {
 /// hung system database fails a reservation loudly (a `Backend` error) instead
 /// of blocking every sequence's refill on the single shared connection forever.
 /// Reservations are single-row updates that complete in well under this bound.
-fn connect(conn: &str) -> Result<Client, SeqError> {
-    let mut client = Client::connect(conn, NoTls).map_err(|e| SeqError::Backend(e.to_string()))?;
+fn connect(conn: &postgres::Config) -> Result<Client, SeqError> {
+    let mut client = conn
+        .connect(NoTls)
+        .map_err(|e| SeqError::Backend(e.to_string()))?;
     client
         .batch_execute("SET statement_timeout = '10s'")
         .map_err(|e| SeqError::Backend(e.to_string()))?;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hostile_password_stays_one_credential() {
+        // With typed setters a password containing conninfo syntax is inert: it
+        // stays a single credential and cannot add hosts or options.
+        let mut cfg = postgres::Config::new();
+        cfg.host("sys")
+            .port(5432)
+            .user("router")
+            .password("p ss'word host=evil port=9999")
+            .dbname("pgshard_system");
+        assert_eq!(
+            cfg.get_password(),
+            Some("p ss'word host=evil port=9999".as_bytes())
+        );
+        assert_eq!(cfg.get_hosts().len(), 1);
+    }
 }

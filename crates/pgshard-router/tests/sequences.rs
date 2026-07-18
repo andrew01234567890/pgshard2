@@ -25,7 +25,7 @@ async fn reserves_disjoint_monotonic_blocks() {
         .await
         .unwrap();
 
-    let reserver = PgBlockReserver::new(pg.connection_string());
+    let reserver = PgBlockReserver::new(pg.connection_string().parse().unwrap());
 
     // reserve() drives a blocking client, so it runs on a blocking thread.
     tokio::task::spawn_blocking(move || {
@@ -60,7 +60,7 @@ async fn misconfigured_block_size_is_rejected_without_moving_next_id() {
         .await
         .unwrap();
 
-    let reserver = PgBlockReserver::new(pg.connection_string());
+    let reserver = PgBlockReserver::new(pg.connection_string().parse().unwrap());
     tokio::task::spawn_blocking(move || {
         // A non-positive block_size is rejected loudly, not used.
         assert!(matches!(reserver.reserve("bad"), Err(SeqError::Backend(_))));
@@ -104,7 +104,7 @@ async fn concurrent_reservations_never_overlap() {
         .map(|_| {
             let conn = conn.clone();
             tokio::task::spawn_blocking(move || {
-                let reserver = PgBlockReserver::new(conn);
+                let reserver = PgBlockReserver::new(conn.parse().unwrap());
                 (0..PER)
                     .map(|_| reserver.reserve("orders_id").unwrap())
                     .collect::<Vec<_>>()
