@@ -299,6 +299,29 @@ impl Instance for PgInstance {
         tables: &[(String, String)],
     ) -> anyhow::Result<Option<u64>> {
         let client = self.connect_to(database).await?;
+        // The runner rejects generated columns outright; provisioning a
+        // publication over such a table would only defer the failure to the
+        // workflow's preflight — honor the cross-contract here instead.
+        for (schema, name) in tables {
+            let has_generated: bool = client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_attribute a
+                         JOIN pg_class c ON c.oid = a.attrelid
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = $1 AND c.relname = $2
+                           AND a.attnum > 0 AND NOT a.attisdropped
+                           AND a.attgenerated <> ''
+                     )",
+                    &[&schema, &name],
+                )
+                .await?
+                .get(0);
+            anyhow::ensure!(
+                !has_generated,
+                "table {schema}.{name} has generated columns; the seeding runner cannot stream them"
+            );
+        }
         // No-op when the publication already has the exact shape the seeding
         // runner's preflight demands: a reconcile retry must never rewrite the
         // catalog rows a live consumer's drift poll has pinned.
@@ -370,19 +393,21 @@ async fn publication_matches(
     if !row.get::<_, bool>(0) {
         return Ok(false);
     }
+    // prattrs/prqual are the UNDERLYING catalog state: an explicit column
+    // list that happens to name every current column is indistinguishable
+    // from no list in pg_publication_tables.attnames, yet it FREEZES the
+    // published set — a later ADD COLUMN would silently vanish from the
+    // stream. Only prattrs IS NULL proves there is no list.
     let members: Vec<(String, String, bool)> = client
         .query(
-            "SELECT schemaname::text, tablename::text,
-                    rowfilter IS NULL AND attnames::text[] = (
-                        SELECT array_agg(a.attname::text ORDER BY a.attnum)
-                        FROM pg_attribute a
-                        JOIN pg_class c ON c.oid = a.attrelid
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = pt.schemaname AND c.relname = pt.tablename
-                          AND a.attnum > 0 AND NOT a.attisdropped
-                          AND a.attgenerated = ''
-                    )
-             FROM pg_publication_tables pt WHERE pubname = $1",
+            "SELECT pt.schemaname::text, pt.tablename::text,
+                    pr.prattrs IS NULL AND pr.prqual IS NULL
+             FROM pg_publication_tables pt
+             JOIN pg_publication p ON p.pubname = pt.pubname
+             JOIN pg_namespace n ON n.nspname = pt.schemaname
+             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
+             JOIN pg_publication_rel pr ON pr.prpubid = p.oid AND pr.prrelid = c.oid
+             WHERE pt.pubname = $1",
             &[&publication],
         )
         .await?

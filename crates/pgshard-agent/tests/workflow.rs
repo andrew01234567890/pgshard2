@@ -395,7 +395,17 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     let mut col_listed = spec(&pg, "wf_cols", "pgshard_cols");
     col_listed.publication = "pub_cols".into();
     registry.start(&col_listed, &config).await?;
-    wait_for_error(&registry, "wf_cols", "different column set").await;
+    wait_for_error(&registry, "wf_cols", "column list").await;
+
+    // A FULL column list is indistinguishable from no list in attnames but
+    // freezes the published set — a later ADD COLUMN would silently vanish.
+    source
+        .batch_execute("CREATE PUBLICATION pub_fullcols FOR TABLE orders (id, note)")
+        .await?;
+    let mut full_listed = spec(&pg, "wf_fullcols", "pgshard_fullcols");
+    full_listed.publication = "pub_fullcols".into();
+    registry.start(&full_listed, &config).await?;
+    wait_for_error(&registry, "wf_fullcols", "column list").await;
 
     // Dynamic membership cannot be pinned by catalog row versions.
     source

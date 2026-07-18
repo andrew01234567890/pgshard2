@@ -89,6 +89,31 @@ async fn provisions_verifies_and_converges_the_publication() -> anyhow::Result<(
         "a no-op re-prepare must leave the publication row untouched"
     );
 
+    // A FULL column list (naming every current column) must be treated as
+    // mismatched — the underlying prattrs freezes the published set even
+    // though attnames looks complete.
+    src.batch_execute(
+        "DROP PUBLICATION pgshard_seed;
+         CREATE PUBLICATION pgshard_seed FOR TABLE orders (id, note), items (id, sku)",
+    )
+    .await?;
+    instance
+        .prepare_source("shard_src", "pgshard_seed", &tables)
+        .await?;
+    let frozen: i64 = src
+        .query_one(
+            "SELECT count(*) FROM pg_publication_rel pr
+             JOIN pg_publication p ON p.oid = pr.prpubid
+             WHERE p.pubname = 'pgshard_seed' AND pr.prattrs IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        frozen, 0,
+        "a full-but-frozen column list must be converged away"
+    );
+
     // A mismatched same-name publication converges to the full shape.
     src.batch_execute(
         "DROP PUBLICATION pgshard_seed;
@@ -114,6 +139,22 @@ async fn provisions_verifies_and_converges_the_publication() -> anyhow::Result<(
         trunc && count == 2,
         "the mismatched publication must converge"
     );
+
+    // Generated-column tables are refused up front: the runner cannot stream
+    // them, so provisioning would only defer the failure.
+    src.batch_execute(
+        "CREATE TABLE gen_src (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
+    )
+    .await?;
+    let err = instance
+        .prepare_source(
+            "shard_src",
+            "pgshard_gen",
+            &[("public".to_string(), "gen_src".to_string())],
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("generated"));
     Ok(())
 }
 

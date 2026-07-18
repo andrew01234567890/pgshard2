@@ -434,14 +434,17 @@ struct TablePreflight {
     columns: Vec<String>,
 }
 
-/// One pg_publication_tables entry: schema, table, published columns (all of
-/// them when no column list), row-filter expression if any.
+/// One publication member, read from the UNDERLYING catalog rows: an
+/// explicit column list that names every current column is invisible in
+/// pg_publication_tables.attnames yet freezes the published set (a later
+/// ADD COLUMN silently vanishes from the stream), so only
+/// pg_publication_rel.prattrs decides `has_column_list`.
 #[derive(PartialEq)]
 struct PublishedTable {
     schema: String,
     name: String,
-    columns: Option<Vec<String>>,
-    row_filter: Option<String>,
+    has_column_list: bool,
+    has_row_filter: bool,
 }
 
 /// The validated shape of the publication. Captured at preflight and
@@ -538,9 +541,16 @@ async fn fetch_publication(
         .collect();
     let tables = source_sql
         .query(
-            "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
-             FROM pg_publication_tables WHERE pubname = $1
-             ORDER BY schemaname, tablename",
+            "SELECT pt.schemaname::text, pt.tablename::text,
+                    pr.prattrs IS NOT NULL, pr.prqual IS NOT NULL
+             FROM pg_publication_tables pt
+             JOIN pg_publication p ON p.pubname = pt.pubname
+             JOIN pg_namespace n ON n.nspname = pt.schemaname
+             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
+             LEFT JOIN pg_publication_rel pr
+               ON pr.prpubid = p.oid AND pr.prrelid = c.oid
+             WHERE pt.pubname = $1
+             ORDER BY pt.schemaname, pt.tablename",
             &[&publication],
         )
         .await?
@@ -548,8 +558,8 @@ async fn fetch_publication(
         .map(|r| PublishedTable {
             schema: r.get(0),
             name: r.get(1),
-            columns: r.get(2),
-            row_filter: r.get(3),
+            has_column_list: r.get::<_, Option<bool>>(2).unwrap_or(false),
+            has_row_filter: r.get::<_, Option<bool>>(3).unwrap_or(false),
         })
         .collect();
     let horizon = xid_recurrence_horizon(xid, &versions)?;
@@ -664,8 +674,15 @@ async fn preflight(
             p.name
         );
         anyhow::ensure!(
-            p.row_filter.is_none(),
+            !p.has_row_filter,
             "publication {} filters rows of {}.{}: the stream would silently drop changes the seed copy included",
+            run.publication,
+            p.schema,
+            p.name
+        );
+        anyhow::ensure!(
+            !p.has_column_list,
+            "publication {} sets a column list for {}.{}: even a currently-complete list freezes the published set, so a later ADD COLUMN would silently vanish from the stream",
             run.publication,
             p.schema,
             p.name
@@ -700,23 +717,6 @@ async fn preflight(
                 !c.generated,
                 "column {} of {}.{} is generated; generated columns cannot be streamed soundly",
                 c.name,
-                table.schema,
-                table.name
-            );
-        }
-        // A column list on the publication would stream a transformed row
-        // shape; the seed copy takes every column, so the stream's published
-        // set must equal it exactly.
-        if let Some(attnames) = published
-            .iter()
-            .find(|p| p.schema == table.schema && p.name == table.name)
-            .and_then(|p| p.columns.as_ref())
-        {
-            let src_names: Vec<&String> = src.iter().map(|c| &c.name).collect();
-            anyhow::ensure!(
-                attnames.len() == src_names.len() && src_names.iter().all(|n| attnames.contains(n)),
-                "publication {} publishes a different column set for {}.{} than the table has: streamed rows would be silently transformed",
-                run.publication,
                 table.schema,
                 table.name
             );
