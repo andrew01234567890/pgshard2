@@ -1,0 +1,200 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgshardreshards.pgshard.dev
+spec:
+  group: pgshard.dev
+  names:
+    kind: PgShardReshard
+    listKind: PgShardReshardList
+    plural: pgshardreshards
+    shortNames:
+    - reshard
+    singular: pgshardreshard
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterRef
+      name: Cluster
+      type: string
+    - jsonPath: .spec.sourceShard
+      name: Source
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PgShardReshard is an online key-range split of a cluster's shard.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgShardReshardSpec requests splitting one source shard's key range into a new
+              partition. The request is immutable once created: a reshard is a workflow, not
+              a knob, and changing its target mid-flight would strand half-provisioned
+              shards. To change course, delete this object (rolling back) and create a new
+              one.
+            properties:
+              clusterRef:
+                description: ClusterRef is the PgShardCluster this reshard operates
+                  on.
+                minLength: 1
+                type: string
+              sourceShard:
+                description: SourceShard is the PgShardShard whose key range is being
+                  split.
+                minLength: 1
+                type: string
+              targetRanges:
+                description: |-
+                  TargetRanges is the desired partition of the source shard's key range —
+                  contiguous, covering exactly the source range, with at least two parts (a
+                  split). The controller validates the partition against the source's range
+                  before creating any target shard.
+                items:
+                  description: |-
+                    KeyRange is a half-open range [start, end) over the 64-bit keyspace in
+                    the canonical trimmed big-endian hex syntax: "40" means
+                    0x4000000000000000; an empty start is 0 and an empty end is the top of
+                    the keyspace. A shard's identity IS its range: reshards never mutate it,
+                    they create new shards and retire old ones.
+
+                    Bounds must be canonical: trailing zero bytes are trimmed, so a non-empty
+                    bound never ends in "00" (which would alias a shorter bound to the same
+                    value, e.g. "4000" == "40" == 0x4000000000000000, breaking range identity).
+                    The pattern enforces this directly — even-length lowercase hex, up to 8
+                    bytes, whose last byte is non-zero — so no CEL rule is needed.
+                  properties:
+                    end:
+                      maxLength: 16
+                      pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                      type: string
+                    start:
+                      maxLength: 16
+                      pattern: ^$|^([0-9a-f]{2}){0,7}([0-9a-f][1-9a-f]|[1-9a-f][0-9a-f])$
+                      type: string
+                  type: object
+                maxItems: 128
+                minItems: 2
+                type: array
+            required:
+            - clusterRef
+            - sourceShard
+            - targetRanges
+            type: object
+            x-kubernetes-validations:
+            - message: clusterRef is immutable
+              rule: self.clusterRef == oldSelf.clusterRef
+            - message: sourceShard is immutable
+              rule: self.sourceShard == oldSelf.sourceShard
+            - message: targetRanges is immutable
+              rule: self.targetRanges == oldSelf.targetRanges
+          status:
+            description: |-
+              PgShardReshardStatus records progress. TargetShards is the durable idempotency
+              anchor: it records which target shard objects the controller has created, so a
+              restart resumes rather than re-deriving and double-creating.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                description: |-
+                  ReshardPhase is where a reshard is in its lifecycle. The later cutover phases
+                  exist in the state model but are not yet driven (they need the seeding engine,
+                  the freeze-LSN handshake, and router-fleet gating); this controller drives
+                  through ProvisioningTargets and back out via RollingBack.
+                type: string
+              targetShards:
+                description: |-
+                  TargetShards are the names of the PgShardShard objects created for the
+                  target ranges, in TargetRanges order.
+                items:
+                  type: string
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
