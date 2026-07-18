@@ -14,18 +14,50 @@ import (
 )
 
 // TopologySnapshot is catalog/topology/gen-<N>.json — written on every
-// structural change (shard set or table catalog). Immutable.
+// structural change (shard set or table catalog). Immutable. It must be the
+// COMPLETE structural routing view: a restore into a fresh cluster
+// reconstructs routing from the snapshot alone (CRDs may be gone with the
+// cluster), so shard ranges without the hash function and table catalog
+// would leave the restored data unroutable — or, worse, routable under
+// different rules than the ones it was written with.
 type TopologySnapshot struct {
-	Generation int64           `json:"generation"`
-	ValidFrom  time.Time       `json:"validFrom"`
-	Epoch      int64           `json:"epoch"`
-	Shards     []ShardTopology `json:"shards"`
+	Generation int64     `json:"generation"`
+	ValidFrom  time.Time `json:"validFrom"`
+	Epoch      int64     `json:"epoch"`
+	// HashFunction is the cluster's shard function (the keyspace-id hash the
+	// shard ranges partition). Restoring data hashed with one function into a
+	// cluster routing with another silently misplaces every row.
+	HashFunction string          `json:"hashFunction"`
+	Shards       []ShardTopology `json:"shards"`
+	// Tables is the compiled table catalog live at this generation, projected
+	// from the same source as PgShardRouting.
+	Tables []TableTopology `json:"tables"`
 }
 
 type ShardTopology struct {
 	Name     string      `json:"name"`
 	KeyRange KeyRangeRef `json:"keyRange"`
 	Stanza   string      `json:"stanza"`
+}
+
+// TableTopology mirrors the compiled RoutingTable structurally: everything a
+// restored cluster needs to route the table's data the way it was written.
+type TableTopology struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	// "sharded" or "global".
+	Type           string `json:"type"`
+	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
+	// Wire value of the shard-key column type (matches the router's
+	// ShardKeyType); required for sharded tables — hashing a literal as the
+	// wrong type routes it to the wrong shard.
+	ShardKeyType string             `json:"shardKeyType,omitempty"`
+	Sequences    []SequenceTopology `json:"sequences,omitempty"`
+}
+
+type SequenceTopology struct {
+	Column   string `json:"column"`
+	Sequence string `json:"sequence"`
 }
 
 type KeyRangeRef struct {

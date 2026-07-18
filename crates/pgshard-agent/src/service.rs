@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -26,13 +26,17 @@ pub struct AgentSvc<I: Instance> {
     pod: String,
     epoch: EpochGuard,
     schema: SchemaLog,
-    /// Restore points already created, by name. PostgreSQL does not deduplicate
-    /// restore-point names (a second create writes a second record, and recovery
-    /// by name stops at the first), so a retried barrier must get its original
-    /// point back instead of writing a divergent second one. Names are unique
-    /// per barrier. In-memory, like the schema log: a retry after an agent
-    /// restart is out of scope for M1.
-    restore_points: Mutex<HashMap<String, RestorePoint>>,
+    /// Restore points already created, by name — one async slot per name, so
+    /// creation is SINGLE-FLIGHT. PostgreSQL does not deduplicate restore-point
+    /// names (a second create writes a second record, and recovery by name
+    /// stops at the FIRST), so a retried barrier must replay its original
+    /// point, and two CONCURRENT same-name calls must never both execute: the
+    /// loser would get a different LSN than the manifest records. The per-name
+    /// lock is held across the PostgreSQL call; a failed create leaves the slot
+    /// empty so a retry re-executes. In-memory, like the schema log: a retry
+    /// after an agent restart is out of scope for M1.
+    restore_points:
+        tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<RestorePoint>>>>>,
 }
 
 impl<I: Instance> AgentSvc<I> {
@@ -42,7 +46,7 @@ impl<I: Instance> AgentSvc<I> {
             pod,
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
-            restore_points: Mutex::new(HashMap::new()),
+            restore_points: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -219,9 +223,20 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         // truncates a restore-point name to 63 bytes, so two long names sharing
         // a prefix would collide onto one record.
         check_ident("restore point name", &req.name, true)?;
-        // Idempotent by name: a retried barrier gets its original point back
-        // rather than writing a divergent second one (see the field doc).
-        if let Some(rp) = self.restore_points.lock().unwrap().get(&req.name).copied() {
+        // Single-flight per name (see the field doc): the map lock is only held
+        // to fetch/create the name's slot; the slot lock is held across the
+        // PostgreSQL call, so a concurrent same-name caller blocks and then
+        // replays the winner's point instead of writing a second record at a
+        // different LSN.
+        let slot = self
+            .restore_points
+            .lock()
+            .await
+            .entry(req.name.clone())
+            .or_default()
+            .clone();
+        let mut point = slot.lock().await;
+        if let Some(rp) = *point {
             return Ok(Response::new(restore_point_response(rp)));
         }
         let rp = self
@@ -229,10 +244,7 @@ impl<I: Instance> AgentService for AgentSvc<I> {
             .create_restore_point(&req.name)
             .await
             .map_err(internal)?;
-        self.restore_points
-            .lock()
-            .unwrap()
-            .insert(req.name.clone(), rp);
+        *point = Some(rp);
         Ok(Response::new(restore_point_response(rp)))
     }
 
@@ -731,6 +743,43 @@ mod tests {
         assert_eq!(retry.timeline, first.timeline);
         // Only one PostgreSQL restore point was written.
         assert_eq!(s.instance.restore_points(), vec!["pgshard_barrier_1"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_name_restore_points_are_single_flight() {
+        let s = Arc::new(svc(FakeInstance::primary()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        s.instance.set_restore_point_gate(gate.clone());
+
+        let spawn_call = |s: Arc<AgentSvc<FakeInstance>>| {
+            tokio::spawn(async move {
+                s.create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                    name: "pgshard_b1".into(),
+                }))
+                .await
+            })
+        };
+        let first = spawn_call(s.clone());
+        // Let the first call reach PostgreSQL (park at the fake's gate) before
+        // the second arrives: without single-flight both pass the exists-check
+        // and write the same name twice at different LSNs — and recovery by
+        // name stops at the FIRST record, not the one the manifest holds.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let second = spawn_call(s.clone());
+        for _ in 0..20 {
+            gate.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+        let a = first.await.unwrap().unwrap().into_inner();
+        let b = second.await.unwrap().unwrap().into_inner();
+        assert_eq!(a.lsn.unwrap().value, b.lsn.unwrap().value);
+        assert_eq!(
+            s.instance.restore_points(),
+            vec!["pgshard_b1".to_string()],
+            "exactly one restore point may be written per name, however many concurrent callers"
+        );
     }
 
     #[tokio::test]
