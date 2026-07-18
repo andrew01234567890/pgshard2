@@ -322,6 +322,20 @@ spec:
                   provisioned on. It scopes the DatabaseReady condition to a node identity so
                   a moved or replaced node re-provisions instead of trusting a stale latch.
                 type: string
+              databaseNodeUID:
+                description: |-
+                  DatabaseNodeUID pins DatabaseNode to the exact node INCARNATION: a
+                  recreated same-named node (fresh or deliberately relabeled storage) has
+                  never been verified, and a name-only latch would keep vouching for a
+                  database nobody checked.
+                type: string
+              databasePodUID:
+                description: |-
+                  DatabasePodUID pins the verification to the exact PRIMARY POD it ran
+                  against: a failover promotes a standby whose copy of the database (and
+                  of a just-stamped adoption marker) may not have replicated, so every
+                  primary change re-verifies before the shard is routable again.
+                type: string
               decisionEpoch:
                 description: |-
                   Monotonic failover-decision epoch carried on agent Promote/Fence

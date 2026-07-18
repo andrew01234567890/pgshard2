@@ -36,6 +36,10 @@ enum Command {
         /// This instance's pod name (a Promote aimed elsewhere is refused).
         #[arg(long, env = "PGSHARD_POD")]
         pod: String,
+        /// This pod's Kubernetes UID (downward API); identity-sensitive
+        /// requests aimed at another pod uid are refused.
+        #[arg(long, env = "PGSHARD_POD_UID", default_value = "")]
+        pod_uid: String,
     },
 }
 
@@ -47,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
             listen,
             pg_conn,
             pod,
+            pod_uid,
         } => {
-            let svc = AgentSvc::new(Arc::new(PgInstance::new(pg_conn)), pod);
+            let svc = AgentSvc::with_pod_uid(Arc::new(PgInstance::new(pg_conn)), pod, pod_uid);
             tracing::info!(%listen, "pgshard-agent serving");
             Server::builder()
                 .add_service(AgentServiceServer::new(svc))
