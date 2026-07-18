@@ -1,0 +1,13 @@
+[package]
+name = "pgshard-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgshard-core = { path = "../pgshard-core" }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

@@ -2028,6 +2028,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgshard-repl"
+version = "0.0.0"
+dependencies = [
+ "pgshard-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pgshard-router"
 version = "0.0.0"
 dependencies = [
