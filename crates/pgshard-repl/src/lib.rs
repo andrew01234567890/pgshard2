@@ -5,6 +5,7 @@
 //! [`pgoutput`] decodes that stream; higher layers filter by keyspace-id and
 //! apply with a transactional checkpoint.
 
+pub mod client;
 pub mod filter;
 pub mod pgoutput;
 pub mod stream;
