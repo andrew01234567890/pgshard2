@@ -129,23 +129,28 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureServices(ctx, &node); err != nil {
 		return ctrl.Result{}, err
 	}
-	// EVERY ordinal is checked before acting on foreign volumes: stopping at
-	// the first would leave a later ordinal's pod — possibly a labeled,
-	// serving primary on foreign data — routed until the earlier one is
-	// remediated.
-	var foreigns []*foreignPVCError
-	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
-		if err := r.ensureInstance(ctx, &node, ordinal); err != nil {
-			var foreign *foreignPVCError
-			if errors.As(err, &foreign) {
-				foreigns = append(foreigns, foreign)
-				continue
-			}
-			return ctrl.Result{}, err
-		}
+	// Storage provenance is PREFLIGHTED for every ordinal before any pod is
+	// created: pods are born with a replica role label, so creating a later
+	// ordinal's pod while an earlier one is foreign would put an unverified
+	// instance behind -ro — and stopping at the first foreign ordinal would
+	// leave a later one's serving pod routed until the earlier was fixed.
+	foreigns, err := r.preflightStorage(ctx, &node)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	if len(foreigns) > 0 {
 		return r.degradeForeignStorage(ctx, &node, foreigns)
+	}
+	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
+		if err := r.ensureInstance(ctx, &node, ordinal); err != nil {
+			// A volume that turned foreign BETWEEN the preflight and here is a
+			// race; the retry's preflight degrades it properly.
+			var foreign *foreignPVCError
+			if errors.As(err, &foreign) {
+				return r.degradeForeignStorage(ctx, &node, []*foreignPVCError{foreign})
+			}
+			return ctrl.Result{}, err
+		}
 	}
 	if err := r.clearStorageProvenance(ctx, &node); err != nil {
 		return ctrl.Result{}, err
@@ -314,6 +319,33 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		return fmt.Errorf("pvc %s: %w", pvcName, err)
 	}
 	return nil
+}
+
+// preflightStorage verifies every ordinal's claims before any pod exists,
+// collecting all foreign volumes so they degrade together.
+func (r *PgShardNodeReconciler) preflightStorage(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) ([]*foreignPVCError, error) {
+	var foreigns []*foreignPVCError
+	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
+		name := nodeInstanceName(node, ordinal)
+		claims := []string{name + "-data"}
+		if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
+			claims = append(claims, name+"-wal")
+		}
+		for _, claim := range claims {
+			if err := r.ensurePVC(ctx, node, claim); err != nil {
+				var foreign *foreignPVCError
+				if errors.As(err, &foreign) {
+					foreign.pod = name
+					foreigns = append(foreigns, foreign)
+					continue
+				}
+				return nil, err
+			}
+		}
+	}
+	return foreigns, nil
 }
 
 // tagForeignPod stamps the pod that would mount a foreign PVC onto the typed

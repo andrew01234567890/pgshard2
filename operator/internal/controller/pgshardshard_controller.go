@@ -301,6 +301,13 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		}
 		return
 	}
+	// The node and pod reads are not an atomic snapshot: a same-named pod
+	// owned by a DIFFERENT node incarnation (the node was just recreated)
+	// must not be dialed — an adoption grant scoped to the node we read
+	// could otherwise re-stamp the replacement's unverified database.
+	if !metav1.IsControlledBy(&pod, node) {
+		return
+	}
 	if pod.Status.PodIP == "" {
 		return
 	}

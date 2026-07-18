@@ -111,6 +111,46 @@ var _ = Describe("PgShardNode storage provenance", func() {
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 
+	It("creates no pod at all while any ordinal's storage is foreign", func() {
+		// Pods are born with a replica role label: creating ordinal 1's pod
+		// while ordinal 0 is foreign would put an unverified instance behind
+		// -ro. The preflight must block ALL pod creation, not just ordinal 0's.
+		const nodeName = "prenode"
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-0-data", Namespace: ns},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		r := &PgShardNodeReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+		}
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: nodeName, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		for i := range 2 {
+			var pod corev1.Pod
+			getErr := k8sClient.Get(ctx, types.NamespacedName{
+				Name: fmt.Sprintf("%s-%d", nodeName, i), Namespace: ns}, &pod)
+			Expect(apierrors.IsNotFound(getErr)).To(BeTrue(),
+				"no ordinal's pod may exist while any storage is foreign")
+		}
+		var got pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
+
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
 	It("does not treat a concurrently-created (unverified) PVC as mountable", func() {
 		// A stale informer can miss an existing claim: Get says NotFound, the
 		// live Create answers AlreadyExists. That claim has NOT been verified,

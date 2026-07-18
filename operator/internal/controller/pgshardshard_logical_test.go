@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -28,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
@@ -36,8 +36,9 @@ import (
 
 var _ = Describe("PgShardShard placed on a node", func() {
 	const (
-		ns      = "default"
-		shardNm = "logshard"
+		ns        = "default"
+		shardNm   = "logshard"
+		fixtureIP = "10.0.0.9"
 	)
 
 	It("mirrors its node's health and creates no physical objects", func() {
@@ -112,15 +113,17 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		node.Status.CurrentPrimary = dbNode + "-0"
 		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
-		// The primary pod must have an address for the controller to dial.
+		// The primary pod must have an address AND be controlled by this node
+		// incarnation for the controller to dial it.
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: dbNode + "-0", Namespace: ns},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{
-				{Name: "postgres", Image: "pg"},
+				{Name: portNamePostgres, Image: "pg"},
 			}},
 		}
+		Expect(controllerutil.SetControllerReference(node, pod, k8sClient.Scheme())).To(Succeed())
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		pod.Status.PodIP = "10.0.0.9"
+		pod.Status.PodIP = fixtureIP
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
 		const dbShard = "dbshard"
@@ -176,21 +179,34 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		fresh.Status.Phase = pgshardv1alpha1.NodeReady
 		fresh.Status.CurrentPrimary = dbNode + "-0"
 		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
-		// While re-verification FAILS (the agent is unreachable), the stale
-		// DatabaseReady=True from the previous incarnation must not keep the
-		// replacement routable.
-		workingDial := r.dialAgent
-		r.dialAgent = func(string, int32) (pgshardv1.AgentServiceClient, error) {
-			return nil, fmt.Errorf("agent unreachable")
-		}
+
+		// The old incarnation's same-named pod is still around: it must not
+		// be dialed for the NEW node — the node and pod reads are not an
+		// atomic snapshot, and an adoption grant could otherwise re-stamp the
+		// wrong instance's database. The stale True must not keep it routable
+		// either.
+		callsBefore = len(agent.Calls)
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
+		Expect(agent.Calls).To(HaveLen(callsBefore),
+			"a pod owned by another node incarnation must not be dialed")
 		var unverified pgshardv1alpha1.PgShardShard
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &unverified)).To(Succeed())
 		Expect(unverified.Status.CurrentPrimary).To(BeEmpty(),
 			"a stale True condition must not route an unverified replacement node")
 
-		r.dialAgent = workingDial
+		// The fresh incarnation gets its own pod: re-verification proceeds.
+		Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		fresh2 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: dbNode + "-0", Namespace: ns},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: portNamePostgres, Image: "pg"},
+			}},
+		}
+		Expect(controllerutil.SetControllerReference(fresh, fresh2, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, fresh2)).To(Succeed())
+		fresh2.Status.PodIP = fixtureIP
+		Expect(k8sClient.Status().Update(ctx, fresh2)).To(Succeed())
 		callsBefore = len(agent.Calls)
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -214,11 +230,12 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "stalenode-0", Namespace: ns},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{
-				{Name: "postgres", Image: "pg"},
+				{Name: portNamePostgres, Image: "pg"},
 			}},
 		}
+		Expect(controllerutil.SetControllerReference(node, pod, k8sClient.Scheme())).To(Succeed())
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		pod.Status.PodIP = "10.0.0.9"
+		pod.Status.PodIP = fixtureIP
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
 		// A retained database from an earlier placement: same name, different
