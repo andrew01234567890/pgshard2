@@ -264,15 +264,15 @@ func TestAssessIdentity(t *testing.T) {
 			wantKept: []string{"p0", "p1"},
 		},
 		{
-			name: "pre-latch conflict: election disabled and any claimant is stripped, never published",
+			name: "pre-latch conflict: EVERY instance is stripped — either lineage could be the intruder",
 			views: []instanceView{
 				{pod: "p0", isPrimary: true, observed: true, systemID: 9999},
 				{pod: "p1", isStandby: true, observed: true, systemID: 4242},
 			},
 			in:           identityInputs{},
 			wantKept:     []string{"p0", "p1"},
-			wantStripped: []string{"p0"},
-			wantFenced:   1,
+			wantStripped: []string{"p0", "p1"},
+			wantFenced:   2,
 			wantConflict: true,
 			wantSuppress: true,
 		},
@@ -390,6 +390,20 @@ func TestAssessIdentity(t *testing.T) {
 			wantKept: []string{"p0"},
 		},
 		{
+			name: "even the TRUSTED pod name behind the recorded timeline is a stale fork, never published",
+			views: []instanceView{
+				// The old primary's name returns on an old backup of the SAME
+				// cluster: matching id, timeline behind the record. Publishing
+				// it would silently discard acknowledged writes.
+				{pod: "p0", isPrimary: true, ready: true, observed: true, systemID: 4242, timeline: 3},
+			},
+			in:           identityInputs{systemID: 4242, timeline: 7, current: "p0"},
+			wantKept:     []string{"p0"},
+			wantStripped: []string{"p0"},
+			wantFenced:   1,
+			wantSuppress: true,
+		},
+		{
 			name: "a trusted pod NAME returning on a foreign volume is still foreign",
 			views: []instanceView{
 				{pod: "p0", isPrimary: true, ready: true, observed: true, systemID: 9999, timeline: 9},
@@ -488,6 +502,44 @@ func TestIdentityConditionReportsIncompleteObservation(t *testing.T) {
 	if cond == nil || cond.Status != "Unknown" || cond.Reason != "IncompleteObservation" {
 		t.Fatalf("condition = %+v, want Unknown/IncompleteObservation", cond)
 	}
+}
+
+func TestLatchIdentity(t *testing.T) {
+	t.Run("latches only from a trusted claimant with a nonzero id", func(t *testing.T) {
+		views := []instanceView{
+			{pod: "p9", isPrimary: true, observed: true, systemID: 9999, timeline: 5}, // unsolicited
+			{pod: "p0", isPrimary: true, observed: true, systemID: 4242, timeline: 2},
+		}
+		id, expected, tl, err := latchIdentity(views, "p0", "", "", 0)
+		if err != nil || id != "4242" || expected != 4242 || tl != 2 {
+			t.Fatalf("latch = (%q,%d,%d,%v), want only the trusted claimant to latch", id, expected, tl, err)
+		}
+		id, expected, tl, err = latchIdentity(views, "", "", "", 0)
+		if err != nil || id != "" || expected != 0 || tl != 0 {
+			t.Fatalf("latch = (%q,%d,%d,%v), want no latch without any trusted claimant", id, expected, tl, err)
+		}
+	})
+	t.Run("a trusted pod NAME on a foreign volume cannot launder its timeline", func(t *testing.T) {
+		views := []instanceView{
+			{pod: "p0", isPrimary: true, observed: true, systemID: 9999, timeline: 9},
+		}
+		id, _, tl, err := latchIdentity(views, "p0", "", "4242", 1)
+		if err != nil || id != "4242" || tl != 1 {
+			t.Fatalf("latch = (%q,tl %d,%v), want the record untouched by a foreign impostor", id, tl, err)
+		}
+	})
+	t.Run("the recorded timeline never regresses, even for a trusted matching claimant", func(t *testing.T) {
+		views := []instanceView{
+			// The trusted name returns on an OLD BACKUP of the same cluster:
+			// matching id, stale timeline. Accepting 3 would make the fork
+			// look current and publish it through -rw.
+			{pod: "p0", isPrimary: true, observed: true, systemID: 4242, timeline: 3},
+		}
+		_, _, tl, err := latchIdentity(views, "p0", "", "4242", 7)
+		if err != nil || tl != 7 {
+			t.Fatalf("timeline = (%d,%v), want the record held at 7", tl, err)
+		}
+	})
 }
 
 func TestParseLatchedID(t *testing.T) {

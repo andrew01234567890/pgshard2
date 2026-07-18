@@ -137,6 +137,10 @@ type identityAssessment struct {
 	// report more than one distinct nonzero system id: there is no way to
 	// tell which lineage is this node's, so no election may run at all.
 	conflict bool
+	// blocked: a same-lineage view with a questionable identity (ahead
+	// timeline or unreported id) is parking the election. The resource must
+	// read Degraded, not Ready, while it persists.
+	blocked bool
 	// anyStartedUnobserved: a pod with an assigned address could not be
 	// polled, so the identity attestation this poll is incomplete (a known
 	// rogue may merely be unreachable).
@@ -201,12 +205,15 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 		}
 		a.conflict = len(ids) > 1
 		if a.conflict {
+			// EVERY instance is unrecognized during a conflict — either
+			// lineage could be the intruder, so no role may be believed: a
+			// claimant must not be published (it would then be trusted and
+			// latch itself next poll) and a standby must not keep serving
+			// reads through -ro.
 			for _, v := range views {
-				if v.isPrimary {
-					a.unrecognized = append(a.unrecognized, v.pod)
-					a.fenced = append(a.fenced, fmt.Sprintf(
-						"%s (claims primary during an unresolved identity conflict)", v.pod))
-				}
+				a.unrecognized = append(a.unrecognized, v.pod)
+				a.fenced = append(a.fenced, fmt.Sprintf(
+					"%s (unresolved bootstrap identity conflict)", v.pod))
 			}
 			a.suppressPrimary = true
 		}
@@ -217,8 +224,13 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 		foreign := v.systemID != 0 && v.systemID != in.systemID
 		unknown := v.observed && v.systemID == 0
 		ahead := in.timeline != 0 && v.timeline > in.timeline
-		vouched := v.pod == in.current ||
-			(v.systemID == in.systemID && in.timeline != 0 && v.timeline == in.timeline)
+		// A claimant is vouched for ONLY by its full identity: latched id on
+		// exactly the recorded timeline. A trusted pod NAME is deliberately
+		// not enough — the same name can return on an old backup of the same
+		// cluster (matching id, BEHIND timeline: a stale fork whose
+		// publication would discard acknowledged writes) and the recorded
+		// timeline never regresses to meet it.
+		vouched := v.systemID == in.systemID && in.timeline != 0 && v.timeline == in.timeline
 		switch {
 		case v.pod == in.committed && in.committed != "" && !foreign:
 			a.kept = append(a.kept, v)
@@ -253,6 +265,7 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 			}
 			a.unrecognized = append(a.unrecognized, v.pod)
 			a.fenced = append(a.fenced, fmt.Sprintf("%s (%s)", v.pod, reason))
+			a.blocked = true
 			blocked := v
 			blocked.isPrimary = false
 			blocked.isStandby = false
@@ -304,7 +317,11 @@ func latchIdentity(
 			systemID = strconv.FormatUint(v.systemID, 10)
 			expectedID = v.systemID
 		}
-		if v.systemID == expectedID && v.timeline != 0 {
+		// The recorded timeline only ever ADVANCES: a trusted pod name
+		// returning on an old backup of the same cluster (matching id, lower
+		// timeline) must not drag the record back to its stale fork — the
+		// assessment then fences it as an off-timeline claimant.
+		if v.systemID == expectedID && v.timeline > tl {
 			tl = v.timeline
 		}
 	}

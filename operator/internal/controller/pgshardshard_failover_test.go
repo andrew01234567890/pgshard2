@@ -455,15 +455,23 @@ var _ = Describe("PgShardShard failover", func() {
 		Expect(idCond).NotTo(BeNil())
 		Expect(string(idCond.Status)).To(Equal("True"))
 
+		// refail-0's volume is swapped for another lineage's while it idles as
+		// a ready standby with the HIGHEST raw LSN: the legacy shard path must
+		// fence it from the election exactly like the node path.
+		n0.SetReady(true)
+		n0.SetSystemID(9999)
+		n0.SetReceivedLSN(999)
+
 		// Second failover: the new primary's pod is removed (node failure). The
-		// caught-up refail-2 must be elected — not parked forever on the stale,
-		// now-gone commitment to refail-1.
+		// caught-up refail-2 must be elected — not the foreign refail-0, and
+		// not parked forever on the stale, now-gone commitment to refail-1.
 		var p1 corev1.Pod
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "refail-1", Namespace: ns}, &p1)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &p1)).To(Succeed())
 
 		reconcile() // recreates refail-1 (no IP), elects refail-2
-		Expect(get().Status.TargetPrimary).To(Equal("refail-2"))
+		Expect(get().Status.TargetPrimary).To(Equal("refail-2"),
+			"the foreign-identity standby must never win the legacy shard election")
 		reconcile() // promote refail-2
 		Expect(n2.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
 

@@ -388,6 +388,13 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(string(cond.Status)).To(Equal("False"))
 		Expect(cond.Message).To(ContainSubstring("idnode-2"))
+		// The foreign instance also loses its replica label: its reads are
+		// another database's data, so -ro must not route to it — including
+		// through the sticky-label blip branch.
+		var fencedPod corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "idnode-2", Namespace: ns}, &fencedPod)).To(Succeed())
+		Expect(fencedPod.Labels).NotTo(HaveKey(labelRole),
+			"a fenced instance must be pulled out of read routing")
 
 		// A timeline AHEAD of the recorded one (a self-promoted split-brain
 		// artifact) is fenced the same way: make the previously-foreign agent
@@ -471,6 +478,157 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		Expect(get().Status.SystemID).To(Equal("4242"))
 
 		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
+	})
+
+	It("strips read routing and gates the election while bootstrap identities conflict", func() {
+		const csNode = "conflictstandbys"
+		a, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(a.Stop)
+		b, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(b.Stop)
+		// Not ready yet, so the agreeing phase confirms roles (and applies
+		// replica labels) without an election committing to anything.
+		a.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		b.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		a.SetReady(false)
+		b.SetReady(false)
+		a.SetReceivedLSN(100)
+		b.SetReceivedLSN(500)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return a.Client()
+			}
+			return b.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		Expect(k8sClient.Create(ctx, &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: csNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		})).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: csNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: csNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+		labelOf := func(pod string) string {
+			var p corev1.Pod
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: pod, Namespace: ns}, &p)).To(Succeed())
+			return p.Labels[labelRole]
+		}
+
+		reconcile()
+		stampPodIP(csNode+"-0", primaryPodIP)
+		stampPodIP(csNode+"-1", replicaPodIP)
+		reconcile()
+		Expect(labelOf(csNode+"-1")).To(Equal(roleLabelReplica), "agreeing standbys serve reads")
+
+		// Pod 1's volume is swapped for another lineage's before any identity
+		// latched, and both standbys become ready — the exact snapshot an
+		// unfenced election would elect from. Either read is possibly wrong
+		// data and electing by raw LSN could promote the intruder, so BOTH
+		// routing and the election must stop.
+		b.SetSystemID(9999)
+		a.SetReady(true)
+		b.SetReady(true)
+		for range 2 {
+			reconcile()
+			got := get()
+			Expect(got.Status.TargetPrimary).To(BeEmpty(),
+				"no election may run across conflicting identities")
+			Expect(got.Status.CurrentPrimary).To(BeEmpty())
+		}
+		Expect(labelOf(csNode+"-0")).To(BeEmpty(), "conflicting standbys lose read routing")
+		Expect(labelOf(csNode + "-1")).To(BeEmpty())
+
+		// The intruder is rebuilt onto the right lineage: the gate lifts and
+		// the election proceeds normally.
+		b.SetSystemID(4242)
+		reconcile()
+		Expect(get().Status.TargetPrimary).To(Equal(csNode+"-1"),
+			"once identities agree, the most-advanced standby is electable again")
+
+		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+
+	It("suppresses primary publication while a same-lineage rogue claimant lives", func() {
+		const sbNode = "suppressnode"
+		legit, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(legit.Stop)
+		rogue, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(rogue.Stop)
+		legit.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		rogue.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+
+		dial := func(host string, _ int32) (pgshardv1.AgentServiceClient, error) {
+			if host == primaryPodIP {
+				return legit.Client()
+			}
+			return rogue.Client()
+		}
+		r := &PgShardNodeReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Images:    ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: dial,
+		}
+		Expect(k8sClient.Create(ctx, &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: sbNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 2},
+		})).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: sbNode, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		get := func() pgshardv1alpha1.PgShardNode {
+			var got pgshardv1alpha1.PgShardNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sbNode, Namespace: ns}, &got)).To(Succeed())
+			return got
+		}
+
+		reconcile()
+		stampPodIP(sbNode+"-0", primaryPodIP)
+		stampPodIP(sbNode+"-1", replicaPodIP)
+		reconcile() // confirm the primary
+		reconcile() // latch from the now-trusted claimant
+		Expect(get().Status.CurrentPrimary).To(Equal(sbNode + "-0"))
+		Expect(get().Status.SystemID).To(Equal("4242"))
+
+		// Pod 1 self-promotes (same lineage, timeline ahead): a genuine
+		// split-brain that may be absorbing writes. NEITHER claimant may be
+		// published until it is resolved — the trusted one included, because
+		// clients cannot be split between two live primaries.
+		rogue.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+		rogue.SetTimeline(9)
+		reconcile()
+		suppressed := get()
+		Expect(suppressed.Status.CurrentPrimary).To(BeEmpty(),
+			"no primary is published while a same-lineage rogue claimant lives")
+		Expect(suppressed.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
+
+		// The rogue demotes back to a standby: still on an ahead timeline it
+		// stays fenced as a blocker, but the legitimate primary — matching id
+		// on exactly the recorded timeline — is published again.
+		rogue.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY)
+		reconcile()
+		recovered := get()
+		Expect(recovered.Status.CurrentPrimary).To(Equal(sbNode + "-0"))
+
+		Expect(k8sClient.Delete(ctx, &recovered)).To(Succeed())
 	})
 
 	It("never publishes a sole foreign claimant as CurrentPrimary", func() {

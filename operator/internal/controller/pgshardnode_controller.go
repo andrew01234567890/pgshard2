@@ -102,12 +102,16 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	readyReplicas, fenced, err := r.aggregateStatus(ctx, &node)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	// Role labels are synced even when aggregation errored mid-way (a failed
+	// Promote or status write): the assessment may have just fenced an
+	// instance, and leaving its -rw/-ro label standing until a lucky retry
+	// would keep routing to data we already know is wrong.
+	readyReplicas, fenced, aggErr := r.aggregateStatus(ctx, &node)
 	if err := r.syncRoleLabels(ctx, &node, fenced); err != nil {
 		return ctrl.Result{}, err
+	}
+	if aggErr != nil {
+		return ctrl.Result{}, aggErr
 	}
 	// Prune only the pods this reconcile confirmed are ready replicas — never a
 	// just-promoted, unpollable, or foreign pod.
@@ -500,9 +504,12 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 		deriveNodeStatus(instances, node.Spec.Replicas, before.CurrentPrimary != "", node.Name+"-")
 	// A same-lineage claimant dispute (or a pre-latch identity conflict)
 	// means writes may be landing somewhere we cannot vouch for: publish no
-	// primary at all until it is resolved.
+	// primary at all until it is resolved. An identity blocker parking the
+	// election is likewise not a Ready node, whatever the ordinal health.
 	if assessment.suppressPrimary {
 		node.Status.CurrentPrimary = ""
+	}
+	if assessment.suppressPrimary || assessment.blocked {
 		node.Status.Phase = pgshardv1alpha1.NodeDegraded
 	}
 
@@ -519,10 +526,13 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	for _, pod := range assessment.unrecognized {
 		fencedPods[pod] = true
 	}
+	// A failover error (failed Promote, conflicting status write) must not
+	// abort the poll's safety output: the caller still needs the fenced set
+	// and the status this poll computed, so the write below is attempted and
+	// the error propagated afterwards.
+	var failoverErr error
 	if parseErr == nil && !assessment.conflict {
-		if err := r.reconcileFailover(ctx, node, assessment.kept); err != nil {
-			return nil, nil, err
-		}
+		failoverErr = r.reconcileFailover(ctx, node, assessment.kept)
 	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a
@@ -538,10 +548,12 @@ func (r *PgShardNodeReconciler) aggregateStatus(
 	// own resource, so an unconditional write on every poll (WAL LSNs advance
 	// with every commit) would re-enqueue immediately and spin a hot loop under
 	// write traffic.
-	if apiequality.Semantic.DeepEqual(before, &node.Status) {
-		return readyReplicas, fencedPods, nil
+	if !apiequality.Semantic.DeepEqual(before, &node.Status) {
+		if err := client.IgnoreNotFound(r.Status().Update(ctx, node)); err != nil && failoverErr == nil {
+			failoverErr = err
+		}
 	}
-	return readyReplicas, fencedPods, client.IgnoreNotFound(r.Status().Update(ctx, node))
+	return readyReplicas, fencedPods, failoverErr
 }
 
 // deriveNodeStatus computes the current primary and phase from polled instance
