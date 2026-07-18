@@ -340,6 +340,44 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     registry.start(&unpublished, &config).await?;
     wait_for_error(&registry, "wf_unpub", "publication").await;
 
+    // A publication with a disabled DML kind, a row filter, or a column list
+    // would silently omit or transform streamed changes.
+    source
+        .batch_execute(
+            "CREATE PUBLICATION pub_ins FOR TABLE orders WITH (publish = 'insert');
+             CREATE PUBLICATION pub_filt FOR TABLE orders WHERE (id > 0);
+             CREATE PUBLICATION pub_cols FOR TABLE orders (id);",
+        )
+        .await?;
+    let mut insert_only = spec(&pg, "wf_ins", "pgshard_ins");
+    insert_only.publication = "pub_ins".into();
+    registry.start(&insert_only, &config).await?;
+    wait_for_error(&registry, "wf_ins", "does not publish all").await;
+
+    let mut filtered = spec(&pg, "wf_filt", "pgshard_filt");
+    filtered.publication = "pub_filt".into();
+    registry.start(&filtered, &config).await?;
+    wait_for_error(&registry, "wf_filt", "filters rows").await;
+
+    let mut col_listed = spec(&pg, "wf_cols", "pgshard_cols");
+    col_listed.publication = "pub_cols".into();
+    registry.start(&col_listed, &config).await?;
+    wait_for_error(&registry, "wf_cols", "omits column").await;
+
+    // REPLICA IDENTITY FULL is refused up front: the applier cannot apply
+    // FULL-identity updates/deletes, so accepting it would re-seed
+    // destructively and then fail on the first mutation.
+    source
+        .batch_execute("ALTER TABLE orders REPLICA IDENTITY FULL")
+        .await?;
+    registry
+        .start(&spec(&pg, "wf_full", "pgshard_full"), &config)
+        .await?;
+    wait_for_error(&registry, "wf_full", "replica identity").await;
+    source
+        .batch_execute("ALTER TABLE orders REPLICA IDENTITY DEFAULT")
+        .await?;
+
     let survivors: i64 = target
         .query_one("SELECT count(*) FROM orders", &[])
         .await?
@@ -440,5 +478,72 @@ async fn update_moving_the_shard_key_across_the_boundary_fails_loudly() -> anyho
         )
         .await?;
     wait_for_error(&registry, "wf_move", "across the target range boundary").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_replica_identity_mid_stream_fails_loudly() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION seed_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
+    let target_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=shard_target",
+        pg.host(),
+        pg.port()
+    );
+    let (target, conn) = tokio_postgres::connect(&target_conn, tokio_postgres::NoTls).await?;
+    tokio::spawn(conn);
+    target
+        .batch_execute("CREATE TABLE orders (id int PRIMARY KEY, note text)")
+        .await?;
+
+    let in_range = (1..100).find(|id| in_upper_half(*id)).unwrap();
+    source
+        .execute("INSERT INTO orders VALUES ($1, 'kept')", &[&in_range])
+        .await?;
+
+    let config = WorkflowConfig {
+        target: format!(
+            "host={} port={} user=postgres password=postgres",
+            pg.host(),
+            pg.port()
+        )
+        .parse()?,
+        source_user: "postgres".into(),
+        source_password: "postgres".into(),
+    };
+    let registry = WorkflowRegistry::default();
+    registry
+        .start(&spec(&pg, "wf_ident", "pgshard_ident"), &config)
+        .await?;
+    wait_for(&registry, "wf_ident", "the streaming phase", |s| {
+        s.phase == v1::WorkflowPhase::Streaming as i32
+    })
+    .await;
+
+    // Preflight passed with the PK identity; the ALTER re-sends the Relation
+    // with FULL, under which the stream can no longer see shard-key changes
+    // the way the boundary check needs — it must fail, not guess.
+    source
+        .batch_execute("ALTER TABLE orders REPLICA IDENTITY FULL")
+        .await?;
+    source
+        .execute(
+            "UPDATE orders SET note = 'poked' WHERE id = $1",
+            &[&in_range],
+        )
+        .await?;
+    wait_for_error(&registry, "wf_ident", "no longer covers shard key").await;
     Ok(())
 }

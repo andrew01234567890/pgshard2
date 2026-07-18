@@ -165,6 +165,12 @@ fn plan(spec: &v1::WorkflowSpec, config: &WorkflowConfig) -> Result<RunPlan, Wor
         .ok_or_else(|| {
             WorkflowError::Invalid("source_primary host/port/database are required".into())
         })?;
+    if source.port > u16::MAX as u32 {
+        return invalid(format!(
+            "source_primary port {} is out of range",
+            source.port
+        ));
+    }
     // Standby sourcing needs the anchor-slot machinery; be honest until then.
     if spec.source_policy != v1::SourcePolicy::Primary as i32
         && spec.source_policy != v1::SourcePolicy::Unspecified as i32
@@ -415,47 +421,68 @@ async fn preflight(
         expected,
     );
 
-    // The publication must cover EXACTLY the mapped tables: a mapped table
-    // missing from it would be seeded once and then silently never receive
-    // changes (stale data); an unmapped table in it would kill the stream
-    // mid-flight after seeding.
-    let published: Vec<(String, String)> = source_sql
+    // The publication must republish EVERYTHING: all DML kinds (a disabled
+    // kind is silently omitted — TRUNCATE included, so a source truncate
+    // reaches the stream and fails loudly instead of silently diverging),
+    // no row filter (it would drop changes the copy included), and no column
+    // list (it would transform rows). And it must cover EXACTLY the mapped
+    // tables: a mapped table missing from it would be seeded once and then
+    // silently never receive changes; an unmapped table in it would kill the
+    // stream mid-flight after seeding.
+    let pub_row = source_sql
+        .query_opt(
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate
+             FROM pg_publication WHERE pubname = $1",
+            &[&run.publication],
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "publication {} does not exist on the source",
+                run.publication
+            )
+        })?;
+    let (ins, upd, del, trunc): (bool, bool, bool, bool) = (
+        pub_row.get(0),
+        pub_row.get(1),
+        pub_row.get(2),
+        pub_row.get(3),
+    );
+    anyhow::ensure!(
+        ins && upd && del && trunc,
+        "publication {} does not publish all of insert/update/delete/truncate: disabled kinds would be silently omitted from the stream",
+        run.publication
+    );
+    let published: Vec<(String, String, Option<Vec<String>>, Option<String>)> = source_sql
         .query(
-            "SELECT schemaname::text, tablename::text FROM pg_publication_tables
-             WHERE pubname = $1",
+            "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
+             FROM pg_publication_tables WHERE pubname = $1",
             &[&run.publication],
         )
         .await?
         .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
         .collect();
-    let pub_exists: bool = source_sql
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
-            &[&run.publication],
-        )
-        .await?
-        .get(0);
-    anyhow::ensure!(
-        !published.is_empty() || pub_exists,
-        "publication {} does not exist on the source",
-        run.publication
-    );
     for table in &run.tables {
         anyhow::ensure!(
             published
                 .iter()
-                .any(|(s, n)| *s == table.schema && *n == table.name),
+                .any(|(s, n, ..)| *s == table.schema && *n == table.name),
             "table {}.{} is not in publication {}: it would be seeded once and then never receive changes",
             table.schema,
             table.name,
             run.publication
         );
     }
-    for (s, n) in &published {
+    for (s, n, _, rowfilter) in &published {
         anyhow::ensure!(
             run.tables.iter().any(|t| t.schema == *s && t.name == *n),
             "publication {} carries unmapped table {s}.{n}: the stream would fail after seeding",
+            run.publication
+        );
+        anyhow::ensure!(
+            rowfilter.is_none(),
+            "publication {} filters rows of {s}.{n}: the stream would silently drop changes the seed copy included",
             run.publication
         );
     }
@@ -482,6 +509,52 @@ async fn preflight(
             table.schema,
             table.name
         );
+        // A column list on the publication would stream a transformed row
+        // shape; the seed copy takes every column, so the stream must too.
+        if let Some((.., Some(attnames), _)) = published
+            .iter()
+            .find(|(s, n, ..)| *s == table.schema && *n == table.name)
+        {
+            for (name, _) in &cols {
+                anyhow::ensure!(
+                    attnames.contains(name),
+                    "publication {} omits column {name} of {}.{}: streamed rows would be silently transformed",
+                    run.publication,
+                    table.schema,
+                    table.name
+                );
+            }
+        }
+        // Missing target tables/columns must surface before the slot is
+        // replaced or anything is truncated, not one table into the seed.
+        let target_cols: Vec<String> = target_sql
+            .query(
+                "SELECT a.attname::text FROM pg_attribute a
+                 JOIN pg_class c ON c.oid = a.attrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2
+                   AND a.attnum > 0 AND NOT a.attisdropped",
+                &[&table.schema, &table.name],
+            )
+            .await?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+        anyhow::ensure!(
+            !target_cols.is_empty(),
+            "target table {}.{} does not exist in {}",
+            table.schema,
+            table.name,
+            run.target_database
+        );
+        for (name, _) in &cols {
+            anyhow::ensure!(
+                target_cols.contains(name),
+                "target table {}.{} is missing column {name}",
+                table.schema,
+                table.name
+            );
+        }
         let key_oid = cols
             .iter()
             .find(|(name, _)| *name == table.shard_key_column)
@@ -516,16 +589,20 @@ async fn preflight(
             .await?
             .get(0);
         match replident as u8 {
-            b'f' => {}
             b'd' | b'i' => {
                 let use_replident = replident as u8 == b'i';
+                // Only the first indnkeyatts index columns are identity KEY
+                // columns; INCLUDE payload columns never appear in the old
+                // tuple, so counting them would let a shard-key change slip
+                // past the boundary check unseen.
                 let identity_cols: Vec<String> = source_sql
                     .query(
                         "SELECT a.attname::text FROM pg_index i
                          JOIN pg_class c ON c.oid = i.indrelid
                          JOIN pg_namespace n ON n.oid = c.relnamespace
                          JOIN pg_attribute a
-                           ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                           ON a.attrelid = c.oid
+                          AND a.attnum = ANY((i.indkey)[0:i.indnkeyatts - 1])
                          WHERE n.nspname = $1 AND c.relname = $2
                            AND (CASE WHEN $3 THEN i.indisreplident ELSE i.indisprimary END)",
                         &[&table.schema, &table.name, &use_replident],
@@ -542,8 +619,11 @@ async fn preflight(
                     table.shard_key_column
                 );
             }
+            // 'f' (FULL) is rejected too: the applier refuses FULL-identity
+            // updates/deletes, so accepting it here would destructively
+            // re-seed and then fail on the first mutation.
             other => anyhow::bail!(
-                "table {}.{} has replica identity {:?}: updates and deletes could not be streamed",
+                "table {}.{} has replica identity {:?} (need default or a replident index covering the shard key): updates and deletes could not be applied",
                 table.schema,
                 table.name,
                 other as char
@@ -584,7 +664,8 @@ async fn run_workflow(
         )
         .await?
     {
-        let (active, plugin, database): (bool, String, String) =
+        // plugin/database are NULL for physical slots — those are never ours.
+        let (active, plugin, database): (bool, Option<String>, Option<String>) =
             (row.get(0), row.get(1), row.get(2));
         anyhow::ensure!(
             !active,
@@ -592,7 +673,8 @@ async fn run_workflow(
             run.slot
         );
         anyhow::ensure!(
-            plugin == "pgoutput" && database == run.source.database,
+            plugin.as_deref() == Some("pgoutput")
+                && database.as_deref() == Some(run.source.database.as_str()),
             "slot {} belongs to plugin {plugin:?} on database {database:?}, not this workflow: refusing to drop it",
             run.slot
         );
@@ -712,8 +794,11 @@ async fn run_workflow(
                         )
                     })?;
                 let key_index = shard_key_index(rel, &table.shard_key_column)?;
-                // A mid-stream ALTER COLUMN TYPE re-sends the Relation; the
-                // preflighted type soundness must hold for the LIVE type too.
+                // A mid-stream ALTER re-sends the Relation; the preflighted
+                // guarantees must hold for the LIVE table too — both the
+                // shard key's type and the replica identity covering it (an
+                // uncovered key change ships no old tuple, so a boundary
+                // crossing would slip past the update check unseen).
                 let key_oid = rel.columns[key_index].type_oid;
                 anyhow::ensure!(
                     allowed_key_oids(table.shard_key_type).contains(&key_oid),
@@ -722,6 +807,14 @@ async fn run_workflow(
                     rel.name,
                     table.shard_key_column,
                     table.shard_key_type,
+                );
+                anyhow::ensure!(
+                    matches!(rel.replica_identity, b'd' | b'i')
+                        && rel.columns[key_index].flags & 1 == 1,
+                    "replica identity of {}.{} no longer covers shard key {}: updates and deletes could not be range-filtered",
+                    rel.namespace,
+                    rel.name,
+                    table.shard_key_column,
                 );
                 relations.insert(
                     rel.oid,
