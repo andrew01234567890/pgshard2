@@ -241,6 +241,12 @@ type PgShardShardStatus struct {
 	// +optional
 	Timeline int32 `json:"timeline,omitempty"`
 
+	// SystemID mirrors PgShardNodeStatus.SystemID for the legacy physical
+	// (un-placed) shard path: the latched PostgreSQL system identifier of the
+	// data lineage, as a decimal string.
+	// +optional
+	SystemID string `json:"systemID,omitempty"`
+
 	// +optional
 	Instances []InstanceState `json:"instances,omitempty"`
 

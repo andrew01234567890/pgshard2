@@ -409,6 +409,12 @@ spec:
                 type: string
               stanzaInitialized:
                 type: boolean
+              systemID:
+                description: |-
+                  SystemID mirrors PgShardNodeStatus.SystemID for the legacy physical
+                  (un-placed) shard path: the latched PostgreSQL system identifier of the
+                  data lineage, as a decimal string.
+                type: string
               targetPrimary:
                 type: string
               targetPrimaryTimestamp:

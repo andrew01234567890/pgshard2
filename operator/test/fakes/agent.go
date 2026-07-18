@@ -77,6 +77,20 @@ func (f *FakeAgent) SetReceivedLSN(value uint64) {
 	f.Status.WalReceiveLsn = &pgshardv1.Lsn{Value: value}
 }
 
+// SetSystemID models a foreign data lineage (a reused PVC, a restore).
+func (f *FakeAgent) SetSystemID(id uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.SystemId = id
+}
+
+// SetTimeline models an instance on a divergent WAL timeline.
+func (f *FakeAgent) SetTimeline(tl uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.Timeline = tl
+}
+
 // Role reads the current instance role.
 func (f *FakeAgent) Role() pgshardv1.InstanceRole {
 	f.mu.Lock()
@@ -114,6 +128,9 @@ func NewFakeAgent() (*FakeAgent, error) {
 			Role:     pgshardv1.InstanceRole_INSTANCE_ROLE_STANDBY,
 			Ready:    true,
 			Timeline: 1,
+			// A stable nonzero identity so envtest exercises the identity
+			// fencing; tests set a divergent value to model a foreign PVC.
+			SystemId: 4242,
 		},
 		executedSchemaOps: map[string]string{},
 		databases:         map[string]string{},

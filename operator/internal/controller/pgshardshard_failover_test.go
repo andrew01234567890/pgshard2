@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -446,20 +447,90 @@ var _ = Describe("PgShardShard failover", func() {
 		reconcile() // observe: commitment cleared once refail-1 is a ready primary
 		Expect(get().Status.CurrentPrimary).To(Equal("refail-1"))
 		Expect(get().Status.TargetPrimary).To(BeEmpty())
+		// The legacy shard path latches identity and reports it, exactly like
+		// the node path.
+		latched := get()
+		Expect(latched.Status.SystemID).To(Equal("4242"))
+		idCond := apimeta.FindStatusCondition(latched.Status.Conditions, "IdentityConsistent")
+		Expect(idCond).NotTo(BeNil())
+		Expect(string(idCond.Status)).To(Equal("True"))
+
+		// refail-0's volume is swapped for another lineage's while it idles as
+		// a ready standby with the HIGHEST raw LSN: the legacy shard path must
+		// fence it from the election exactly like the node path.
+		n0.SetReady(true)
+		n0.SetSystemID(9999)
+		n0.SetReceivedLSN(999)
 
 		// Second failover: the new primary's pod is removed (node failure). The
-		// caught-up refail-2 must be elected — not parked forever on the stale,
-		// now-gone commitment to refail-1.
+		// caught-up refail-2 must be elected — not the foreign refail-0, and
+		// not parked forever on the stale, now-gone commitment to refail-1.
 		var p1 corev1.Pod
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "refail-1", Namespace: ns}, &p1)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &p1)).To(Succeed())
 
 		reconcile() // recreates refail-1 (no IP), elects refail-2
-		Expect(get().Status.TargetPrimary).To(Equal("refail-2"))
+		Expect(get().Status.TargetPrimary).To(Equal("refail-2"),
+			"the foreign-identity standby must never win the legacy shard election")
 		reconcile() // promote refail-2
 		Expect(n2.Role()).To(Equal(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY))
 
 		got := get()
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+})
+
+var _ = Describe("PgShardShard identity fencing (legacy physical path)", func() {
+	const ns = "default"
+
+	It("refuses every role under an unreadable latched identity", func() {
+		const mlShard = "mlshard"
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		agent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+
+		r := &PgShardShardReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: mlShard, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 1,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: mlShard, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile()
+		stampPodIP(mlShard+"-0", primaryPodIP)
+
+		// A corrupted latch on the legacy shard path: same refusal as the node
+		// path — even a sole healthy claimant loses recognition, not just the
+		// election.
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlShard, Namespace: ns}, &got)).To(Succeed())
+		got.Status.SystemID = "not-a-number"
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+
+		for range 2 {
+			reconcile()
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlShard, Namespace: ns}, &got)).To(Succeed())
+			Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+				"an unverifiable latch must not publish any primary on the legacy path")
+			Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("MalformedIdentity"))
+
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
 })
