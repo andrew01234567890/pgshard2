@@ -81,16 +81,15 @@ pub struct WorkflowHandle {
 }
 
 impl WorkflowHandle {
-    /// A workflow whose status is terminal is replaceable (and holds no claim
-    /// on its target) even if its task has not quite finished unwinding — a
-    /// restart acknowledged against a dying task would otherwise be a success
-    /// with no worker behind it.
-    fn live(&self) -> bool {
-        if self.join.is_finished() {
-            return false;
-        }
+    /// An unfinished task holds its claims — replication session, slot, and
+    /// target database — until it has actually terminated; releasing on the
+    /// terminal STATUS alone would let a replacement race the old worker's
+    /// teardown. A winding-down handle answers Stopping (retryable) instead.
+    fn winding_down(&self) -> bool {
         let phase = self.status.borrow().phase;
-        phase != v1::WorkflowPhase::Error as i32 && phase != v1::WorkflowPhase::Stopped as i32
+        phase == v1::WorkflowPhase::Error as i32
+            || phase == v1::WorkflowPhase::Stopped as i32
+            || *self.stop.borrow()
     }
 }
 
@@ -297,12 +296,13 @@ impl WorkflowRegistry {
         let spec_bytes = spec.encode_to_vec();
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.get(&run.id)
-            && existing.live()
+            && !existing.join.is_finished()
         {
-            // A stop has been signaled but not yet observed: the old worker
-            // may still be mid-copy. Acknowledging a byte-identical restart
-            // now would return success whose only worker is about to exit.
-            if *existing.stop.borrow() {
+            // Terminal status or a signaled stop means the old worker is
+            // winding down but may not have released its sessions yet;
+            // acknowledging a byte-identical restart now would either return
+            // a success with no worker behind it or race the teardown.
+            if existing.winding_down() {
                 return Err(WorkflowError::Stopping(run.id));
             }
             if existing.spec_bytes == spec_bytes {
@@ -312,10 +312,9 @@ impl WorkflowRegistry {
         }
         // One running workflow per target database: seeding truncates, so a
         // second worker under a DIFFERENT id would destroy the first's copy.
-        if let Some((other, _)) = inner
-            .iter()
-            .find(|(id, h)| **id != run.id && h.live() && h.target_database == run.target_database)
-        {
+        if let Some((other, _)) = inner.iter().find(|(id, h)| {
+            **id != run.id && !h.join.is_finished() && h.target_database == run.target_database
+        }) {
             return Err(WorkflowError::TargetBusy(
                 other.clone(),
                 run.target_database,
@@ -465,16 +464,39 @@ struct PublicationShape {
     tables: Vec<PublishedTable>,
 }
 
-/// The publication's validated shape plus the xid horizon fencing xmin reuse:
-/// 32-bit xmins can repeat after 2^32 transactions, so the poll also refuses
-/// to continue once the source has consumed half the xid space since
-/// preflight — long before a captured version could recur.
+/// The publication's validated shape plus the exact xid horizon fencing xmin
+/// reuse: 32-bit xmins recur when the counter wraps back to a captured value,
+/// and freezing PRESERVES old xmins — a row frozen nearly a full wrap ago can
+/// be only a few xids ahead of the counter. `horizon` is the minimum forward
+/// distance from the baseline xid to ANY captured xmin; while fewer xids than
+/// that have been consumed, no new assignment can equal a captured value, so
+/// version equality is proof the row was never rewritten.
 struct PublicationBaseline {
     shape: PublicationShape,
     xid: u64,
+    horizon: u64,
 }
 
-const XID_HORIZON: u64 = 1 << 31;
+/// Forward-recurrence horizon: min over captured xmins of the xid distance
+/// until the counter reaches that value again. Special xids (< 3: bootstrap,
+/// frozen) are never assigned again and do not bound the horizon.
+fn xid_recurrence_horizon(base: u64, versions: &[(i32, u32, String)]) -> anyhow::Result<u64> {
+    let base32 = base as u32;
+    let mut horizon = u64::from(u32::MAX) + 1;
+    for (_, _, xmin) in versions {
+        let v: u32 = xmin
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unparseable catalog xmin {xmin:?}"))?;
+        if v < 3 {
+            continue;
+        }
+        let d = u64::from(v.wrapping_sub(base32));
+        if d > 0 {
+            horizon = horizon.min(d);
+        }
+    }
+    Ok(horizon)
+}
 
 async fn fetch_publication(
     source_sql: &tokio_postgres::Client,
@@ -491,7 +513,7 @@ async fn fetch_publication(
         .await?
         .ok_or_else(|| anyhow::anyhow!("publication {publication} does not exist on the source"))?;
     let xid: u64 = row.get::<_, String>(7).parse()?;
-    let versions = source_sql
+    let versions: Vec<(i32, u32, String)> = source_sql
         .query(
             "SELECT 0, oid, xmin::text FROM pg_publication WHERE pubname = $1
              UNION ALL
@@ -525,6 +547,7 @@ async fn fetch_publication(
             row_filter: r.get(3),
         })
         .collect();
+    let horizon = xid_recurrence_horizon(xid, &versions)?;
     Ok(PublicationBaseline {
         shape: PublicationShape {
             insert: row.get(0),
@@ -538,6 +561,7 @@ async fn fetch_publication(
             tables,
         },
         xid,
+        horizon,
     })
 }
 
@@ -1031,8 +1055,8 @@ async fn run_workflow(
                     run.publication
                 );
                 anyhow::ensure!(
-                    now.xid.wrapping_sub(publication.xid) < XID_HORIZON,
-                    "the source has consumed half the xid space since this workflow began; catalog row versions can no longer be trusted"
+                    now.xid.saturating_sub(publication.xid) < publication.horizon,
+                    "the source has consumed enough xids since this workflow began that a captured catalog row version could recur; the versions can no longer be trusted"
                 );
                 continue;
             }

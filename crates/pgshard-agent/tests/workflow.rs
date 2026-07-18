@@ -399,6 +399,14 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     registry.start(&all_tables, &config).await?;
     wait_for_error(&registry, "wf_all", "FOR ALL TABLES").await;
 
+    source
+        .batch_execute("CREATE PUBLICATION pub_schema FOR TABLES IN SCHEMA public")
+        .await?;
+    let mut in_schema = spec(&pg, "wf_schema", "pgshard_schema");
+    in_schema.publication = "pub_schema".into();
+    registry.start(&in_schema, &config).await?;
+    wait_for_error(&registry, "wf_schema", "TABLES IN SCHEMA").await;
+
     // A partition-root publication announces leaf relations the mapping
     // does not know, and direct leaf truncates go unpublished.
     source
