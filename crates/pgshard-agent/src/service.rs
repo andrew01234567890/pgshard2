@@ -948,6 +948,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_caller_does_not_lose_or_duplicate_the_restore_point() {
+        let s = Arc::new(svc(FakeInstance::primary()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        s.instance
+            .set_restore_point_gate_with_entered(entered.clone(), gate.clone());
+
+        // The caller is aborted while PostgreSQL is mid-create: the slot-owning
+        // task must survive the cancellation, store the point, and a retry must
+        // REPLAY it — a lost point would make the barrier unrestorable, and a
+        // re-create would write the same name at a second LSN.
+        let entered_wait = entered.notified();
+        let first = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                    name: "pgshard_cancel".into(),
+                }))
+                .await
+            })
+        };
+        entered_wait.await;
+        first.abort();
+        gate.notify_waiters();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.instance.restore_points().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached task must complete the create after the caller was aborted"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let retry = s
+            .create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                name: "pgshard_cancel".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            s.instance.restore_points(),
+            vec!["pgshard_cancel".to_string()],
+            "exactly one point: the retry replays, never re-creates"
+        );
+        assert!(retry.lsn.is_some());
+    }
+
+    #[tokio::test]
     async fn create_restore_point_rejects_an_overlong_name() {
         // PostgreSQL truncates a restore-point name at 63 bytes; reject upfront so
         // two long names cannot collide onto one record.

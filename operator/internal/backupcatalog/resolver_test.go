@@ -25,6 +25,8 @@ const (
 	point2  = "pgshard_b2"
 	backup1 = "bk1"
 	stopA   = "0/3000000"
+	stanzaS = "c-sys-g1"
+	pointS  = "0/1000000"
 )
 
 var (
@@ -52,6 +54,7 @@ func driftCatalog() Catalog {
 				Tables: driftTables(), Shards: []ShardTopology{
 					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA, Role: RoleData, State: StateServing},
 					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB, Role: RoleData, State: StateServing},
+					{Name: "sys", Stanza: stanzaS, Role: RoleSystem, State: StateServing},
 				}},
 			{Generation: 2, ValidFrom: t3, Epoch: 10, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
@@ -59,30 +62,35 @@ func driftCatalog() Catalog {
 					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD, Role: RoleData, State: StateServing},
 					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE, Role: RoleData, State: StateServing},
 					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF, Role: RoleData, State: StateServing},
+					{Name: "sys", Stanza: stanzaS, Role: RoleSystem, State: StateServing},
 				}},
 		},
 		Barriers: []BarrierManifest{
 			{ID: "b1", Time: t2, TopologyGeneration: 1, Shards: []BarrierShard{
 				{Name: "A", Stanza: stanzaA, LSN: "0/5000000", Timeline: 1, RestorePoint: point1},
 				{Name: "B", Stanza: stanzaB, LSN: "0/6000000", Timeline: 2, RestorePoint: point1},
+				{Name: "sys", Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point1},
 			}},
 			{ID: "b2", Time: t5, TopologyGeneration: 2, Shards: []BarrierShard{
 				{Name: "C", Stanza: stanzaC, LSN: "0/8000000", Timeline: 1, RestorePoint: point2},
 				{Name: "D", Stanza: stanzaD, LSN: "0/8000010", Timeline: 1, RestorePoint: point2},
 				{Name: "E", Stanza: stanzaE, LSN: "0/8000020", Timeline: 1, RestorePoint: point2},
 				{Name: "F", Stanza: stanzaF, LSN: "0/8000030", Timeline: 1, RestorePoint: point2},
+				{Name: "sys", Stanza: stanzaS, LSN: pointS, Timeline: 1, RestorePoint: point2},
 			}},
 		},
 		Backups: []BackupManifest{
 			{ID: backup1, CompletedAt: t1, TopologyGeneration: 1, Shards: []BackupShard{
 				{Name: "A", Stanza: stanzaA, Label: "20260716-1F", StopLSN: stopA, Timeline: 1, StopTime: t1},
 				{Name: "B", Stanza: stanzaB, Label: "20260716-2F", StopLSN: "0/4000000", Timeline: 2, StopTime: t1},
+				{Name: "sys", Stanza: stanzaS, Label: "20260716-SF", StopLSN: pointS, Timeline: 1, StopTime: t1},
 			}},
 			{ID: "bk2", CompletedAt: t4, TopologyGeneration: 2, Shards: []BackupShard{
 				{Name: "C", Stanza: stanzaC, Label: "20260716-3F", StopLSN: "0/7000000", Timeline: 1, StopTime: t4},
 				{Name: "D", Stanza: stanzaD, Label: "20260716-4F", StopLSN: "0/7000010", Timeline: 1, StopTime: t4},
 				{Name: "E", Stanza: stanzaE, Label: "20260716-5F", StopLSN: "0/7000020", Timeline: 1, StopTime: t4},
 				{Name: "F", Stanza: stanzaF, Label: "20260716-6F", StopLSN: "0/7000030", Timeline: 1, StopTime: t4},
+				{Name: "sys", Stanza: stanzaS, Label: "20260716-S2", StopLSN: pointS, Timeline: 1, StopTime: t4},
 			}},
 		},
 	}
@@ -93,8 +101,8 @@ func TestBarrierBeforeReshardRestoresOldTopology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Topology.Generation != 1 || len(plan.Shards) != 2 {
-		t.Fatalf("must restore the 2-shard gen1 layout, got gen%d/%d shards",
+	if plan.Topology.Generation != 1 || len(plan.Shards) != 3 {
+		t.Fatalf("must restore the gen1 layout incl. the system shard, got gen%d/%d shards",
 			plan.Topology.Generation, len(plan.Shards))
 	}
 	a := plan.Shards[0]
@@ -132,8 +140,8 @@ func TestTimeAfterReshardUsesNewGenerationAndItsBackups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Topology.Generation != 2 || len(plan.Shards) != 4 {
-		t.Fatalf("expected gen2 4-shard plan, got %+v", plan.Topology)
+	if plan.Topology.Generation != 2 || len(plan.Shards) != 5 {
+		t.Fatalf("expected the 5-shard gen2 plan (incl. system), got %+v", plan.Topology)
 	}
 }
 
@@ -229,6 +237,21 @@ func TestIncompleteTopologySnapshotIsRejected(t *testing.T) {
 	dup.Topologies[0].Tables = append(dup.Topologies[0].Tables, dup.Topologies[0].Tables[0])
 	if _, err := Resolve(dup, Target{BackupID: backup1}); err == nil {
 		t.Fatal("a duplicated table entry is ambiguous and must be rejected")
+	}
+
+	noSystem := driftCatalog()
+	noSystem.Topologies[0].Shards = noSystem.Topologies[0].Shards[:2] // drop sys
+	noSystem.Backups[0].Shards = noSystem.Backups[0].Shards[:2]
+	if _, err := Resolve(noSystem, Target{BackupID: backup1}); err == nil {
+		t.Fatal("a snapshot without its system shard cannot restore sequences/migrations")
+	}
+
+	twoSystems := driftCatalog()
+	twoSystems.Topologies[0].Shards = append(twoSystems.Topologies[0].Shards, ShardTopology{
+		Name: "sys2", Stanza: "c-sys2-g1", Role: RoleSystem, State: StateServing,
+	})
+	if _, err := Resolve(twoSystems, Target{BackupID: backup1}); err == nil {
+		t.Fatal("two system shards are ambiguous; a restorable snapshot records exactly one")
 	}
 
 	noRole := driftCatalog()

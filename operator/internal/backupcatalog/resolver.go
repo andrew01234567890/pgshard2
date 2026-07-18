@@ -340,9 +340,12 @@ func snapshotComplete(topology TopologySnapshot) error {
 		return errf("topology generation %d records no hash function; a restored cluster could not route its data",
 			topology.Generation)
 	}
+	systemShards := 0
 	for _, sh := range topology.Shards {
 		switch sh.Role {
-		case RoleData, RoleSystem:
+		case RoleData:
+		case RoleSystem:
+			systemShards++
 		default:
 			return errf("topology generation %d: shard %s has unknown role %q (need data|system)",
 				topology.Generation, sh.Name, sh.Role)
@@ -353,6 +356,13 @@ func snapshotComplete(topology TopologySnapshot) error {
 			return errf("topology generation %d: shard %s has unknown routing state %q",
 				topology.Generation, sh.Name, sh.State)
 		}
+	}
+	// Exactly one system shard: it hosts the sequences and migration records
+	// a restored cluster cannot function without, and ranges alone cannot
+	// identify it (it has no range, like a full-range data shard).
+	if systemShards != 1 {
+		return errf("topology generation %d has %d system shards; a restorable snapshot records exactly one",
+			topology.Generation, systemShards)
 	}
 	seen := make(map[string]bool, len(topology.Tables))
 	for _, t := range topology.Tables {
