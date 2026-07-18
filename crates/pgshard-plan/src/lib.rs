@@ -29,6 +29,13 @@
 //!   `ON CONFLICT DO UPDATE`), `UPDATE ... FROM` / `DELETE ... USING`, and
 //!   MERGE/COPY are rejected with SQLSTATE `0A000`.
 //! - `search_path` is not modeled: an unqualified relation defaults to `public`.
+//! - A relation the sharding schema does not know is rejected (`42P01`) wherever
+//!   it appears — plain FROM, joins, subqueries, CTE bodies — rather than routed
+//!   by guesswork. The exception is qualified `pg_catalog`/`information_schema`
+//!   reads, which route to the system database: **catalog reads answer with the
+//!   system database's own catalogs**, not a per-shard merge — sufficient for
+//!   client handshakes and tooling probes, but shard-local statistics views
+//!   describe the system database only. This is a documented M1 contract.
 //! - Joins, subqueries, CTEs, and set operations over sharded tables are
 //!   rejected, not routed: key-routing needs a single plain sharded table in the
 //!   FROM, no subquery anywhere in the statement, and no `WITH` clause (which can
@@ -327,6 +334,17 @@ fn placement<'a>(vschema: &'a VSchema, table: &TableName) -> Placement<'a> {
 }
 
 fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan {
+    // Fail loud on any relation the schema does not know — a typo, or a table
+    // missing from the config — ANYWHERE in the statement: plain FROM, join
+    // arms, subqueries in any clause, CTE bodies, set-operation arms. Falling
+    // through to the system database could return a same-named table's rows
+    // there instead of an error. The walk is the complete serde traversal
+    // (nothing can hide from it); unqualified names that match a CTE the
+    // statement itself defines are the CTE, not a base relation. Runs before
+    // the set-operation dispatch so both paths are covered once.
+    if let Some(unknown) = unknown_relation(s, vschema) {
+        return reject_unknown(&unknown);
+    }
     // A set operation (UNION/INTERSECT/EXCEPT) nests its operands in larg/rarg and
     // leaves the top-level FROM empty, so the key-routing path below would see no
     // tables and mistake it for a session-local read — running the whole set
@@ -336,16 +354,6 @@ fn plan_select(s: &SelectStmt, vschema: &VSchema, shards: &ShardCatalog) -> Plan
         return plan_set_op(s, vschema);
     }
     let from = analyze_from(&s.from_clause);
-    // Fail loud on a relation the schema does not know (a typo, or a table
-    // missing from the config): falling through to the system database could
-    // return a same-named table's rows there instead of an error.
-    if let Some(unknown) = from
-        .tables
-        .iter()
-        .find(|t| !is_catalog_schema(t) && matches!(placement(vschema, t), Placement::Unknown))
-    {
-        return reject_unknown(unknown);
-    }
     let sharded: Vec<(&str, Option<ScalarType>, &str)> = from
         .tables
         .iter()
@@ -455,20 +463,35 @@ fn plan_set_op(s: &SelectStmt, vschema: &VSchema) -> Plan {
             "a set operation (UNION/INTERSECT/EXCEPT) over a sharded table is not supported in M1",
         );
     }
-    // Same unknown-relation stance as a plain SELECT: never route a relation
-    // the schema does not know to the system database by default.
-    if let Some(unknown) = from
-        .tables
-        .iter()
-        .find(|t| !is_catalog_schema(t) && matches!(placement(vschema, t), Placement::Unknown))
-    {
-        return reject_unknown(unknown);
-    }
     if from.tables.is_empty() {
         Plan::RouterLocal
     } else {
         Plan::Unsharded
     }
+}
+
+/// The first relation reference anywhere in `tree` that is neither a configured
+/// table, a qualified catalog relation, nor an unqualified reference to a CTE
+/// the statement defines. A serialization failure (which a well-formed parse
+/// tree does not produce) reports a sentinel so the caller fails closed.
+fn unknown_relation<T: serde::Serialize>(tree: &T, vschema: &VSchema) -> Option<TableName> {
+    let Some((rels, ctes)) = extract::referenced_relations(tree) else {
+        return Some(TableName::new("", "<unserializable statement>"));
+    };
+    for (schema, name) in rels {
+        // Only an unqualified name can refer to a CTE.
+        if schema.is_empty() && ctes.contains(&name) {
+            continue;
+        }
+        let t = TableName::new(if schema.is_empty() { "public" } else { &schema }, name);
+        if is_catalog_schema(&t) {
+            continue;
+        }
+        if matches!(placement(vschema, &t), Placement::Unknown) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// The FROM relations of every arm of a (possibly nested) set operation, and
@@ -1120,6 +1143,11 @@ mod tests {
             "SELECT * FROM orderz",
             "SELECT * FROM orders o JOIN mystery m ON m.id = o.id WHERE o.customer_id = 1",
             "SELECT * FROM settings UNION ALL SELECT * FROM mystery",
+            // Hidden references: a FROM subquery, an expression subquery, and a
+            // CTE body — the complete walk sees them all.
+            "SELECT * FROM (SELECT * FROM mystery) m",
+            "SELECT (SELECT count(*) FROM mystery)",
+            "WITH x AS (SELECT * FROM mystery) SELECT * FROM x",
         ] {
             assert!(
                 matches!(&plan1(sql), Plan::Reject { code, .. } if *code == UNDEFINED_TABLE),
@@ -1132,6 +1160,12 @@ mod tests {
         assert_eq!(plan1("SELECT * FROM pg_catalog.pg_class"), Plan::Unsharded);
         assert_eq!(
             plan1("SELECT * FROM information_schema.tables"),
+            Plan::Unsharded
+        );
+        // A CTE over a known global table keeps working: the CTE's own name is
+        // not a base relation, and its body references only known tables.
+        assert_eq!(
+            plan1("WITH x AS (SELECT * FROM settings) SELECT * FROM x"),
             Plan::Unsharded
         );
     }

@@ -280,3 +280,53 @@ fn contains_node<T: serde::Serialize>(tree: &T, node_kind: &str) -> bool {
         Err(_) => true,
     }
 }
+
+/// Every relation reference in the statement — `RangeVar`s anywhere (plain
+/// FROM, join arms, subqueries in any clause, CTE bodies) — plus the names of
+/// CTEs the statement itself defines. The same complete serde walk as
+/// [`contains_node`], so no shape can hide a table reference from the caller's
+/// unknown-relation guard. `None` on a serialization error (well-formed parse
+/// trees do not produce one) so the caller fails closed.
+///
+/// Each reference is `(schemaname, relname)` exactly as written — an empty
+/// schema means unqualified, which the caller resolves (default `public`, and
+/// only unqualified names can refer to a CTE).
+/// Every `(schemaname, relname)` reference plus the statement's own CTE names.
+pub(crate) type RelationRefs = (Vec<(String, String)>, std::collections::BTreeSet<String>);
+
+pub(crate) fn referenced_relations<T: serde::Serialize>(tree: &T) -> Option<RelationRefs> {
+    fn walk(
+        value: &serde_json::Value,
+        rels: &mut Vec<(String, String)>,
+        ctes: &mut std::collections::BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(rv) = map.get("RangeVar").and_then(|v| v.as_object()) {
+                    let schema = rv.get("schemaname").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = rv.get("relname").and_then(|v| v.as_str()).unwrap_or("");
+                    rels.push((schema.to_owned(), name.to_owned()));
+                }
+                if let Some(cte) = map.get("CommonTableExpr").and_then(|v| v.as_object())
+                    && let Some(name) = cte.get("ctename").and_then(|v| v.as_str())
+                {
+                    ctes.insert(name.to_owned());
+                }
+                for v in map.values() {
+                    walk(v, rels, ctes);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    walk(v, rels, ctes);
+                }
+            }
+            _ => {}
+        }
+    }
+    let json = serde_json::to_value(tree).ok()?;
+    let mut rels = Vec::new();
+    let mut ctes = std::collections::BTreeSet::new();
+    walk(&json, &mut rels, &mut ctes);
+    Some((rels, ctes))
+}

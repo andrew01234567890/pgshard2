@@ -108,11 +108,11 @@ spec:
                         properties:
                           column:
                             maxLength: 63
-                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                            pattern: ^[a-z_][a-z0-9_$]*$
                             type: string
                           sequence:
                             maxLength: 63
-                            pattern: ^[A-Za-z_][A-Za-z0-9_$]*$
+                            pattern: ^[a-z_][a-z0-9_$]*$
                             type: string
                         required:
                         - column

@@ -73,11 +73,11 @@ type RoutingShard struct {
 
 // RoutingSequence binds a column to a global sequence.
 type RoutingSequence struct {
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	Column string `json:"column"`
 
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_$]*$`
 	// +kubebuilder:validation:MaxLength=63
 	Sequence string `json:"sequence"`
 }
