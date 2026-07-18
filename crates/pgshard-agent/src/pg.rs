@@ -170,7 +170,10 @@ impl Instance for PgInstance {
         adopt: bool,
     ) -> anyhow::Result<()> {
         let client = self.connect().await?;
-        loop {
+        // Bounded verify-or-create: each retry is a lost check-then-create
+        // race, and a create/drop flap must surface as a retriable error
+        // rather than hold the RPC (and its operator worker) forever.
+        for _ in 0..3 {
             // The provenance marker lives in the database's comment
             // (pg_shdescription), the one annotation CREATE DATABASE-adjacent
             // metadata offers without connecting into the new database.
@@ -221,6 +224,7 @@ impl Instance for PgInstance {
                 Err(e) => return Err(e.into()),
             }
         }
+        anyhow::bail!("database {name:?} keeps flapping between absent and present; retry later")
     }
 
     async fn drop_database(&self, name: &str) -> anyhow::Result<()> {

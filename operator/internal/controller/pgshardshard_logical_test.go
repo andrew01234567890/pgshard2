@@ -69,7 +69,10 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		var got pgshardv1alpha1.PgShardShard
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: shardNm, Namespace: ns}, &got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady), "phase mirrors the node")
-		Expect(got.Status.CurrentPrimary).To(Equal("gatenode-0"))
+		// Routing reads CurrentPrimary: it stays withheld until the shard's OWN
+		// database on this node is verified (no agent here, so never).
+		Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+			"a placed shard is not routable before its database is verified")
 
 		var pods corev1.PodList
 		Expect(k8sClient.List(ctx, &pods, client.InNamespace(ns),
@@ -95,18 +98,19 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(agent.Stop)
 
+		const dbNode = "dbnode"
 		node := &pgshardv1alpha1.PgShardNode{
-			ObjectMeta: metav1.ObjectMeta{Name: "dbnode", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: dbNode, Namespace: ns},
 			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
 		}
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 		node.Status.Phase = pgshardv1alpha1.NodeReady
-		node.Status.CurrentPrimary = "dbnode-0"
+		node.Status.CurrentPrimary = dbNode + "-0"
 		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
 		// The primary pod must have an address for the controller to dial.
 		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "dbnode-0", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: dbNode + "-0", Namespace: ns},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{
 				{Name: "postgres", Image: "pg"},
 			}},
@@ -120,7 +124,7 @@ var _ = Describe("PgShardShard placed on a node", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: dbShard, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
 				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
-				Replicas: 1, NodeRef: "dbnode",
+				Replicas: 1, NodeRef: dbNode,
 			},
 		}
 		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
@@ -152,7 +156,27 @@ var _ = Describe("PgShardShard placed on a node", func() {
 
 		var provisioned pgshardv1alpha1.PgShardShard
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &provisioned)).To(Succeed())
-		Expect(provisioned.Status.DatabaseNode).To(Equal("dbnode"))
+		Expect(provisioned.Status.DatabaseNode).To(Equal(dbNode))
+		Expect(provisioned.Status.CurrentPrimary).To(Equal(dbNode+"-0"),
+			"a verified database makes the shard routable")
+
+		// A recreated same-named node is a NEW incarnation: its storage has
+		// never been verified, so the latch must not carry over — the shard
+		// re-provisions (and re-verifies provenance) against the new node.
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
+		fresh := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: dbNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
+		fresh.Status.Phase = pgshardv1alpha1.NodeReady
+		fresh.Status.CurrentPrimary = dbNode + "-0"
+		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+		callsBefore = len(agent.Calls)
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(agent.Calls)).To(BeNumerically(">", callsBefore),
+			"a recreated node incarnation must be re-verified, not trusted by name")
 	})
 
 	It("fences a same-named database left by another placement and adopts only on explicit authorization", func() {
@@ -213,6 +237,11 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(cond.Message).To(ContainSubstring(adoptDatabaseAnnotation))
 		Expect(agent.DatabaseProvenance(staleShard)).To(Equal("prior-placement-uid"),
 			"the foreign marker is untouched")
+		// A refused database must not be served: the routing view reads
+		// CurrentPrimary, so it is withheld and the shard reads Degraded.
+		Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+			"a shard whose database was refused must not be routable")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
 
 		// Explicit adoption: a deliberate human/restore action, never routine.
 		got.Annotations = map[string]string{adoptDatabaseAnnotation: "true"}
@@ -222,6 +251,12 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, shardDatabaseReadyCondition)).To(BeTrue())
 		Expect(agent.DatabaseProvenance(staleShard)).To(Equal(string(got.UID)),
 			"adoption re-stamps the marker with this placement's identity")
+		Expect(got.Status.CurrentPrimary).To(Equal("stalenode-0"),
+			"an adopted database makes the shard routable again")
+		// Adoption is ONE-SHOT: left standing, the annotation would silently
+		// adopt any stale same-named database on the shard's NEXT node too.
+		Expect(got.Annotations).NotTo(HaveKey(adoptDatabaseAnnotation),
+			"the adopt annotation is consumed by a successful adoption")
 	})
 
 	It("marks an overlong database name terminal without calling the agent or wedging the mirror", func() {
@@ -266,7 +301,9 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("InvalidName"))
-		// The node-health mirror still ran despite the database problem.
-		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardReady))
+		// A shard whose database can never be created is not routable and not
+		// healthy - Degraded with no published primary is the honest signal.
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
+		Expect(got.Status.CurrentPrimary).To(BeEmpty())
 	})
 })

@@ -65,6 +65,9 @@ const storageProvenanceCondition = "StorageProvenance"
 type foreignPVCError struct {
 	pvc      string
 	foundUID string
+	// pod is the instance that would (or does) mount the claim; stamped by
+	// ensureInstance so the degrade path can strip its routing label.
+	pod string
 }
 
 func (e *foreignPVCError) Error() string {
@@ -219,11 +222,11 @@ func (r *PgShardNodeReconciler) ensureInstance(
 	name := nodeInstanceName(node, ordinal)
 
 	if err := r.ensurePVC(ctx, node, name+"-data"); err != nil {
-		return err
+		return tagForeignPod(err, name)
 	}
 	if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
 		if err := r.ensurePVC(ctx, node, name+"-wal"); err != nil {
-			return err
+			return tagForeignPod(err, name)
 		}
 	}
 
@@ -290,29 +293,61 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		},
 		StorageClassName: storageClass,
 	}
-	if err := r.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, pvc); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// The cached Get missed an existing claim (stale informer). It has
+			// NOT been verified — treating the 409 as success would mount a
+			// possibly-foreign volume this reconcile. Error out; the retry
+			// re-reads and verifies it.
+			return fmt.Errorf("pvc %s appeared concurrently and is unverified; retrying", pvcName)
+		}
 		return fmt.Errorf("pvc %s: %w", pvcName, err)
 	}
 	return nil
 }
 
+// tagForeignPod stamps the pod that would mount a foreign PVC onto the typed
+// error, so the degrade path can pull an ALREADY-RUNNING pod out of routing.
+func tagForeignPod(err error, pod string) error {
+	var foreign *foreignPVCError
+	if errors.As(err, &foreign) {
+		foreign.pod = pod
+	}
+	return err
+}
+
 // degradeForeignStorage records that a retained volume from another node
-// identity blocked instance creation, and stops reconciling instances: the pod
-// that would mount it is never created. Recovery is an explicit human action —
-// relabel the PVC to this node's UID to adopt its data deliberately, or delete
-// it for a fresh volume — retried at the poll cadence, not by hot-looping an
-// error.
+// identity blocked instance reconciliation: the pod that would mount it is
+// never created, and one ALREADY RUNNING (the volume turned foreign under it
+// — a relabel, or a pre-provenance upgrade) is pulled out of read/write
+// routing by stripping its role label. Recovery is an explicit human action —
+// relabel the PVC to this node's UID to adopt its data deliberately, or
+// delete the pod and PVC for a fresh volume — retried at the poll cadence,
+// not by hot-looping an error.
 func (r *PgShardNodeReconciler) degradeForeignStorage(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode, foreign *foreignPVCError,
 ) (ctrl.Result, error) {
-	logf.FromContext(ctx).Info("foreign PVC blocks instance creation",
-		"node", node.Name, "pvc", foreign.pvc, "foundUID", foreign.foundUID)
+	log := logf.FromContext(ctx)
+	log.Info("foreign PVC blocks instance reconciliation",
+		"node", node.Name, "pvc", foreign.pvc, "pod", foreign.pod, "foundUID", foreign.foundUID)
+	var pod corev1.Pod
+	err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: foreign.pod}, &pod)
+	switch {
+	case err == nil && metav1.IsControlledBy(&pod, node) && pod.Labels[labelRole] != "":
+		patched := pod.DeepCopy()
+		delete(patched.Labels, labelRole)
+		if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
+			return ctrl.Result{}, err
+		}
+	case err != nil && !apierrors.IsNotFound(err):
+		return ctrl.Result{}, err
+	}
 	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
 		Type:   storageProvenanceCondition,
 		Status: metav1.ConditionFalse,
 		Reason: "ForeignData",
 		Message: fmt.Sprintf(
-			"%s; relabel it with %s=%s to adopt its data deliberately, or delete it for a fresh volume",
+			"%s; relabel it with %s=%s to adopt its data deliberately, or delete the pod and PVC for a fresh volume",
 			foreign.Error(), labelNodeUID, node.UID),
 		ObservedGeneration: node.Generation,
 	})

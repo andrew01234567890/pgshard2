@@ -337,6 +337,18 @@ func (f *FakeAgent) CreateDatabase(
 	if req.Adopt && req.Provenance == "" {
 		return nil, status.Error(codes.InvalidArgument, "adopt requires a provenance marker to stamp")
 	}
+	// Mirror the real agent's provenance validation so envtests cannot pass
+	// requests the Rust service rejects.
+	if len(req.Provenance) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "provenance exceeds 128 bytes")
+	}
+	for _, c := range req.Provenance {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == ':' || c == '-'
+		if !ok {
+			return nil, status.Error(codes.InvalidArgument, "provenance may only contain [A-Za-z0-9._:-]")
+		}
+	}
 	if _, ok := f.databases[req.Name]; ok {
 		if req.Provenance != "" && f.dbProvenance[req.Name] != req.Provenance {
 			if !req.Adopt {
@@ -365,6 +377,7 @@ func (f *FakeAgent) DropDatabase(
 		return nil, status.Error(codes.InvalidArgument, "database name is required")
 	}
 	delete(f.databases, req.Name)
+	delete(f.dbProvenance, req.Name)
 	return &pgshardv1.DropDatabaseResponse{}, nil
 }
 

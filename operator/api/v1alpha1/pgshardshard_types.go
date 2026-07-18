@@ -227,6 +227,13 @@ type PgShardShardStatus struct {
 	// +optional
 	DatabaseNode string `json:"databaseNode,omitempty"`
 
+	// DatabaseNodeUID pins DatabaseNode to the exact node INCARNATION: a
+	// recreated same-named node (fresh or deliberately relabeled storage) has
+	// never been verified, and a name-only latch would keep vouching for a
+	// database nobody checked.
+	// +optional
+	DatabaseNodeUID string `json:"databaseNodeUID,omitempty"`
+
 	// +optional
 	TargetPrimary string `json:"targetPrimary,omitempty"`
 

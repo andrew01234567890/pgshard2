@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
@@ -119,6 +120,23 @@ var _ = Describe("PgShardNode storage provenance", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal("Verified"))
+
+		// The volume turns foreign UNDER a running, routed pod (a bad relabel,
+		// or a pre-provenance upgrade): fencing must pull the pod out of
+		// routing, not just block future pod creation.
+		labeled := pod.DeepCopy()
+		labeled.Labels[labelRole] = roleLabelPrimary
+		Expect(k8sClient.Patch(ctx, labeled, client.MergeFrom(&pod))).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0-data", Namespace: ns}, pvc)).To(Succeed())
+		pvc.Labels[labelNodeUID] = "hijacked-by-another-node"
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		reconcile()
+		var refetched corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-0", Namespace: ns}, &refetched)).To(Succeed())
+		Expect(refetched.Labels).NotTo(HaveKey(labelRole),
+			"a running pod on a foreign volume must be pulled out of routing")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.NodeDegraded))
 
 		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
 	})
