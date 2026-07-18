@@ -394,6 +394,15 @@ struct TablePreflight {
     columns: Vec<String>,
 }
 
+/// One pg_publication_tables entry: schema, table, published columns (all of
+/// them when no column list), row-filter expression if any.
+struct PublishedTable {
+    schema: String,
+    name: String,
+    columns: Option<Vec<String>>,
+    row_filter: Option<String>,
+}
+
 /// Everything that must hold BEFORE any destructive step (truncate, slot
 /// drop, checkpoint clear). A typo'd or misdeclared spec must fail here, with
 /// the target untouched.
@@ -453,7 +462,7 @@ async fn preflight(
         "publication {} does not publish all of insert/update/delete/truncate: disabled kinds would be silently omitted from the stream",
         run.publication
     );
-    let published: Vec<(String, String, Option<Vec<String>>, Option<String>)> = source_sql
+    let published: Vec<PublishedTable> = source_sql
         .query(
             "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
              FROM pg_publication_tables WHERE pubname = $1",
@@ -461,29 +470,40 @@ async fn preflight(
         )
         .await?
         .into_iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .map(|r| PublishedTable {
+            schema: r.get(0),
+            name: r.get(1),
+            columns: r.get(2),
+            row_filter: r.get(3),
+        })
         .collect();
     for table in &run.tables {
         anyhow::ensure!(
             published
                 .iter()
-                .any(|(s, n, ..)| *s == table.schema && *n == table.name),
+                .any(|p| p.schema == table.schema && p.name == table.name),
             "table {}.{} is not in publication {}: it would be seeded once and then never receive changes",
             table.schema,
             table.name,
             run.publication
         );
     }
-    for (s, n, _, rowfilter) in &published {
+    for p in &published {
         anyhow::ensure!(
-            run.tables.iter().any(|t| t.schema == *s && t.name == *n),
-            "publication {} carries unmapped table {s}.{n}: the stream would fail after seeding",
-            run.publication
+            run.tables
+                .iter()
+                .any(|t| t.schema == p.schema && t.name == p.name),
+            "publication {} carries unmapped table {}.{}: the stream would fail after seeding",
+            run.publication,
+            p.schema,
+            p.name
         );
         anyhow::ensure!(
-            rowfilter.is_none(),
-            "publication {} filters rows of {s}.{n}: the stream would silently drop changes the seed copy included",
-            run.publication
+            p.row_filter.is_none(),
+            "publication {} filters rows of {}.{}: the stream would silently drop changes the seed copy included",
+            run.publication,
+            p.schema,
+            p.name
         );
     }
 
@@ -511,9 +531,10 @@ async fn preflight(
         );
         // A column list on the publication would stream a transformed row
         // shape; the seed copy takes every column, so the stream must too.
-        if let Some((.., Some(attnames), _)) = published
+        if let Some(attnames) = published
             .iter()
-            .find(|(s, n, ..)| *s == table.schema && *n == table.name)
+            .find(|p| p.schema == table.schema && p.name == table.name)
+            .and_then(|p| p.columns.as_ref())
         {
             for (name, _) in &cols {
                 anyhow::ensure!(
