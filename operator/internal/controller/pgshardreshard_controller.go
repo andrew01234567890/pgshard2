@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -50,9 +51,15 @@ type PgShardReshardReconciler struct {
 // The condition that records whether the requested split is well-formed.
 const reshardValidatedCondition = "Validated"
 
+// The condition that records whether the target shards have been created.
+const reshardTargetsProvisionedCondition = "TargetsProvisioned"
+
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardnodes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
 
 func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var reshard pgshardv1alpha1.PgShardReshard
@@ -60,19 +67,23 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// This slice owns only the pre-provisioning phases. Terminal states and the
-	// later (not-yet-built) workflow phases are left untouched, so a future slice
-	// — or a controller restart hitting an already-advanced reshard — never
-	// regresses a Seeding/Finalizing/... reshard back to Validating.
+	before := reshard.Status.DeepCopy()
+
+	// Dispatch by phase. Terminal states and the later (not-yet-built) workflow
+	// phases (Seeding onward) are left untouched, so a controller restart hitting
+	// an already-advanced reshard never regresses it.
+	var (
+		result ctrl.Result
+		err    error
+	)
 	switch reshard.Status.Phase {
 	case "", pgshardv1alpha1.ReshardPending, pgshardv1alpha1.ReshardValidating:
-		// This controller drives these; continue below.
+		result, err = r.reconcileValidating(ctx, &reshard)
+	case pgshardv1alpha1.ReshardProvisioningTargets:
+		result, err = r.reconcileProvisioningTargets(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}
-
-	before := reshard.Status.DeepCopy()
-	result, err := r.reconcileValidating(ctx, &reshard)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -99,7 +110,7 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	if err := r.Get(ctx, sourceKey, &source); err != nil {
 		if apierrors.IsNotFound(err) {
 			reshard.Status.Phase = pgshardv1alpha1.ReshardValidating
-			setReshardCondition(reshard, metav1.ConditionFalse, "SourceNotFound",
+			setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionFalse, "SourceNotFound",
 				fmt.Sprintf("source shard %q not found yet", reshard.Spec.SourceShard))
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
@@ -111,7 +122,7 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	// so a mismatch is a permanent misconfiguration — fail rather than validate a
 	// split that would later seed and cut over another cluster's shard.
 	if source.Spec.ClusterRef != reshard.Spec.ClusterRef {
-		r.fail(reshard, "SourceClusterMismatch",
+		r.fail(reshard, reshardValidatedCondition, "SourceClusterMismatch",
 			fmt.Sprintf("source shard %q belongs to cluster %q, not this reshard's cluster %q",
 				source.Name, source.Spec.ClusterRef, reshard.Spec.ClusterRef))
 		return ctrl.Result{}, nil
@@ -120,14 +131,14 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	// The system shard holds control-plane state (sequences, migrations) and is
 	// never a data-routing partition; resharding it is never valid.
 	if source.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
-		r.fail(reshard, "SourceNotReshardable",
+		r.fail(reshard, reshardValidatedCondition, "SourceNotReshardable",
 			fmt.Sprintf("source shard %q is the system shard and cannot be resharded", source.Name))
 		return ctrl.Result{}, nil
 	}
 
 	sourceRange, err := toRange(source.Spec.KeyRange)
 	if err != nil {
-		r.fail(reshard, "InvalidSourceRange",
+		r.fail(reshard, reshardValidatedCondition, "InvalidSourceRange",
 			fmt.Sprintf("source shard %q has an invalid key range: %v", source.Name, err))
 		return ctrl.Result{}, nil
 	}
@@ -136,7 +147,7 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	for _, tr := range reshard.Spec.TargetRanges {
 		t, err := toRange(tr)
 		if err != nil {
-			r.fail(reshard, "InvalidPartition",
+			r.fail(reshard, reshardValidatedCondition, "InvalidPartition",
 				fmt.Sprintf("target range %q-%q is invalid: %v", tr.Start, tr.End, err))
 			return ctrl.Result{}, nil
 		}
@@ -144,34 +155,36 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	}
 
 	if err := validateReshardPartition(sourceRange, targets); err != nil {
-		r.fail(reshard, "InvalidPartition", err.Error())
+		r.fail(reshard, reshardValidatedCondition, "InvalidPartition", err.Error())
 		return ctrl.Result{}, nil
 	}
 
-	// Validated. Advance to ProvisioningTargets; creating the target shards is a
-	// later slice, so this reconcile stops here.
+	// Validated. Advance to ProvisioningTargets; the next reconcile creates the
+	// target shards.
 	reshard.Status.Phase = pgshardv1alpha1.ReshardProvisioningTargets
-	setReshardCondition(reshard, metav1.ConditionTrue, "PartitionValid",
+	setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionTrue, "PartitionValid",
 		"target ranges partition the source shard's key range")
 	return ctrl.Result{}, nil
 }
 
-// fail moves the reshard to the terminal Failed phase with a reason.
+// fail moves the reshard to the terminal Failed phase, recording the reason on
+// the condition that owns the current phase.
 func (r *PgShardReshardReconciler) fail(
 	reshard *pgshardv1alpha1.PgShardReshard,
-	reason, message string,
+	condType, reason, message string,
 ) {
 	reshard.Status.Phase = pgshardv1alpha1.ReshardFailed
-	setReshardCondition(reshard, metav1.ConditionFalse, reason, message)
+	setReshardCondition(reshard, condType, metav1.ConditionFalse, reason, message)
 }
 
 func setReshardCondition(
 	reshard *pgshardv1alpha1.PgShardReshard,
+	condType string,
 	status metav1.ConditionStatus,
 	reason, message string,
 ) {
 	apimeta.SetStatusCondition(&reshard.Status.Conditions, metav1.Condition{
-		Type:               reshardValidatedCondition,
+		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -182,6 +195,9 @@ func setReshardCondition(
 func (r *PgShardReshardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&pgshardv1alpha1.PgShardShard{}).
+		Owns(&pgshardv1alpha1.PgShardNode{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Owns(&corev1.ConfigMap{}).
 		Named("pgshardreshard").
 		Complete(r)
 }
