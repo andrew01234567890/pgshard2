@@ -124,6 +124,20 @@ pub trait Instance: Send + Sync + 'static {
     /// When `wait_archived`, block until that segment is confirmed archived so
     /// the point is immediately restorable. Only valid on a primary.
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
+
+    /// Ensure `publication` exists in `database` publishing EXACTLY `tables`
+    /// with every DML kind, no row filter, no column list, and no generated
+    /// columns — the shape the seeding runner's preflight demands. A same-name
+    /// publication already in that shape is left untouched (a live consumer's
+    /// drift poll must not trip on reconcile retries); any other shape is
+    /// dropped and recreated. Returns the WAL headroom for slot retention
+    /// (`max_slot_wal_keep_size`), or None when unlimited.
+    async fn prepare_source(
+        &self,
+        database: &str,
+        publication: &str,
+        tables: &[(String, String)],
+    ) -> anyhow::Result<Option<u64>>;
 }
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
@@ -133,6 +147,9 @@ pub mod fake {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    /// (database, publication) -> published (schema, table) pairs.
+    pub type Publications = BTreeMap<(String, String), Vec<(String, String)>>;
 
     #[derive(Clone)]
     pub struct RestorePointGate {
@@ -158,6 +175,7 @@ pub mod fake {
         /// single-flight and cancellation-safety semantics deterministically.
         restore_point_gate: Mutex<Option<RestorePointGate>>,
         wal_switches: std::sync::atomic::AtomicU32,
+        publications: Mutex<Publications>,
     }
 
     impl FakeInstance {
@@ -227,6 +245,10 @@ pub mod fake {
                 (owner.to_owned(), marker.map(str::to_owned)),
             );
         }
+        pub fn publications(&self) -> Publications {
+            self.publications.lock().unwrap().clone()
+        }
+
         pub fn restore_points(&self) -> Vec<String> {
             self.restore_points.lock().unwrap().clone()
         }
@@ -352,6 +374,23 @@ pub mod fake {
             self.wal_switches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(s.write_lsn)
+        }
+
+        async fn prepare_source(
+            &self,
+            database: &str,
+            publication: &str,
+            tables: &[(String, String)],
+        ) -> anyhow::Result<Option<u64>> {
+            anyhow::ensure!(
+                self.databases.lock().unwrap().contains_key(database),
+                "database {database} does not exist"
+            );
+            self.publications.lock().unwrap().insert(
+                (database.to_owned(), publication.to_owned()),
+                tables.to_vec(),
+            );
+            Ok(Some(1 << 30))
         }
     }
 }

@@ -28,6 +28,20 @@ impl PgInstance {
         });
         Ok(client)
     }
+
+    /// Connect into a specific database on this instance (a node hosts one
+    /// shard per DATABASE; publication DDL is database-scoped).
+    async fn connect_to(&self, database: &str) -> anyhow::Result<tokio_postgres::Client> {
+        let mut config: tokio_postgres::Config = self.conn_string.parse()?;
+        config.dbname(database);
+        let (client, connection) = config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "postgres connection closed");
+            }
+        });
+        Ok(client)
+    }
 }
 
 /// Quote a PostgreSQL identifier: wrap in double quotes and double any embedded
@@ -277,6 +291,112 @@ impl Instance for PgInstance {
             .get(0);
         Ok(parse_lsn(&lsn))
     }
+
+    async fn prepare_source(
+        &self,
+        database: &str,
+        publication: &str,
+        tables: &[(String, String)],
+    ) -> anyhow::Result<Option<u64>> {
+        let client = self.connect_to(database).await?;
+        // No-op when the publication already has the exact shape the seeding
+        // runner's preflight demands: a reconcile retry must never rewrite the
+        // catalog rows a live consumer's drift poll has pinned.
+        if !publication_matches(&client, publication, tables).await? {
+            // Converge by drop+recreate: a mismatched same-name publication is
+            // drift or misconfiguration, and every CREATE-time property
+            // (membership mode, via_partition_root) converges this way where
+            // ALTER could not. Any live consumer fails loudly and re-seeds.
+            client
+                .execute(
+                    &format!("DROP PUBLICATION IF EXISTS {}", quote_ident(publication)),
+                    &[],
+                )
+                .await?;
+            let list = tables
+                .iter()
+                .map(|(schema, name)| format!("{}.{}", quote_ident(schema), quote_ident(name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            client
+                .execute(
+                    &format!(
+                        "CREATE PUBLICATION {} FOR TABLE {list}
+                         WITH (publish = 'insert, update, delete, truncate')",
+                        quote_ident(publication)
+                    ),
+                    &[],
+                )
+                .await?;
+        }
+        let keep: String = client
+            .query_one("SELECT current_setting('max_slot_wal_keep_size')", &[])
+            .await?
+            .get(0);
+        if keep == "-1" {
+            return Ok(None);
+        }
+        let bytes: i64 = client
+            .query_one("SELECT pg_size_bytes($1)", &[&keep])
+            .await?
+            .get(0);
+        Ok(Some(bytes.max(0) as u64))
+    }
+}
+
+/// Does `publication` already publish EXACTLY `tables` in the shape the
+/// seeding runner accepts (static FOR TABLE membership, every DML kind, no
+/// partition-root routing, no generated columns, no row filters, no column
+/// lists)?
+async fn publication_matches(
+    client: &tokio_postgres::Client,
+    publication: &str,
+    tables: &[(String, String)],
+) -> anyhow::Result<bool> {
+    let Some(row) = client
+        .query_opt(
+            "SELECT pubinsert AND pubupdate AND pubdelete AND pubtruncate
+                    AND NOT puballtables AND NOT pubviaroot
+                    AND pubgencols::text = 'n'
+                    AND NOT EXISTS (SELECT 1 FROM pg_publication_namespace pn
+                                    WHERE pn.pnpubid = p.oid)
+             FROM pg_publication p WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    if !row.get::<_, bool>(0) {
+        return Ok(false);
+    }
+    let members: Vec<(String, String, bool)> = client
+        .query(
+            "SELECT schemaname::text, tablename::text,
+                    rowfilter IS NULL AND attnames::text[] = (
+                        SELECT array_agg(a.attname::text ORDER BY a.attnum)
+                        FROM pg_attribute a
+                        JOIN pg_class c ON c.oid = a.attrelid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = pt.schemaname AND c.relname = pt.tablename
+                          AND a.attnum > 0 AND NOT a.attisdropped
+                          AND a.attgenerated = ''
+                    )
+             FROM pg_publication_tables pt WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    if members.len() != tables.len() {
+        return Ok(false);
+    }
+    Ok(tables.iter().all(|(schema, name)| {
+        members
+            .iter()
+            .any(|(s, n, clean)| s == schema && n == name && *clean)
+    }))
 }
 
 #[cfg(test)]

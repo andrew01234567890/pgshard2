@@ -1454,9 +1454,16 @@ func (x *StanzaCheckResponse) GetDetail() string {
 }
 
 type PrepareSourceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Publication   string                 `protobuf:"bytes,1,opt,name=publication,proto3" json:"publication,omitempty"`
-	Tables        []*TableRef            `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Publication string                 `protobuf:"bytes,1,opt,name=publication,proto3" json:"publication,omitempty"`
+	Tables      []*TableRef            `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	// The source shard's database on this node (a node hosts many shard
+	// databases; the publication lives inside one). Required.
+	Database string `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`
+	// Pod-identity fence, as in StartWorkflow/CreateDatabase: ABORTED on
+	// mismatch so a reassigned pod IP cannot aim publication DDL at another
+	// node incarnation.
+	TargetPodUid  string `protobuf:"bytes,4,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1503,6 +1510,20 @@ func (x *PrepareSourceRequest) GetTables() []*TableRef {
 		return x.Tables
 	}
 	return nil
+}
+
+func (x *PrepareSourceRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *PrepareSourceRequest) GetTargetPodUid() string {
+	if x != nil {
+		return x.TargetPodUid
+	}
+	return ""
 }
 
 type PrepareSourceResponse struct {
@@ -2749,10 +2770,12 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06stanza\x18\x01 \x01(\tR\x06stanza\"G\n" +
 	"\x13StanzaCheckResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12\x16\n" +
-	"\x06detail\x18\x02 \x01(\tR\x06detail\"f\n" +
+	"\x06detail\x18\x02 \x01(\tR\x06detail\"\xa8\x01\n" +
 	"\x14PrepareSourceRequest\x12 \n" +
 	"\vpublication\x18\x01 \x01(\tR\vpublication\x12,\n" +
-	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\"a\n" +
+	"\x06tables\x18\x02 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\x12\x1a\n" +
+	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12$\n" +
+	"\x0etarget_pod_uid\x18\x04 \x01(\tR\ftargetPodUid\"a\n" +
 	"\x15PrepareSourceResponse\x121\n" +
 	"\x12wal_headroom_bytes\x18\x01 \x01(\x04H\x00R\x10walHeadroomBytes\x88\x01\x01B\x15\n" +
 	"\x13_wal_headroom_bytes\"j\n" +

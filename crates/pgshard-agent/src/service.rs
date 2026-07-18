@@ -368,9 +368,53 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn prepare_source(
         &self,
-        _r: Request<v1::PrepareSourceRequest>,
+        request: Request<v1::PrepareSourceRequest>,
     ) -> Result<Response<v1::PrepareSourceResponse>, Status> {
-        Err(Status::unimplemented("prepare_source"))
+        let req = request.into_inner();
+        // Same fence as StartWorkflow: publication DDL aimed at a reassigned
+        // pod IP must not land on another node incarnation.
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        check_ident("database", &req.database, true)?;
+        check_ident("publication", &req.publication, true)?;
+        // The pgshard_ prefix reserves the namespace: a mismatched same-name
+        // publication is DROPPED to converge, and that must never be able to
+        // name an application's own publication.
+        if !req.publication.starts_with("pgshard_") {
+            return Err(Status::invalid_argument(
+                "publication must carry the pgshard_ prefix (a mismatched publication is dropped to converge)",
+            ));
+        }
+        if req.tables.is_empty() {
+            return Err(Status::invalid_argument("at least one table is required"));
+        }
+        let mut tables = Vec::with_capacity(req.tables.len());
+        for t in &req.tables {
+            check_ident("table schema", &t.schema, true)?;
+            check_ident("table name", &t.name, true)?;
+            if tables.contains(&(t.schema.clone(), t.name.clone())) {
+                return Err(Status::invalid_argument(format!(
+                    "table {}.{} is listed twice",
+                    t.schema, t.name
+                )));
+            }
+            tables.push((t.schema.clone(), t.name.clone()));
+        }
+        let headroom = self
+            .instance
+            .prepare_source(&req.database, &req.publication, &tables)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::PrepareSourceResponse {
+            wal_headroom_bytes: headroom,
+        }))
     }
     async fn start_workflow(
         &self,
@@ -587,6 +631,67 @@ mod tests {
 
     fn svc(instance: FakeInstance) -> AgentSvc<FakeInstance> {
         AgentSvc::new(Arc::new(instance), "pod-0".into())
+    }
+
+    fn prep_req(publication: &str, database: &str) -> v1::PrepareSourceRequest {
+        v1::PrepareSourceRequest {
+            publication: publication.into(),
+            database: database.into(),
+            tables: vec![v1::TableRef {
+                schema: "public".into(),
+                name: "orders".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_source_provisions_the_publication() {
+        let s = svc(FakeInstance::primary());
+        s.instance.seed_database("shard_src", "", None);
+        let resp = s
+            .prepare_source(Request::new(prep_req("pgshard_pub", "shard_src")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.wal_headroom_bytes.is_some());
+        let pubs = s.instance.publications();
+        assert_eq!(
+            pubs.get(&("shard_src".into(), "pgshard_pub".into())),
+            Some(&vec![("public".into(), "orders".into())])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_source_requires_the_reserved_publication_prefix() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .prepare_source(Request::new(prep_req("app_pub", "shard_src")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn prepare_source_rejects_a_duplicate_table() {
+        let s = svc(FakeInstance::primary());
+        let mut req = prep_req("pgshard_pub", "shard_src");
+        req.tables.push(req.tables[0].clone());
+        let err = s.prepare_source(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn prepare_source_refuses_another_pods_uid() {
+        let s = AgentSvc::with_pod_uid(
+            Arc::new(FakeInstance::primary()),
+            "pod-0".into(),
+            "uid-live".into(),
+        );
+        let mut req = prep_req("pgshard_pub", "shard_src");
+        req.target_pod_uid = "uid-stale".into();
+        let err = s.prepare_source(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
     }
 
     #[tokio::test]
