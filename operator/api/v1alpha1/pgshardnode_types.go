@@ -92,6 +92,14 @@ type PgShardNodeStatus struct {
 	// +optional
 	Timeline int32 `json:"timeline,omitempty"`
 
+	// SystemID is the PostgreSQL system identifier of this node's data
+	// lineage, latched from the first confirmed primary that reported one and
+	// never overwritten: an instance reporting a different identifier carries
+	// FOREIGN data (a reused PVC, a restore) and is fenced out of elections.
+	// A uint64 rendered as a decimal string (JSON numbers lose precision).
+	// +optional
+	SystemID string `json:"systemID,omitempty"`
+
 	// +optional
 	Instances []InstanceState `json:"instances,omitempty"`
 

@@ -150,12 +150,16 @@ func (r *PgShardShardReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	readyReplicas, err := r.aggregateStatus(ctx, &shard)
-	if err != nil {
+	// Role labels are synced even when aggregation errored mid-way (a failed
+	// Promote or status write): the assessment may have just fenced an
+	// instance, and leaving its -rw/-ro label standing until a lucky retry
+	// would keep routing to data we already know is wrong.
+	readyReplicas, fenced, aggErr := r.aggregateStatus(ctx, &shard)
+	if err := r.syncRoleLabels(ctx, &shard, fenced); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.syncRoleLabels(ctx, &shard); err != nil {
-		return ctrl.Result{}, err
+	if aggErr != nil {
+		return ctrl.Result{}, aggErr
 	}
 	// Prune only the pods this reconcile confirmed are ready replicas — never a
 	// just-promoted, unpollable, or foreign pod.
@@ -635,12 +639,12 @@ func (r *PgShardShardReconciler) instancePod(
 // bound to their polled UID.
 func (r *PgShardShardReconciler) aggregateStatus(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
-) ([]corev1.Pod, error) {
+) ([]corev1.Pod, map[string]bool, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(shard.Namespace),
 		client.MatchingLabels(shardSelector(shard))); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	before := shard.Status.DeepCopy()
@@ -670,6 +674,8 @@ func (r *PgShardShardReconciler) aggregateStatus(
 				state.Ready = status.Ready
 				view.ready = status.Ready
 				view.receivedLSN = lsnValue(status.WalReceiveLsn)
+				view.systemID = status.SystemId
+				view.timeline = int32(status.Timeline)
 				view.walReceiver = status.WalReceiverActive
 				switch status.Role {
 				case pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY:
@@ -688,17 +694,70 @@ func (r *PgShardShardReconciler) aggregateStatus(
 		views = append(views, view)
 	}
 
+	// Same identity guard as the node controller (this is the legacy physical
+	// path for un-placed shards).
+	var expectedID uint64
+	var parseErr error
+	shard.Status.SystemID, expectedID, shard.Status.Timeline, parseErr = latchIdentity(
+		views, before.CurrentPrimary, before.TargetPrimary,
+		shard.Status.SystemID, shard.Status.Timeline)
+	assessment := assessIdentity(views, identityInputs{
+		systemID:  expectedID,
+		timeline:  shard.Status.Timeline,
+		current:   before.CurrentPrimary,
+		committed: before.TargetPrimary,
+		malformed: parseErr != nil,
+	})
+	// An unrecognized instance's role is never believed: no CurrentPrimary
+	// (-rw writes) for a rogue claimant, no replica role (-ro reads) for a
+	// fenced standby.
+	for i := range views {
+		if assessment.rogue(views[i].pod) {
+			instances[i].Role = ""
+		}
+	}
+	if len(assessment.fenced) > 0 {
+		logf.FromContext(ctx).Info("instances fenced from election or recognition",
+			"shard", shard.Name, "instances", assessment.fenced)
+	}
+
 	shard.Status.Instances = instances
 	// CurrentPrimary is assigned unconditionally, so a demoted/unreachable
 	// primary with no confirmed replacement is CLEARED (else -rw keeps routing
 	// writes to a stale primary).
 	shard.Status.CurrentPrimary, shard.Status.Phase =
 		deriveShardStatus(instances, shard.Spec.Replicas, before.CurrentPrimary != "", shard.Name+"-")
+	// A same-lineage claimant dispute (or a pre-latch identity conflict)
+	// means writes may be landing somewhere we cannot vouch for: publish no
+	// primary at all until it is resolved. An identity blocker parking the
+	// election is likewise not a Ready shard, whatever the ordinal health.
+	if assessment.suppressPrimary {
+		shard.Status.CurrentPrimary = ""
+	}
+	if assessment.suppressPrimary || assessment.blocked {
+		shard.Status.Phase = pgshardv1alpha1.ShardDegraded
+	}
 
-	// Drive the target/current-primary handshake: track the healthy primary, or
-	// elect and promote a replacement when it is gone.
-	if err := r.reconcileFailover(ctx, shard, views); err != nil {
-		return nil, err
+	if cond := identityConsistentCondition(
+		&assessment, shard.Status.SystemID != "", parseErr, shard.Generation); cond != nil {
+		apimeta.SetStatusCondition(&shard.Status.Conditions, *cond)
+	}
+
+	// Drive the target/current-primary handshake: track the healthy primary,
+	// or elect and promote a replacement when it is gone. A pre-latch identity
+	// conflict or an unparseable latch disables the election entirely (fail
+	// closed) until a human resolves it; the condition above says why.
+	fencedPods := make(map[string]bool, len(assessment.unrecognized))
+	for _, pod := range assessment.unrecognized {
+		fencedPods[pod] = true
+	}
+	// A failover error (failed Promote, conflicting status write) must not
+	// abort the poll's safety output: the caller still needs the fenced set
+	// and the status this poll computed, so the write below is attempted and
+	// the error propagated afterwards.
+	var failoverErr error
+	if parseErr == nil && !assessment.conflict {
+		failoverErr = r.reconcileFailover(ctx, shard, assessment.kept)
 	}
 
 	// Ready replicas, bound to their polled pod objects: the only pods a
@@ -714,10 +773,12 @@ func (r *PgShardShardReconciler) aggregateStatus(
 	// own resource, so an unconditional write on every poll (WAL LSNs advance
 	// with every commit) would re-enqueue immediately and spin a hot loop
 	// under write traffic.
-	if apiequality.Semantic.DeepEqual(before, &shard.Status) {
-		return readyReplicas, nil
+	if !apiequality.Semantic.DeepEqual(before, &shard.Status) {
+		if err := client.IgnoreNotFound(r.Status().Update(ctx, shard)); err != nil && failoverErr == nil {
+			failoverErr = err
+		}
 	}
-	return readyReplicas, client.IgnoreNotFound(r.Status().Update(ctx, shard))
+	return readyReplicas, fencedPods, failoverErr
 }
 
 // deriveShardStatus computes the current primary and phase from polled instance
@@ -804,7 +865,7 @@ func lsnString(lsn *pgshardv1.Lsn) string {
 // -ro. A possible writer (an unreachable or not-yet-classified ex-primary) must
 // not receive read traffic on -ro.
 func (r *PgShardShardReconciler) syncRoleLabels(
-	ctx context.Context, shard *pgshardv1alpha1.PgShardShard,
+	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, fenced map[string]bool,
 ) error {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
@@ -829,7 +890,7 @@ func (r *PgShardShardReconciler) syncRoleLabels(
 			want = roleLabelPrimary
 		case confirmedStandby[pod.Name]:
 			want = roleLabelReplica
-		case pod.Labels[labelRole] == roleLabelReplica:
+		case pod.Labels[labelRole] == roleLabelReplica && !fenced[pod.Name]:
 			// Role unconfirmed this cycle (a transient poll blip), but the pod was
 			// a confirmed standby: keep it in -ro rather than flap a healthy replica
 			// out of read routing on a single hiccup. A possible writer is never
