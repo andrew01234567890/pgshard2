@@ -55,6 +55,25 @@ impl PgBlockReserver {
     }
 }
 
+/// The production construction of the reservation config — typed setters only,
+/// so hostile credential content is inert. Kept here (not in the binary) so the
+/// unit test guards the exact code the router runs.
+pub fn reserver_config(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+) -> postgres::Config {
+    let mut cfg = postgres::Config::new();
+    cfg.host(host)
+        .port(port)
+        .user(user)
+        .password(password)
+        .dbname(dbname);
+    cfg
+}
+
 impl BlockReserver for PgBlockReserver {
     fn reserve(&self, sequence: &str) -> Result<(i64, i64), SeqError> {
         // Recover a poisoned lock rather than wedge every future reservation:
@@ -106,20 +125,26 @@ fn connect(conn: &postgres::Config) -> Result<Client, SeqError> {
 
 #[cfg(test)]
 mod tests {
+    use super::reserver_config;
+
     #[test]
     fn hostile_password_stays_one_credential() {
-        // With typed setters a password containing conninfo syntax is inert: it
-        // stays a single credential and cannot add hosts or options.
-        let mut cfg = postgres::Config::new();
-        cfg.host("sys")
-            .port(5432)
-            .user("router")
-            .password("p ss'word host=evil port=9999")
-            .dbname("pgshard_system");
+        // The production builder keeps a password containing conninfo syntax
+        // inert: one credential, one host, nothing reinterpreted.
+        let cfg = reserver_config(
+            "sys",
+            5432,
+            "router",
+            "p ss'word host=evil port=9999",
+            "pgshard_system",
+        );
         assert_eq!(
             cfg.get_password(),
             Some("p ss'word host=evil port=9999".as_bytes())
         );
         assert_eq!(cfg.get_hosts().len(), 1);
+        assert_eq!(cfg.get_ports(), &[5432]);
+        assert_eq!(cfg.get_user(), Some("router"));
+        assert_eq!(cfg.get_dbname(), Some("pgshard_system"));
     }
 }

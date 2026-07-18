@@ -80,13 +80,13 @@ async fn main() -> anyhow::Result<()> {
     // Typed setters, never a formatted conninfo string: a credential containing
     // whitespace or quotes must not split into extra connection options.
     let system_conn = router.load().system_endpoint().map(|ep| {
-        let mut cfg = postgres::Config::new();
-        cfg.host(&ep.host)
-            .port(ep.port)
-            .user(&backend.user)
-            .password(&backend.password)
-            .dbname(&backend.system_database);
-        cfg
+        pgshard_router::sequence::reserver_config(
+            &ep.host,
+            ep.port,
+            &backend.user,
+            &backend.password,
+            &backend.system_database,
+        )
     });
     let proxy = std::sync::Arc::new(match system_conn {
         Some(conn) => {
