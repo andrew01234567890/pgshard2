@@ -112,6 +112,20 @@ type BackupShard struct {
 	StopTime time.Time `json:"stopTime"`
 }
 
+// Wire values for ShardTopology.Role, ShardTopology.State, and
+// TableTopology.Type, matching the compiled routing view.
+const (
+	RoleData      = "data"
+	RoleSystem    = "system"
+	StateServing  = "serving"
+	StateBuffered = "buffered"
+	StateReadOnly = "readOnly"
+	StateDraining = "draining"
+	StateHidden   = "hidden"
+	TableSharded  = "sharded"
+	TableGlobal   = "global"
+)
+
 // Catalog is the full manifest set a resolver works over. Callers load it
 // from object storage; tests construct it directly.
 type Catalog struct {

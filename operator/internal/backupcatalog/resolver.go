@@ -342,13 +342,13 @@ func snapshotComplete(topology TopologySnapshot) error {
 	}
 	for _, sh := range topology.Shards {
 		switch sh.Role {
-		case "data", "system":
+		case RoleData, RoleSystem:
 		default:
 			return errf("topology generation %d: shard %s has unknown role %q (need data|system)",
 				topology.Generation, sh.Name, sh.Role)
 		}
 		switch sh.State {
-		case "serving", "buffered", "readOnly", "draining", "hidden":
+		case StateServing, StateBuffered, StateReadOnly, StateDraining, StateHidden:
 		default:
 			return errf("topology generation %d: shard %s has unknown routing state %q",
 				topology.Generation, sh.Name, sh.State)
@@ -368,12 +368,12 @@ func snapshotComplete(topology TopologySnapshot) error {
 		}
 		seen[key] = true
 		switch t.Type {
-		case "sharded":
+		case TableSharded:
 			if t.ShardKeyColumn == "" || t.ShardKeyType == "" {
 				return errf("topology generation %d: sharded table %s records no shard key column/type",
 					topology.Generation, key)
 			}
-		case "global":
+		case TableGlobal:
 		default:
 			return errf("topology generation %d: table %s has unknown type %q",
 				topology.Generation, key, t.Type)

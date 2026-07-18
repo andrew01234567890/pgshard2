@@ -38,10 +38,10 @@ var (
 
 func driftTables() []TableTopology {
 	return []TableTopology{
-		{Schema: "public", Name: "orders", Type: "sharded",
+		{Schema: "public", Name: "orders", Type: TableSharded,
 			ShardKeyColumn: "customer_id", ShardKeyType: "int8",
 			Sequences: []SequenceTopology{{Column: "id", Sequence: "orders_id"}}},
-		{Schema: "public", Name: "currencies", Type: "global"},
+		{Schema: "public", Name: "currencies", Type: TableGlobal},
 	}
 }
 
@@ -50,15 +50,15 @@ func driftCatalog() Catalog {
 		Topologies: []TopologySnapshot{
 			{Generation: 1, ValidFrom: t0, Epoch: 1, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
-					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA, Role: "data", State: "serving"},
-					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB, Role: "data", State: "serving"},
+					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA, Role: RoleData, State: StateServing},
+					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB, Role: RoleData, State: StateServing},
 				}},
 			{Generation: 2, ValidFrom: t3, Epoch: 10, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
-					{Name: "C", KeyRange: KeyRangeRef{End: "40"}, Stanza: stanzaC, Role: "data", State: "serving"},
-					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD, Role: "data", State: "serving"},
-					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE, Role: "data", State: "serving"},
-					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF, Role: "data", State: "serving"},
+					{Name: "C", KeyRange: KeyRangeRef{End: "40"}, Stanza: stanzaC, Role: RoleData, State: StateServing},
+					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD, Role: RoleData, State: StateServing},
+					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE, Role: RoleData, State: StateServing},
+					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF, Role: RoleData, State: StateServing},
 				}},
 		},
 		Barriers: []BarrierManifest{
@@ -245,7 +245,7 @@ func TestIncompleteTopologySnapshotIsRejected(t *testing.T) {
 
 	caseDup := driftCatalog()
 	caseDup.Topologies[0].Tables = append(caseDup.Topologies[0].Tables, TableTopology{
-		Schema: "PUBLIC", Name: "Orders", Type: "sharded",
+		Schema: "PUBLIC", Name: "Orders", Type: TableSharded,
 		ShardKeyColumn: "customer_id", ShardKeyType: "int8",
 	})
 	if _, err := Resolve(caseDup, Target{BackupID: backup1}); err == nil {
