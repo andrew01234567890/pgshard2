@@ -41,6 +41,7 @@ rules:
   resources:
   - pgshardclusters
   - pgshardnodes
+  - pgshardreshards
   - pgshardshards
   verbs:
   - create
@@ -55,6 +56,7 @@ rules:
   resources:
   - pgshardclusters/finalizers
   - pgshardnodes/finalizers
+  - pgshardreshards/finalizers
   - pgshardshards/finalizers
   verbs:
   - update
@@ -63,6 +65,7 @@ rules:
   resources:
   - pgshardclusters/status
   - pgshardnodes/status
+  - pgshardreshards/status
   - pgshardshards/status
   verbs:
   - get
