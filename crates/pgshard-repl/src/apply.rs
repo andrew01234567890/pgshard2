@@ -10,9 +10,10 @@
 //! checkpoint back to the source via [`crate::client::ReplicationClient::confirm`]
 //! so the slot never advances past the durable position.
 //!
-//! Slice 1 applies inserts. Update, delete, and truncate are rejected (fail
-//! closed) rather than silently skipped, so the target never diverges; they, plus
-//! replication origins for loop prevention, are the next slice.
+//! Inserts, updates, and deletes are applied (updates and deletes match by the
+//! table's replica-identity key). Truncate and streamed/two-phase transactions
+//! are rejected (fail closed) rather than silently skipped, so the target never
+//! diverges; those, plus replication origins for loop prevention, are follow-ups.
 
 use std::collections::HashMap;
 
@@ -37,6 +38,8 @@ pub enum ApplyError {
     },
     #[error("non-UTF-8 value in a text column")]
     InvalidUtf8,
+    #[error("a change affected {affected} target rows, expected exactly 1 (target diverged)")]
+    RowCountMismatch { affected: u64 },
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
 }
@@ -48,19 +51,39 @@ struct RelationInfo {
     schema: String,
     table: String,
     columns: Vec<String>,
+    /// `relreplident`: `d` default (PK), `i` index, `f` full, `n` nothing.
+    replica_identity: u8,
+    /// Indices into `columns` of the replica-identity key columns — the `WHERE`
+    /// of an update or delete.
+    key_columns: Vec<usize>,
 }
 
-/// A column value buffered for apply. Text is the pgoutput text form, applied as
-/// an unknown-typed literal that the target column coerces back to its type.
+/// A column value buffered for apply. `Text` is the pgoutput text form, applied
+/// as an unknown-typed literal the target column coerces back to its type;
+/// `Unchanged` is a TOASTed value an update did not ship (the stored value stays).
 enum Cell {
     Null,
     Text(Vec<u8>),
+    Unchanged,
 }
 
-/// One buffered insert awaiting its transaction's commit.
-struct PendingInsert {
-    rel_oid: Oid,
-    values: Vec<Cell>,
+/// One buffered change awaiting its transaction's commit.
+enum PendingChange {
+    Insert {
+        rel_oid: Oid,
+        new: Vec<Cell>,
+    },
+    Update {
+        rel_oid: Oid,
+        /// The tuple to read the old key from: the `K`/`O` sub-message, or the new
+        /// tuple when the key did not change.
+        key_source: Vec<Cell>,
+        new: Vec<Cell>,
+    },
+    Delete {
+        rel_oid: Oid,
+        key_source: Vec<Cell>,
+    },
 }
 
 /// Applies a decoded logical-replication stream to a target database.
@@ -69,7 +92,7 @@ pub struct Applier {
     relations: HashMap<Oid, RelationInfo>,
     consumer: String,
     checkpoint: Lsn,
-    pending: Vec<PendingInsert>,
+    pending: Vec<PendingChange>,
 }
 
 impl Applier {
@@ -120,7 +143,7 @@ impl Applier {
         self.checkpoint
     }
 
-    /// Handle one decoded message: track relations, buffer inserts, and apply at
+    /// Handle one decoded message: track relations, buffer changes, and apply at
     /// commit. Rejects anything it cannot apply soundly rather than skipping it.
     pub async fn handle(&mut self, msg: &LogicalRepMsg<'_>) -> Result<()> {
         match msg {
@@ -131,6 +154,14 @@ impl Applier {
                         schema: r.namespace.to_owned(),
                         table: r.name.to_owned(),
                         columns: r.columns.iter().map(|c| c.name.to_owned()).collect(),
+                        replica_identity: r.replica_identity,
+                        key_columns: r
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_key())
+                            .map(|(i, _)| i)
+                            .collect(),
                     },
                 );
                 Ok(())
@@ -140,24 +171,48 @@ impl Applier {
                 Ok(())
             }
             LogicalRepMsg::Insert(insert) => {
-                let values = insert
-                    .new_tuple
-                    .columns
-                    .iter()
-                    .map(cell_of)
-                    .collect::<Result<Vec<_>>>()?;
-                self.pending.push(PendingInsert {
+                self.pending.push(PendingChange::Insert {
                     rel_oid: insert.rel_oid,
-                    values,
+                    new: tuple_cells(&insert.new_tuple)?,
+                });
+                Ok(())
+            }
+            LogicalRepMsg::Update(update) => {
+                // The old key comes from the K (index/changed identity) or O (full)
+                // sub-message when present, else the new tuple (default identity,
+                // key unchanged).
+                let key_source = match (&update.key, &update.old) {
+                    (Some(key), _) => tuple_cells(key)?,
+                    (None, Some(old)) => tuple_cells(old)?,
+                    (None, None) => tuple_cells(&update.new_tuple)?,
+                };
+                self.pending.push(PendingChange::Update {
+                    rel_oid: update.rel_oid,
+                    key_source,
+                    new: tuple_cells(&update.new_tuple)?,
+                });
+                Ok(())
+            }
+            LogicalRepMsg::Delete(delete) => {
+                let key_source = match (&delete.key, &delete.old) {
+                    (Some(key), _) => tuple_cells(key)?,
+                    (None, Some(old)) => tuple_cells(old)?,
+                    (None, None) => {
+                        return Err(ApplyError::Unsupported(
+                            "delete without a replica-identity key",
+                        ));
+                    }
+                };
+                self.pending.push(PendingChange::Delete {
+                    rel_oid: delete.rel_oid,
+                    key_source,
                 });
                 Ok(())
             }
             LogicalRepMsg::Commit(commit) => self.commit(commit.commit_lsn).await,
             // Metadata the apply path does not act on directly.
             LogicalRepMsg::Origin(_) | LogicalRepMsg::Type(_) | LogicalRepMsg::Message(_) => Ok(()),
-            // Fail closed rather than silently diverge — next slice.
-            LogicalRepMsg::Update(_) => Err(ApplyError::Unsupported("UPDATE apply")),
-            LogicalRepMsg::Delete(_) => Err(ApplyError::Unsupported("DELETE apply")),
+            // Fail closed rather than silently diverge — follow-ups.
             LogicalRepMsg::Truncate(_) => Err(ApplyError::Unsupported("TRUNCATE apply")),
             _ => Err(ApplyError::Unsupported(
                 "streamed or two-phase transactions",
@@ -178,17 +233,41 @@ impl Applier {
         // Build every statement before opening the transaction so the relation
         // map is only borrowed while the target connection is not.
         let mut statements = Vec::with_capacity(self.pending.len());
-        for insert in &self.pending {
-            let relation = self
-                .relations
-                .get(&insert.rel_oid)
-                .ok_or(ApplyError::UnknownRelation(insert.rel_oid))?;
-            statements.push(build_insert(relation, &insert.values)?);
+        for change in &self.pending {
+            match change {
+                PendingChange::Insert { rel_oid, new } => {
+                    statements.push(build_insert(self.relation(*rel_oid)?, new)?);
+                }
+                PendingChange::Update {
+                    rel_oid,
+                    key_source,
+                    new,
+                } => {
+                    // An update that changed only unshipped-TOAST columns has
+                    // nothing to set; skip it.
+                    if let Some(sql) = build_update(self.relation(*rel_oid)?, key_source, new)? {
+                        statements.push(sql);
+                    }
+                }
+                PendingChange::Delete {
+                    rel_oid,
+                    key_source,
+                } => {
+                    statements.push(build_delete(self.relation(*rel_oid)?, key_source)?);
+                }
+            }
         }
 
         let txn = self.target.transaction().await?;
         for sql in &statements {
-            txn.batch_execute(sql).await?;
+            // Each built statement targets exactly one row (insert, or update/delete
+            // matched by the replica-identity key). A different count means the
+            // target diverged from the source — a missing row, or a duplicate under
+            // a key that should be unique — so surface it instead of hiding it.
+            let affected = txn.execute(sql.as_str(), &[]).await?;
+            if affected != 1 {
+                return Err(ApplyError::RowCountMismatch { affected });
+            }
         }
         // Advance the checkpoint in the SAME transaction as the changes: either
         // both land or neither does, which is what makes the apply exactly-once.
@@ -204,25 +283,41 @@ impl Applier {
         self.pending.clear();
         Ok(())
     }
+
+    fn relation(&self, oid: Oid) -> Result<&RelationInfo> {
+        self.relations
+            .get(&oid)
+            .ok_or(ApplyError::UnknownRelation(oid))
+    }
+}
+
+fn tuple_cells(tuple: &crate::pgoutput::TupleData) -> Result<Vec<Cell>> {
+    tuple.columns.iter().map(cell_of).collect()
 }
 
 fn cell_of(column: &TupleColumn) -> Result<Cell> {
     match column {
         TupleColumn::Null => Ok(Cell::Null),
         TupleColumn::Text(bytes) => Ok(Cell::Text(bytes.to_vec())),
-        TupleColumn::UnchangedToast => Err(ApplyError::Unsupported("unchanged-TOAST value")),
+        TupleColumn::UnchangedToast => Ok(Cell::Unchanged),
         TupleColumn::Binary(_) => Err(ApplyError::Unsupported("binary-format value")),
     }
 }
 
-fn build_insert(relation: &RelationInfo, values: &[Cell]) -> Result<String> {
-    if values.len() != relation.columns.len() {
+/// Error unless `cells` has one entry per relation column.
+fn check_len(relation: &RelationInfo, cells: &[Cell]) -> Result<()> {
+    if cells.len() != relation.columns.len() {
         return Err(ApplyError::ColumnCountMismatch {
             relation: format!("{}.{}", relation.schema, relation.table),
             expected: relation.columns.len(),
-            actual: values.len(),
+            actual: cells.len(),
         });
     }
+    Ok(())
+}
+
+fn build_insert(relation: &RelationInfo, values: &[Cell]) -> Result<String> {
+    check_len(relation, values)?;
     let columns = relation
         .columns
         .iter()
@@ -243,6 +338,80 @@ fn build_insert(relation: &RelationInfo, values: &[Cell]) -> Result<String> {
     ))
 }
 
+/// Build an `UPDATE`, or `None` when the row image shipped no changed values
+/// (only unchanged-TOAST columns) and there is nothing to set.
+fn build_update(
+    relation: &RelationInfo,
+    key_source: &[Cell],
+    new: &[Cell],
+) -> Result<Option<String>> {
+    check_len(relation, key_source)?;
+    check_len(relation, new)?;
+    let mut assignments = Vec::new();
+    for (name, cell) in relation.columns.iter().zip(new) {
+        // A TOASTed value the update did not ship keeps its stored value.
+        if matches!(cell, Cell::Unchanged) {
+            continue;
+        }
+        assignments.push(format!("{} = {}", quote_ident(name), render_cell(cell)?));
+    }
+    if assignments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "UPDATE {}.{} SET {} WHERE {}",
+        quote_ident(&relation.schema),
+        quote_ident(&relation.table),
+        assignments.join(", "),
+        build_where(relation, key_source)?,
+    )))
+}
+
+fn build_delete(relation: &RelationInfo, key_source: &[Cell]) -> Result<String> {
+    check_len(relation, key_source)?;
+    Ok(format!(
+        "DELETE FROM {}.{} WHERE {}",
+        quote_ident(&relation.schema),
+        quote_ident(&relation.table),
+        build_where(relation, key_source)?,
+    ))
+}
+
+/// The `WHERE` matching a row by its replica-identity key columns.
+fn build_where(relation: &RelationInfo, key_source: &[Cell]) -> Result<String> {
+    // Only a key-based identity (default = PK, or an explicit index) matches a
+    // single row unambiguously. REPLICA IDENTITY FULL (`f`) matches on the whole
+    // old row — which double-matches duplicate rows — and NOTHING (`n`) gives no
+    // key at all; reject both rather than risk changing the wrong rows.
+    if !matches!(relation.replica_identity, b'd' | b'i') {
+        return Err(ApplyError::Unsupported(
+            "update/delete requires REPLICA IDENTITY DEFAULT or an index (full/nothing not supported)",
+        ));
+    }
+    if relation.key_columns.is_empty() {
+        return Err(ApplyError::Unsupported(
+            "update/delete on a table with no replica-identity key",
+        ));
+    }
+    let mut conditions = Vec::with_capacity(relation.key_columns.len());
+    for &i in &relation.key_columns {
+        let condition = match &key_source[i] {
+            // A key column is never null or an unshipped TOAST value.
+            Cell::Null => return Err(ApplyError::Unsupported("null replica-identity key")),
+            Cell::Unchanged => {
+                return Err(ApplyError::Unsupported("unshipped replica-identity key"));
+            }
+            cell => format!(
+                "{} = {}",
+                quote_ident(&relation.columns[i]),
+                render_cell(cell)?
+            ),
+        };
+        conditions.push(condition);
+    }
+    Ok(conditions.join(" AND "))
+}
+
 fn render_cell(cell: &Cell) -> Result<String> {
     match cell {
         Cell::Null => Ok("NULL".to_owned()),
@@ -250,6 +419,9 @@ fn render_cell(cell: &Cell) -> Result<String> {
             let text = std::str::from_utf8(bytes).map_err(|_| ApplyError::InvalidUtf8)?;
             Ok(quote_literal(text))
         }
+        Cell::Unchanged => Err(ApplyError::Unsupported(
+            "unshipped TOAST value in a full row",
+        )),
     }
 }
 
@@ -267,7 +439,28 @@ fn quote_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_ident, quote_literal};
+    use super::{
+        Cell, RelationInfo, build_delete, build_insert, build_update, quote_ident, quote_literal,
+    };
+
+    fn text(s: &str) -> Cell {
+        Cell::Text(s.as_bytes().to_vec())
+    }
+
+    /// A two-column `public.orders(id, note)` with `id` as the key.
+    fn orders(replica_identity: u8) -> RelationInfo {
+        RelationInfo {
+            schema: "public".to_owned(),
+            table: "orders".to_owned(),
+            columns: vec!["id".to_owned(), "note".to_owned()],
+            replica_identity,
+            key_columns: if replica_identity == b'n' {
+                vec![]
+            } else {
+                vec![0]
+            },
+        }
+    }
 
     #[test]
     fn quoting_neutralizes_injection() {
@@ -279,5 +472,83 @@ mod tests {
         );
         assert_eq!(quote_ident("orders"), "\"orders\"");
         assert_eq!(quote_ident("weird\"name"), "\"weird\"\"name\"");
+    }
+
+    #[test]
+    fn insert_names_every_column() {
+        let sql = build_insert(&orders(b'd'), &[text("1"), text("hi")]).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"public\".\"orders\" (\"id\", \"note\") VALUES ('1', 'hi')"
+        );
+    }
+
+    #[test]
+    fn update_sets_shipped_columns_and_matches_by_key() {
+        // Default identity, key unchanged: key_source is the new tuple.
+        let sql = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[text("1"), text("z")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"orders\" SET \"id\" = '1', \"note\" = 'z' WHERE \"id\" = '1'"
+        );
+    }
+
+    #[test]
+    fn update_skips_unchanged_toast_and_no_op_updates() {
+        // A shipped 'note' change with an unchanged-TOAST 'id' would not happen for
+        // a key, but exercises SET omission on the second column.
+        let sql = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[text("1"), Cell::Unchanged],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"orders\" SET \"id\" = '1' WHERE \"id\" = '1'"
+        );
+        // All columns unchanged → nothing to set → no statement.
+        let none = build_update(
+            &orders(b'd'),
+            &[text("1"), text("z")],
+            &[Cell::Unchanged, Cell::Unchanged],
+        )
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn delete_matches_by_key() {
+        let sql = build_delete(&orders(b'd'), &[text("1"), Cell::Null]).unwrap();
+        assert_eq!(sql, "DELETE FROM \"public\".\"orders\" WHERE \"id\" = '1'");
+    }
+
+    #[test]
+    fn multi_column_key_is_anded() {
+        let mut rel = orders(b'i');
+        rel.columns = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        rel.key_columns = vec![0, 1];
+        let sql = build_delete(&rel, &[text("x"), text("y"), text("z")]).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"public\".\"orders\" WHERE \"a\" = 'x' AND \"b\" = 'y'"
+        );
+    }
+
+    #[test]
+    fn unsupported_or_missing_keys_fail_closed() {
+        // REPLICA IDENTITY FULL / NOTHING are rejected.
+        assert!(build_delete(&orders(b'f'), &[text("1"), text("hi")]).is_err());
+        assert!(build_delete(&orders(b'n'), &[text("1"), text("hi")]).is_err());
+        // A NULL or unshipped-TOAST key value is rejected.
+        assert!(build_delete(&orders(b'd'), &[Cell::Null, text("hi")]).is_err());
+        assert!(build_delete(&orders(b'd'), &[Cell::Unchanged, text("hi")]).is_err());
     }
 }
