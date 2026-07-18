@@ -733,6 +733,41 @@ async fn altering_the_publication_mid_stream_fails_loudly() -> anyhow::Result<()
     })
     .await;
 
+    // ADD COLUMN never touches a versioned catalog row when there is no
+    // explicit column list — only the published column names betray it. The
+    // stream would otherwise keep applying rows missing the new column.
+    source
+        .batch_execute("ALTER TABLE orders ADD COLUMN added int")
+        .await?;
+    wait_for_error(&registry, "wf_pubdrift", "changed while streaming").await;
+
+    // Restart the workflow for the transient-toggle half of this test — the
+    // re-seed picks up the widened schema on both sides.
+    target
+        .batch_execute("ALTER TABLE orders ADD COLUMN added int")
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match registry
+            .start(&spec(&pg, "wf_pubdrift", "pgshard_pubdrift"), &config)
+            .await
+        {
+            Ok(()) => break,
+            Err(WorkflowError::Stopping(_)) => {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => panic!("restart after drift failure: {other:?}"),
+        }
+    }
+    wait_for(
+        &registry,
+        "wf_pubdrift",
+        "streaming after the reseed",
+        |s| s.phase == v1::WorkflowPhase::Streaming as i32,
+    )
+    .await;
+
     // A transient toggle — disable a DML kind and RESTORE it before the next
     // poll — leaves the sampled shape identical, but every ALTER PUBLICATION
     // rewrites the catalog row and xids never repeat, so the captured row

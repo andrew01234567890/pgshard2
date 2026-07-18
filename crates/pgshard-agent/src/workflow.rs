@@ -443,6 +443,10 @@ struct TablePreflight {
 struct PublishedTable {
     schema: String,
     name: String,
+    /// The currently-published column names — part of the drift shape: with
+    /// no explicit list, ADD COLUMN silently expands the publication without
+    /// touching any versioned catalog row, and only this list betrays it.
+    columns: Vec<String>,
     has_column_list: bool,
     has_row_filter: bool,
 }
@@ -541,7 +545,7 @@ async fn fetch_publication(
         .collect();
     let tables = source_sql
         .query(
-            "SELECT pt.schemaname::text, pt.tablename::text,
+            "SELECT pt.schemaname::text, pt.tablename::text, pt.attnames::text[],
                     pr.prattrs IS NOT NULL, pr.prqual IS NOT NULL
              FROM pg_publication_tables pt
              JOIN pg_publication p ON p.pubname = pt.pubname
@@ -558,8 +562,9 @@ async fn fetch_publication(
         .map(|r| PublishedTable {
             schema: r.get(0),
             name: r.get(1),
-            has_column_list: r.get::<_, Option<bool>>(2).unwrap_or(false),
-            has_row_filter: r.get::<_, Option<bool>>(3).unwrap_or(false),
+            columns: r.get::<_, Option<Vec<String>>>(2).unwrap_or_default(),
+            has_column_list: r.get::<_, Option<bool>>(3).unwrap_or(false),
+            has_row_filter: r.get::<_, Option<bool>>(4).unwrap_or(false),
         })
         .collect();
     let horizon = xid_recurrence_horizon(xid, &versions)?;
