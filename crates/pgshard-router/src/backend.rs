@@ -89,11 +89,16 @@ fn dml_tag_prefix(query: &str) -> Option<String> {
 /// (v1 forwards a single statement, so normally one).
 #[async_trait]
 pub trait BackendConnection: Send + Sync {
+    /// `read_only` runs the query under `default_transaction_read_only=on`,
+    /// so PostgreSQL itself refuses any write — including one hidden inside a
+    /// function body the router cannot see. The proxy sets it for reads served
+    /// under an expired write lease.
     async fn run(
         &self,
         endpoint: &Endpoint,
         database: &str,
         query: &str,
+        read_only: bool,
     ) -> PgWireResult<Vec<BackendResult>>;
 }
 
@@ -127,6 +132,7 @@ impl BackendConnection for TokioPostgresBackend {
         endpoint: &Endpoint,
         database: &str,
         query: &str,
+        read_only: bool,
     ) -> PgWireResult<Vec<BackendResult>> {
         // Typed setters, never a formatted conninfo string: a credential
         // containing whitespace or quotes must not split into extra connection
@@ -137,6 +143,9 @@ impl BackendConnection for TokioPostgresBackend {
             .user(&self.creds.user)
             .password(&self.creds.password)
             .dbname(database);
+        if read_only {
+            conn.options("-c default_transaction_read_only=on");
+        }
         let (client, connection) = conn.connect(NoTls).await.map_err(tokio_backend_error)?;
         // The connection task drives the protocol; it ends when `client` drops.
         let driver = tokio::spawn(connection);
@@ -266,6 +275,7 @@ impl BackendConnection for PgWireBackend {
         endpoint: &Endpoint,
         database: &str,
         query: &str,
+        read_only: bool,
     ) -> PgWireResult<Vec<BackendResult>> {
         // No TLS connector forces a plain connection regardless of ssl_mode.
         let mut config = Config::new();
@@ -275,11 +285,22 @@ impl BackendConnection for PgWireBackend {
             .user(self.creds.user.clone())
             .password(self.creds.password.clone())
             .dbname(database.to_owned());
-
         let mut client =
             PgWireClient::connect(Arc::new(config), DefaultStartupHandler::new(), None)
                 .await
                 .map_err(client_error)?;
+        if read_only {
+            // The pgwire client's startup does not transmit `options`, so pin
+            // the session explicitly before the query: PostgreSQL then refuses
+            // any write — including one hidden inside a function body.
+            client
+                .simple_query(
+                    ResultCollector::default(),
+                    "SET default_transaction_read_only = on",
+                )
+                .await
+                .map_err(client_error)?;
+        }
         client
             .simple_query(ResultCollector::default(), query)
             .await

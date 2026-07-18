@@ -169,6 +169,8 @@ type PgShardRoutingSpec struct {
 
 	// +kubebuilder:default=10
 	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=60
 	WriteLeaseSeconds int32 `json:"writeLeaseSeconds,omitempty"`
 
 	// +kubebuilder:default="xxhash64_v1"

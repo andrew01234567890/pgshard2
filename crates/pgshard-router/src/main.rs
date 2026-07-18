@@ -66,7 +66,26 @@ async fn main() -> anyhow::Result<()> {
         Router::build(&initial).context("building router from the initial topology")?,
     );
     tracing::info!(epoch = router.load().epoch(), "loaded initial topology");
-    tokio::spawn(pgshard_router::watch_topology(router.clone(), updates));
+
+    // The write lease renews only when the ACTIVE router's view is
+    // re-confirmed (see watch_topology_leased). A poll interval at or beyond
+    // the lease would make writes flap off between polls even when everything
+    // is healthy — refuse the misconfiguration at startup.
+    let lease = router.load().write_lease();
+    if Duration::from_secs(args.poll_seconds) >= lease {
+        anyhow::bail!(
+            "poll interval ({}s) must be shorter than the topology's writeLeaseSeconds ({}s): \
+             a healthy router could not renew its write lease between polls",
+            args.poll_seconds,
+            lease.as_secs()
+        );
+    }
+    let freshness = pgshard_topo::Freshness::new();
+    tokio::spawn(pgshard_router::watch_topology_leased(
+        router.clone(),
+        updates,
+        Some((watcher.subscribe_validated(), freshness.clone())),
+    ));
 
     let backend = Backend {
         user: args.backend_user,
@@ -88,9 +107,6 @@ async fn main() -> anyhow::Result<()> {
             &backend.system_database,
         )
     });
-    // The watcher's freshness stamp drives the write lease: writes stop once
-    // the topology can no longer be confirmed current within the lease window.
-    let freshness = watcher.freshness();
     let proxy = std::sync::Arc::new(
         match system_conn {
             Some(conn) => {

@@ -44,29 +44,42 @@ pub trait TopologyWatcher {
 /// `write_lease_seconds`, so a router cut off from its source cannot keep
 /// writing against a routing world that may have moved on.
 #[derive(Clone)]
-pub struct Freshness(Arc<std::sync::RwLock<std::time::Instant>>);
+pub struct Freshness(Arc<std::sync::RwLock<(std::time::Instant, std::time::SystemTime)>>);
 
 impl Freshness {
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::RwLock::new(std::time::Instant::now())))
+        Self(Arc::new(std::sync::RwLock::new((
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+        ))))
     }
 
-    /// Record a successful source validation now.
+    /// Record a successful confirmation now.
     pub fn bump(&self) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) =
+            (std::time::Instant::now(), std::time::SystemTime::now());
     }
 
-    /// How long ago the source was last successfully validated.
+    /// How long ago the view was last confirmed. Takes the LARGER of the
+    /// monotonic and wall-clock elapsed times: Linux's monotonic clock stops
+    /// during system suspend, so a resumed node would otherwise think a
+    /// pre-suspend confirmation is recent. A wall-clock jump (NTP step) can
+    /// only make the age look larger — a false expiry fails closed.
     pub fn age(&self) -> std::time::Duration {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).elapsed()
+        let (instant, wall) = *self.0.read().unwrap_or_else(|e| e.into_inner());
+        let monotonic = instant.elapsed();
+        let wall_elapsed = std::time::SystemTime::now()
+            .duration_since(wall)
+            .unwrap_or_default();
+        monotonic.max(wall_elapsed)
     }
 
-    /// Test hook: pretend the last successful validation happened `by` ago.
+    /// Test hook: pretend the last confirmation happened `by` ago.
     #[doc(hidden)]
     pub fn backdate(&self, by: std::time::Duration) {
         let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
         if let Some(at) = std::time::Instant::now().checked_sub(by) {
-            *guard = at;
+            *guard = (at, std::time::SystemTime::now() - by);
         }
     }
 }
@@ -85,6 +98,14 @@ impl Default for Freshness {
 pub fn validate(topology: &Topology) -> Result<(), TopologyError> {
     if topology.epoch == 0 {
         return Err(TopologyError::Invalid("epoch must be >= 1".into()));
+    }
+    // Mirrors the cluster CRD's bounds: 0 would refuse every write, and an
+    // enormous value effectively disables stale-write fencing.
+    if !(1..=60).contains(&topology.write_lease_seconds) {
+        return Err(TopologyError::Invalid(format!(
+            "writeLeaseSeconds {} must be between 1 and 60",
+            topology.write_lease_seconds
+        )));
     }
     if topology.topology_generation == 0 {
         return Err(TopologyError::Invalid(

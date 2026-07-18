@@ -258,13 +258,66 @@ pub fn shared(router: Router) -> SharedRouter {
 /// topology that fails to build — e.g. a transient reshard state whose serving
 /// shards do not yet partition the keyspace — is logged and skipped, keeping the
 /// last good router. Returns when the watcher is dropped.
-pub async fn watch_topology(target: SharedRouter, mut updates: watch::Receiver<Arc<Topology>>) {
-    while updates.changed().await.is_ok() {
+pub async fn watch_topology(target: SharedRouter, updates: watch::Receiver<Arc<Topology>>) {
+    watch_topology_leased(target, updates, None).await;
+}
+
+/// [`watch_topology`] plus write-lease renewal. `lease` pairs the watcher's
+/// validated-epoch stream with the proxy's [`pgshard_topo::Freshness`] stamp.
+///
+/// The lease renews only when the ACTIVE router's view is re-confirmed:
+/// either the source re-validates at exactly the active epoch, or a newer
+/// epoch arrives AND builds AND swaps in. A source the router cannot accept —
+/// a gated topology, a build error, a file frozen at a different epoch — does
+/// NOT renew, so writes stop once the lease expires. That is the fail-safe: a
+/// router that cannot follow its topology forward must not keep writing
+/// against the world it last saw.
+pub async fn watch_topology_leased(
+    target: SharedRouter,
+    mut updates: watch::Receiver<Arc<Topology>>,
+    lease: Option<(watch::Receiver<u64>, pgshard_topo::Freshness)>,
+) {
+    let (mut validated, freshness) = match lease {
+        Some((v, f)) => (Some(v), Some(f)),
+        None => (None, None),
+    };
+    loop {
+        let changed = async {
+            match &mut validated {
+                Some(v) => {
+                    tokio::select! {
+                        r = updates.changed() => r.map(|()| true),
+                        r = v.changed() => r.map(|()| false),
+                    }
+                }
+                None => updates.changed().await.map(|()| true),
+            }
+        };
+        let Ok(is_update) = changed.await else {
+            return; // watcher dropped
+        };
+        if !is_update {
+            // A validated-epoch announcement: renew the lease only if it
+            // confirms the epoch this router is actually serving.
+            let epoch = *validated
+                .as_mut()
+                .expect("validated stream")
+                .borrow_and_update();
+            if epoch == target.load().epoch()
+                && let Some(f) = &freshness
+            {
+                f.bump();
+            }
+            continue;
+        }
         let topology = updates.borrow_and_update().clone();
         match Router::build(&topology) {
             Ok(router) => {
                 let epoch = router.epoch();
                 target.store(Arc::new(router));
+                if let Some(f) = &freshness {
+                    f.bump();
+                }
                 tracing::info!(epoch, "applied topology update");
             }
             Err(err) => {
