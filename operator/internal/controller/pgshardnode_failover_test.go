@@ -468,6 +468,10 @@ var _ = Describe("PgShardNode failover identity fencing", func() {
 		cond := apimeta.FindStatusCondition(get().Status.Conditions, "IdentityConsistent")
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal("IdentityConflict"))
+		// The condition can stand indefinitely: it must name every pod and its
+		// reported id so the operator knows which instance to rebuild.
+		Expect(cond.Message).To(ContainSubstring("9999"))
+		Expect(cond.Message).To(ContainSubstring("4242"))
 
 		// The intruder is rebuilt onto the right lineage: the conflict clears,
 		// the claimant is published, and the identity latches from it.

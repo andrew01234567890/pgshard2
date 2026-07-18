@@ -480,6 +480,61 @@ var _ = Describe("PgShardShard failover", func() {
 	})
 })
 
+var _ = Describe("PgShardShard identity fencing (legacy physical path)", func() {
+	const ns = "default"
+
+	It("refuses every role under an unreadable latched identity", func() {
+		const mlShard = "mlshard"
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		agent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
+
+		r := &PgShardShardReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			Images: ShardImages{Postgres: testPostgresImage, Agent: testAgentImage},
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: mlShard, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"}, Replicas: 1,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: mlShard, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile()
+		stampPodIP(mlShard+"-0", primaryPodIP)
+
+		// A corrupted latch on the legacy shard path: same refusal as the node
+		// path — even a sole healthy claimant loses recognition, not just the
+		// election.
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlShard, Namespace: ns}, &got)).To(Succeed())
+		got.Status.SystemID = "not-a-number"
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+
+		for range 2 {
+			reconcile()
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mlShard, Namespace: ns}, &got)).To(Succeed())
+			Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+				"an unverifiable latch must not publish any primary on the legacy path")
+			Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ShardDegraded))
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "IdentityConsistent")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("MalformedIdentity"))
+
+		Expect(k8sClient.Delete(ctx, &got)).To(Succeed())
+	})
+})
+
 func stampPodIP(name, ip string) {
 	const ns = "default"
 	var pod corev1.Pod

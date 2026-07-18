@@ -230,7 +230,8 @@ func assessIdentity(views []instanceView, in identityInputs) identityAssessment 
 			for _, v := range views {
 				a.unrecognized = append(a.unrecognized, v.pod)
 				a.fenced = append(a.fenced, fmt.Sprintf(
-					"%s (unresolved bootstrap identity conflict)", v.pod))
+					"%s (system id %d; unresolved bootstrap identity conflict)",
+					v.pod, v.systemID))
 			}
 			a.suppressPrimary = true
 		}
@@ -386,7 +387,11 @@ func identityConsistentCondition(
 	case a.conflict:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "IdentityConflict"
-		cond.Message = "instances report conflicting system ids before any identity was latched; election and primary publication disabled until they agree"
+		// Name every pod and its reported id: this condition can stand
+		// indefinitely, and the operator resolving it needs to know WHICH
+		// instance to rebuild without spelunking logs.
+		cond.Message = "conflicting system ids before any identity was latched; election and primary publication disabled until they agree: " +
+			strings.Join(a.fenced, ", ")
 	case latched && len(a.fenced) > 0:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "ForeignInstance"
