@@ -257,7 +257,15 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         // to fetch/create the name's slot; the slot lock is held across the
         // PostgreSQL call, so a concurrent same-name caller blocks and then
         // replays the winner's point instead of writing a second record at a
-        // different LSN.
+        // different LSN. The work runs in a SPAWNED task that owns the slot:
+        // a cancelled RPC (client hangup) must not abandon a create after
+        // PostgreSQL wrote the point but before the slot recorded it — the
+        // task finishes and stores it, and the retry replays. The PostgreSQL
+        // call is bounded so a hung backend cannot wedge same-name retries
+        // forever; a timed-out create is outcome-unknown, and if it DID land,
+        // the retry's duplicate makes the barrier fail verification loudly
+        // (recovery-by-name + recorded-LSN comparison) rather than serve a
+        // divergent point silently.
         let slot = self
             .restore_points
             .lock()
@@ -265,16 +273,25 @@ impl<I: Instance> AgentService for AgentSvc<I> {
             .entry(req.name.clone())
             .or_default()
             .clone();
-        let mut point = slot.lock().await;
-        if let Some(rp) = *point {
-            return Ok(Response::new(restore_point_response(rp)));
-        }
-        let rp = self
-            .instance
-            .create_restore_point(&req.name)
+        let instance = self.instance.clone();
+        let name = req.name.clone();
+        let rp = tokio::spawn(async move {
+            let mut point = slot.lock().await;
+            if let Some(rp) = *point {
+                return Ok(rp);
+            }
+            let rp = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                instance.create_restore_point(&name),
+            )
             .await
-            .map_err(internal)?;
-        *point = Some(rp);
+            .map_err(|_| anyhow::anyhow!("restore point {name:?} timed out"))??;
+            *point = Some(rp);
+            Ok::<_, anyhow::Error>(rp)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("restore point task: {e}")))?
+        .map_err(internal)?;
         Ok(Response::new(restore_point_response(rp)))
     }
 

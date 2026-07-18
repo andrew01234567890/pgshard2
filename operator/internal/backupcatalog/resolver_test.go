@@ -50,15 +50,15 @@ func driftCatalog() Catalog {
 		Topologies: []TopologySnapshot{
 			{Generation: 1, ValidFrom: t0, Epoch: 1, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
-					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA},
-					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB},
+					{Name: "A", KeyRange: KeyRangeRef{End: "80"}, Stanza: stanzaA, Role: "data", State: "serving"},
+					{Name: "B", KeyRange: KeyRangeRef{Start: "80"}, Stanza: stanzaB, Role: "data", State: "serving"},
 				}},
 			{Generation: 2, ValidFrom: t3, Epoch: 10, HashFunction: "xxhash64_v1",
 				Tables: driftTables(), Shards: []ShardTopology{
-					{Name: "C", KeyRange: KeyRangeRef{End: "40"}, Stanza: stanzaC},
-					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD},
-					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE},
-					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF},
+					{Name: "C", KeyRange: KeyRangeRef{End: "40"}, Stanza: stanzaC, Role: "data", State: "serving"},
+					{Name: "D", KeyRange: KeyRangeRef{Start: "40", End: "80"}, Stanza: stanzaD, Role: "data", State: "serving"},
+					{Name: "E", KeyRange: KeyRangeRef{Start: "80", End: "c0"}, Stanza: stanzaE, Role: "data", State: "serving"},
+					{Name: "F", KeyRange: KeyRangeRef{Start: "c0"}, Stanza: stanzaF, Role: "data", State: "serving"},
 				}},
 		},
 		Barriers: []BarrierManifest{
@@ -178,6 +178,9 @@ func TestBackupAndLatestTargets(t *testing.T) {
 		a.VerifyLSN != stopA || a.TargetTimeline != "1" {
 		t.Fatalf("backup restore must target the recorded stop LSN: %+v", a)
 	}
+	if !a.TargetExclusive {
+		t.Fatal("stop LSN is an end-of-record pointer: inclusive recovery would apply one extra record")
+	}
 	latest, err := Resolve(driftCatalog(), Target{Latest: true})
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +229,27 @@ func TestIncompleteTopologySnapshotIsRejected(t *testing.T) {
 	dup.Topologies[0].Tables = append(dup.Topologies[0].Tables, dup.Topologies[0].Tables[0])
 	if _, err := Resolve(dup, Target{BackupID: backup1}); err == nil {
 		t.Fatal("a duplicated table entry is ambiguous and must be rejected")
+	}
+
+	noRole := driftCatalog()
+	noRole.Topologies[0].Shards[0].Role = ""
+	if _, err := Resolve(noRole, Target{BackupID: backup1}); err == nil {
+		t.Fatal("a shard without a role cannot identify the sequence host after restore")
+	}
+
+	noState := driftCatalog()
+	noState.Topologies[0].Shards[0].State = ""
+	if _, err := Resolve(noState, Target{BackupID: backup1}); err == nil {
+		t.Fatal("a shard without a routing state is ambiguous mid-reshard (overlapping ranges)")
+	}
+
+	caseDup := driftCatalog()
+	caseDup.Topologies[0].Tables = append(caseDup.Topologies[0].Tables, TableTopology{
+		Schema: "PUBLIC", Name: "Orders", Type: "sharded",
+		ShardKeyColumn: "customer_id", ShardKeyType: "int8",
+	})
+	if _, err := Resolve(caseDup, Target{BackupID: backup1}); err == nil {
+		t.Fatal("PostgreSQL folds unquoted identifiers: a case-variant duplicate table is the same table")
 	}
 
 	// The check is scoped to the generation being restored: gen2 corruption

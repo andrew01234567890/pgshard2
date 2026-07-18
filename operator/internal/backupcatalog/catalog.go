@@ -38,6 +38,16 @@ type ShardTopology struct {
 	Name     string      `json:"name"`
 	KeyRange KeyRangeRef `json:"keyRange"`
 	Stanza   string      `json:"stanza"`
+	// Role: "data" or "system". Ranges alone cannot identify the sequence
+	// host (the system shard has no range, like a full-range data shard),
+	// and a restore that guessed would rebuild sequences on the wrong shard.
+	Role string `json:"role"`
+	// State is the compiled routing state at snapshot time (serving,
+	// buffered, readOnly, draining, hidden). Mid-reshard, sources and hidden
+	// targets hold OVERLAPPING ranges: without the state a fresh restore
+	// cannot know which side may serve, and publishing both would return
+	// duplicate or wrong rows.
+	State string `json:"state"`
 }
 
 // TableTopology mirrors the compiled RoutingTable structurally: everything a
