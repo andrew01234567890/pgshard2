@@ -66,7 +66,14 @@ pub fn boot_now() -> Option<std::time::Duration> {
     {
         use std::sync::OnceLock;
         static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-        Some(EPOCH.get_or_init(std::time::Instant::now).elapsed())
+        // Floor at 1ns: the very first reading must still exceed the
+        // unconfirmed sentinel (ZERO) so a first install always lands.
+        Some(
+            EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .max(std::time::Duration::from_nanos(1)),
+        )
     }
 }
 
@@ -77,13 +84,16 @@ impl Freshness {
     /// ordering guard in [`Freshness::install`] would silently ignore a stamp
     /// older than construction time.
     pub fn new() -> Self {
-        // A clock failure stores ZERO, which can never read fresh: age() then
-        // reports max(full uptime, wall age) — far beyond any lease — or
-        // Duration::MAX while the clock keeps failing. Fail closed either way.
-        Self(Arc::new(std::sync::RwLock::new((
-            boot_now().unwrap_or_default(),
-            std::time::SystemTime::now(),
-        ))))
+        // A clock failure at construction degrades to the unconfirmed state:
+        // storing any substitute could read fresh if the clock later recovers
+        // while the system is young enough.
+        match boot_now() {
+            Some(boot) => Self(Arc::new(std::sync::RwLock::new((
+                boot,
+                std::time::SystemTime::now(),
+            )))),
+            None => Self::unconfirmed(),
+        }
     }
 
     /// A freshness seeded from an existing validation's own stamps —
@@ -145,10 +155,12 @@ impl Freshness {
     /// Test hook: pretend the last confirmation happened `by` ago.
     #[doc(hidden)]
     pub fn backdate(&self, by: std::time::Duration) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = (
-            boot_now().unwrap_or_default().saturating_sub(by),
-            std::time::SystemTime::now() - by,
-        );
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        *guard = match boot_now() {
+            Some(boot) => (boot.saturating_sub(by), std::time::SystemTime::now() - by),
+            // Clock failure: degrade to unconfirmed (maximal age).
+            None => (std::time::Duration::ZERO, std::time::SystemTime::UNIX_EPOCH),
+        };
     }
 }
 
