@@ -364,6 +364,47 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     registry.start(&col_listed, &config).await?;
     wait_for_error(&registry, "wf_cols", "omits column").await;
 
+    // A partition-root publication announces leaf relations the mapping
+    // does not know, and direct leaf truncates go unpublished.
+    source
+        .batch_execute(
+            "CREATE TABLE measurements (id int NOT NULL, reading int)
+                 PARTITION BY RANGE (id);
+             CREATE TABLE measurements_low PARTITION OF measurements
+                 FOR VALUES FROM (MINVALUE) TO (1000);
+             CREATE PUBLICATION pub_root FOR TABLE measurements
+                 WITH (publish_via_partition_root = true);",
+        )
+        .await?;
+    let mut partitioned = spec(&pg, "wf_part", "pgshard_part");
+    partitioned.publication = "pub_root".into();
+    partitioned.tables[0].source = Some(v1::TableRef {
+        schema: "public".into(),
+        name: "measurements".into(),
+    });
+    registry.start(&partitioned, &config).await?;
+    wait_for_error(&registry, "wf_part", "publish_via_partition_root").await;
+
+    // A same-named target column of a different type would truncate first
+    // and fail mid-copy without the deep compatibility check.
+    source
+        .batch_execute("CREATE TABLE mistyped_target (id int PRIMARY KEY, note text)")
+        .await?;
+    target
+        .batch_execute("CREATE TABLE mistyped_target (id int PRIMARY KEY, note int)")
+        .await?;
+    source
+        .batch_execute("CREATE PUBLICATION pub_mt FOR TABLE mistyped_target")
+        .await?;
+    let mut mistyped_tgt = spec(&pg, "wf_mt", "pgshard_mt");
+    mistyped_tgt.publication = "pub_mt".into();
+    mistyped_tgt.tables[0].source = Some(v1::TableRef {
+        schema: "public".into(),
+        name: "mistyped_target".into(),
+    });
+    registry.start(&mistyped_tgt, &config).await?;
+    wait_for_error(&registry, "wf_mt", "different type on the target").await;
+
     // REPLICA IDENTITY FULL is refused up front: the applier cannot apply
     // FULL-identity updates/deletes, so accepting it would re-seed
     // destructively and then fail on the first mutation.
@@ -545,5 +586,60 @@ async fn dropping_replica_identity_mid_stream_fails_loudly() -> anyhow::Result<(
         )
         .await?;
     wait_for_error(&registry, "wf_ident", "no longer covers shard key").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn altering_the_publication_mid_stream_fails_loudly() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION seed_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
+    let target_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=shard_target",
+        pg.host(),
+        pg.port()
+    );
+    let (target, conn) = tokio_postgres::connect(&target_conn, tokio_postgres::NoTls).await?;
+    tokio::spawn(conn);
+    target
+        .batch_execute("CREATE TABLE orders (id int PRIMARY KEY, note text)")
+        .await?;
+
+    let config = WorkflowConfig {
+        target: format!(
+            "host={} port={} user=postgres password=postgres",
+            pg.host(),
+            pg.port()
+        )
+        .parse()?,
+        source_user: "postgres".into(),
+        source_password: "postgres".into(),
+    };
+    let registry = WorkflowRegistry::default();
+    registry
+        .start(&spec(&pg, "wf_pubdrift", "pgshard_pubdrift"), &config)
+        .await?;
+    wait_for(&registry, "wf_pubdrift", "the streaming phase", |s| {
+        s.phase == v1::WorkflowPhase::Streaming as i32
+    })
+    .await;
+
+    // Disabling a DML kind mid-stream makes pgoutput silently omit changes;
+    // the catalog poll must notice within its interval and fail the workflow.
+    source
+        .batch_execute("ALTER PUBLICATION seed_pub SET (publish = 'insert')")
+        .await?;
+    wait_for_error(&registry, "wf_pubdrift", "changed while streaming").await;
     Ok(())
 }

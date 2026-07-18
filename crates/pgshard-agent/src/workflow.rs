@@ -396,11 +396,66 @@ struct TablePreflight {
 
 /// One pg_publication_tables entry: schema, table, published columns (all of
 /// them when no column list), row-filter expression if any.
+#[derive(PartialEq)]
 struct PublishedTable {
     schema: String,
     name: String,
     columns: Option<Vec<String>>,
     row_filter: Option<String>,
+}
+
+/// The validated shape of the publication. Captured at preflight and
+/// re-fetched during streaming: ALTER PUBLICATION can disable a DML kind or
+/// add a row filter mid-stream, after which pgoutput silently omits changes
+/// with no Relation message to betray it — the only defense is to notice the
+/// catalog changed and fail the workflow loudly (a retry re-seeds from
+/// scratch, so omitted changes can never be served).
+#[derive(PartialEq)]
+struct PublicationShape {
+    insert: bool,
+    update: bool,
+    delete: bool,
+    truncate: bool,
+    via_partition_root: bool,
+    tables: Vec<PublishedTable>,
+}
+
+async fn fetch_publication(
+    source_sql: &tokio_postgres::Client,
+    publication: &str,
+) -> anyhow::Result<PublicationShape> {
+    let row = source_sql
+        .query_opt(
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
+             FROM pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("publication {publication} does not exist on the source"))?;
+    let tables = source_sql
+        .query(
+            "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
+             FROM pg_publication_tables WHERE pubname = $1
+             ORDER BY schemaname, tablename",
+            &[&publication],
+        )
+        .await?
+        .into_iter()
+        .map(|r| PublishedTable {
+            schema: r.get(0),
+            name: r.get(1),
+            columns: r.get(2),
+            row_filter: r.get(3),
+        })
+        .collect();
+    Ok(PublicationShape {
+        insert: row.get(0),
+        update: row.get(1),
+        delete: row.get(2),
+        truncate: row.get(3),
+        via_partition_root: row.get(4),
+        tables,
+    })
 }
 
 /// Everything that must hold BEFORE any destructive step (truncate, slot
@@ -410,7 +465,7 @@ async fn preflight(
     run: &RunPlan,
     source_sql: &tokio_postgres::Client,
     target_sql: &tokio_postgres::Client,
-) -> anyhow::Result<Vec<TablePreflight>> {
+) -> anyhow::Result<(Vec<TablePreflight>, PublicationShape)> {
     // The target database must be the shard this workflow was aimed at: its
     // provenance marker is stamped by CreateDatabase and never by hand.
     let marker: Option<String> = target_sql
@@ -438,45 +493,22 @@ async fn preflight(
     // tables: a mapped table missing from it would be seeded once and then
     // silently never receive changes; an unmapped table in it would kill the
     // stream mid-flight after seeding.
-    let pub_row = source_sql
-        .query_opt(
-            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate
-             FROM pg_publication WHERE pubname = $1",
-            &[&run.publication],
-        )
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "publication {} does not exist on the source",
-                run.publication
-            )
-        })?;
-    let (ins, upd, del, trunc): (bool, bool, bool, bool) = (
-        pub_row.get(0),
-        pub_row.get(1),
-        pub_row.get(2),
-        pub_row.get(3),
-    );
+    let shape = fetch_publication(source_sql, &run.publication).await?;
     anyhow::ensure!(
-        ins && upd && del && trunc,
+        shape.insert && shape.update && shape.delete && shape.truncate,
         "publication {} does not publish all of insert/update/delete/truncate: disabled kinds would be silently omitted from the stream",
         run.publication
     );
-    let published: Vec<PublishedTable> = source_sql
-        .query(
-            "SELECT schemaname::text, tablename::text, attnames::text[], rowfilter
-             FROM pg_publication_tables WHERE pubname = $1",
-            &[&run.publication],
-        )
-        .await?
-        .into_iter()
-        .map(|r| PublishedTable {
-            schema: r.get(0),
-            name: r.get(1),
-            columns: r.get(2),
-            row_filter: r.get(3),
-        })
-        .collect();
+    // publish_via_partition_root publishes the ROOT in the catalog while
+    // pgoutput still announces leaf relations (unmapped here), and a direct
+    // leaf TRUNCATE is not published at all — the loud-failure guarantees do
+    // not hold. Partitioned sources are out of M1 scope.
+    anyhow::ensure!(
+        !shape.via_partition_root,
+        "publication {} sets publish_via_partition_root, which this runner cannot stream soundly",
+        run.publication
+    );
+    let published = &shape.tables;
     for table in &run.tables {
         anyhow::ensure!(
             published
@@ -488,7 +520,7 @@ async fn preflight(
             run.publication
         );
     }
-    for p in &published {
+    for p in published {
         anyhow::ensure!(
             run.tables
                 .iter()
@@ -509,77 +541,104 @@ async fn preflight(
 
     let mut plans = Vec::with_capacity(run.tables.len());
     for table in &run.tables {
-        let cols: Vec<(String, u32)> = source_sql
-            .query(
-                "SELECT a.attname::text, a.atttypid::oid FROM pg_attribute a
-                 JOIN pg_class c ON c.oid = a.attrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relname = $2
-                   AND a.attnum > 0 AND NOT a.attisdropped
-                 ORDER BY a.attnum",
-                &[&table.schema, &table.name],
-            )
-            .await?
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1)))
-            .collect();
+        let src = table_columns(source_sql, &table.schema, &table.name).await?;
         anyhow::ensure!(
-            !cols.is_empty(),
+            !src.is_empty(),
             "source table {}.{} not found",
             table.schema,
             table.name
         );
+        // Only plain tables: pgoutput announces partition LEAVES while the
+        // catalog publishes the root, and a direct leaf TRUNCATE is not
+        // published — the mapping and loud-failure guarantees break.
+        anyhow::ensure!(
+            src[0].relkind as u8 == b'r',
+            "source table {}.{} is not a plain table (relkind {:?}); partitioned sources are not supported",
+            table.schema,
+            table.name,
+            src[0].relkind as u8 as char
+        );
+        // Generated columns are excluded from the copy: pgoutput does not
+        // publish them either, so both paths let the target recompute — but
+        // ONLY if the target column is generated too; a plain target column
+        // would be left NULL by the stream while the source computed a value.
+        let copy_cols: Vec<&SqlColumn> = src.iter().filter(|c| !c.generated).collect();
         // A column list on the publication would stream a transformed row
-        // shape; the seed copy takes every column, so the stream must too.
+        // shape; the seed copy takes every non-generated column, so the
+        // stream must too.
         if let Some(attnames) = published
             .iter()
             .find(|p| p.schema == table.schema && p.name == table.name)
             .and_then(|p| p.columns.as_ref())
         {
-            for (name, _) in &cols {
+            for c in &copy_cols {
                 anyhow::ensure!(
-                    attnames.contains(name),
-                    "publication {} omits column {name} of {}.{}: streamed rows would be silently transformed",
+                    attnames.contains(&c.name),
+                    "publication {} omits column {} of {}.{}: streamed rows would be silently transformed",
                     run.publication,
+                    c.name,
                     table.schema,
                     table.name
                 );
             }
         }
-        // Missing target tables/columns must surface before the slot is
-        // replaced or anything is truncated, not one table into the seed.
-        let target_cols: Vec<String> = target_sql
-            .query(
-                "SELECT a.attname::text FROM pg_attribute a
-                 JOIN pg_class c ON c.oid = a.attrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relname = $2
-                   AND a.attnum > 0 AND NOT a.attisdropped",
-                &[&table.schema, &table.name],
-            )
-            .await?
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect();
+        // The target table must be COPY- and apply-compatible before the slot
+        // is replaced or anything is truncated, not one table into the seed:
+        // every copied column present with the same type, generated columns
+        // generated on both sides, and no extra target column that would
+        // reject an insert lacking it.
+        let tgt = table_columns(target_sql, &table.schema, &table.name).await?;
         anyhow::ensure!(
-            !target_cols.is_empty(),
+            !tgt.is_empty(),
             "target table {}.{} does not exist in {}",
             table.schema,
             table.name,
             run.target_database
         );
-        for (name, _) in &cols {
+        anyhow::ensure!(
+            tgt[0].relkind as u8 == b'r',
+            "target table {}.{} is not a plain table",
+            table.schema,
+            table.name
+        );
+        for c in &src {
+            let t = tgt.iter().find(|t| t.name == c.name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "target table {}.{} is missing column {}",
+                    table.schema,
+                    table.name,
+                    c.name
+                )
+            })?;
             anyhow::ensure!(
-                target_cols.contains(name),
-                "target table {}.{} is missing column {name}",
+                t.type_oid == c.type_oid && t.typmod == c.typmod,
+                "column {} of {}.{} has a different type on the target: copied and streamed values could be transformed or rejected",
+                c.name,
+                table.schema,
+                table.name
+            );
+            anyhow::ensure!(
+                t.generated == c.generated,
+                "column {} of {}.{} is generated on one side only: the two sides would compute different values",
+                c.name,
                 table.schema,
                 table.name
             );
         }
-        let key_oid = cols
+        for t in &tgt {
+            if !src.iter().any(|c| c.name == t.name) {
+                anyhow::ensure!(
+                    !t.required(),
+                    "target table {}.{} has extra required column {}: copied and streamed rows do not carry it",
+                    table.schema,
+                    table.name,
+                    t.name
+                );
+            }
+        }
+        let key = src
             .iter()
-            .find(|(name, _)| *name == table.shard_key_column)
-            .map(|(_, oid)| *oid)
+            .find(|c| c.name == table.shard_key_column)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "shard key column {} not found in {}.{}",
@@ -588,6 +647,14 @@ async fn preflight(
                     table.name
                 )
             })?;
+        anyhow::ensure!(
+            !key.generated,
+            "shard key {}.{}.{} is a generated column and cannot be streamed",
+            table.schema,
+            table.name,
+            table.shard_key_column
+        );
+        let key_oid = key.type_oid;
         anyhow::ensure!(
             allowed_key_oids(table.shard_key_type).contains(&key_oid),
             "shard key {}.{}.{} has type oid {key_oid}, which cannot be hashed as declared {:?}: rows would land on the wrong shard",
@@ -651,10 +718,62 @@ async fn preflight(
             ),
         }
         plans.push(TablePreflight {
-            columns: cols.into_iter().map(|(name, _)| name).collect(),
+            columns: copy_cols.iter().map(|c| c.name.clone()).collect(),
         });
     }
-    Ok(plans)
+    Ok((plans, shape))
+}
+
+/// One column as both sides' compatibility check needs it.
+struct SqlColumn {
+    name: String,
+    type_oid: u32,
+    typmod: i32,
+    generated: bool,
+    not_null: bool,
+    has_default: bool,
+    identity: bool,
+    relkind: i8,
+}
+
+impl SqlColumn {
+    /// Would an INSERT that does not mention this column be rejected?
+    fn required(&self) -> bool {
+        self.not_null && !self.has_default && !self.identity && !self.generated
+    }
+}
+
+async fn table_columns(
+    sql: &tokio_postgres::Client,
+    schema: &str,
+    name: &str,
+) -> anyhow::Result<Vec<SqlColumn>> {
+    Ok(sql
+        .query(
+            "SELECT a.attname::text, a.atttypid::oid, a.atttypmod,
+                    a.attgenerated <> '', a.attnotnull, a.atthasdef,
+                    a.attidentity <> '', c.relkind
+             FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = $2
+               AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY a.attnum",
+            &[&schema, &name],
+        )
+        .await?
+        .into_iter()
+        .map(|r| SqlColumn {
+            name: r.get(0),
+            type_oid: r.get(1),
+            typmod: r.get(2),
+            generated: r.get(3),
+            not_null: r.get(4),
+            has_default: r.get(5),
+            identity: r.get(6),
+            relkind: r.get(7),
+        })
+        .collect())
 }
 
 async fn run_workflow(
@@ -669,7 +788,7 @@ async fn run_workflow(
     // dropped, cleared, or truncated.
     let source_sql = connect_source_sql(&run).await?;
     let target_sql = connect_sql(&config.target, &run.target_database).await?;
-    let tables = preflight(&run, &source_sql, &target_sql).await?;
+    let (tables, publication) = preflight(&run, &source_sql, &target_sql).await?;
 
     // A pre-existing slot from an earlier attempt is dropped — this run
     // re-seeds from scratch — but only a slot that is provably ours: our
@@ -785,9 +904,24 @@ async fn run_workflow(
     .map_err(|e| anyhow::anyhow!("applier: {e}"))?;
     let mut decoder = PgOutputDecoder::new(4);
     let mut relations: HashMap<u32, RelFilter> = HashMap::new();
+    // ALTER PUBLICATION mid-stream makes pgoutput silently omit changes with
+    // no Relation message to betray it; the only defense is to poll the
+    // catalog and fail loudly on drift (bounded by this interval — a failed
+    // workflow re-seeds from scratch, so omitted changes are never served).
+    let mut pub_recheck = tokio::time::interval(std::time::Duration::from_secs(5));
+    pub_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let frame = tokio::select! {
             frame = repl.next() => frame?,
+            _ = pub_recheck.tick() => {
+                let now = fetch_publication(&source_sql, &run.publication).await?;
+                anyhow::ensure!(
+                    now == publication,
+                    "publication {} changed while streaming: the stream may have silently omitted changes",
+                    run.publication
+                );
+                continue;
+            }
             _ = stop.changed() => {
                 if *stop.borrow() {
                     status.send_modify(|s| s.phase = v1::WorkflowPhase::Stopped as i32);
