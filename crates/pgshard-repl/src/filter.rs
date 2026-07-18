@@ -198,6 +198,34 @@ mod tests {
     }
 
     #[test]
+    fn uuid_and_bytea_shard_keys_match_the_routers_typed_hash() {
+        // These reshard-critical types must hash from their pgoutput text form to
+        // exactly the keyspace id the router computed from the canonical value.
+        let f = xxhash();
+
+        // pgoutput emits a UUID in canonical lowercase-hyphenated form.
+        let uuid_bytes = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        let from_text = cell_keyspace_id(
+            &TupleColumn::Text(b"550e8400-e29b-41d4-a716-446655440000"),
+            ScalarType::Uuid,
+            f,
+        )
+        .unwrap();
+        assert_eq!(from_text, f.keyspace_id(&ScalarValue::Uuid(uuid_bytes)));
+
+        // pgoutput emits bytea in the default hex form (`\x..`).
+        let from_hex =
+            cell_keyspace_id(&TupleColumn::Text(b"\\x0102ff"), ScalarType::Bytea, f).unwrap();
+        assert_eq!(
+            from_hex,
+            f.keyspace_id(&ScalarValue::Bytea(vec![0x01, 0x02, 0xff]))
+        );
+    }
+
+    #[test]
     fn tuple_in_range_keeps_in_range_rows_and_skips_the_rest() {
         let f = xxhash();
         let row = tuple(vec![TupleColumn::Text(b"7"), TupleColumn::Text(b"hi")]);
