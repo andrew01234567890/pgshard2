@@ -111,14 +111,11 @@ async fn the_verbatim_backend_reports_real_column_types_and_the_backend_command_
         .unwrap();
     let topology = single_shard_topology(pg.host(), pg.port());
 
-    // --- Verbatim backend: real OIDs and the backend's own command tag. -------
-    let verbatim = Arc::new(
-        Proxy::new(
-            pgshard_router::shared(Router::build(&topology).unwrap()),
-            backend_creds(),
-        )
-        .verbatim(),
-    );
+    // --- Default (verbatim) backend: real OIDs and the backend's command tag. --
+    let verbatim = Arc::new(Proxy::new(
+        pgshard_router::shared(Router::build(&topology).unwrap()),
+        backend_creds(),
+    ));
     let mut vclient = client(spawn_router(verbatim).await).await;
 
     let responses = vclient
@@ -149,13 +146,16 @@ async fn the_verbatim_backend_reports_real_column_types_and_the_backend_command_
     };
     assert_eq!(CommandComplete::from(tag).tag, "SET");
 
-    // --- Default (text) backend: the same select is all-text, proving both the
-    // pre-existing behavior and that the two backends coexist. -----------------
-    let default = Arc::new(Proxy::new(
-        pgshard_router::shared(Router::build(&topology).unwrap()),
-        backend_creds(),
-    ));
-    let mut dclient = client(spawn_router(default).await).await;
+    // --- Explicit text backend (the .text() escape hatch): the same select is
+    // all-text, proving the fallback and that the two backends coexist. --------
+    let text = Arc::new(
+        Proxy::new(
+            pgshard_router::shared(Router::build(&topology).unwrap()),
+            backend_creds(),
+        )
+        .text(),
+    );
+    let mut dclient = client(spawn_router(text).await).await;
 
     let responses = dclient
         .simple_query(
@@ -232,15 +232,10 @@ async fn the_verbatim_backend_rejects_a_scatter_where_shards_disagree_on_column_
             .unwrap();
     }
 
-    let proxy = Arc::new(
-        Proxy::new(
-            pgshard_router::shared(
-                Router::build(&two_shard_topology(pg.host(), pg.port())).unwrap(),
-            ),
-            backend_creds(),
-        )
-        .verbatim(),
-    );
+    let proxy = Arc::new(Proxy::new(
+        pgshard_router::shared(Router::build(&two_shard_topology(pg.host(), pg.port())).unwrap()),
+        backend_creds(),
+    ));
     let mut client = client(spawn_router(proxy).await).await;
 
     // A keyless read scatters to both shards; their `note` columns have different
