@@ -302,3 +302,95 @@ async fn a_returning_write_reports_its_own_command_tag_not_select() {
     };
     assert_eq!(CommandComplete::from(tag).tag, "SELECT 1");
 }
+
+#[tokio::test]
+async fn an_ordered_scatter_merges_shards_numerically() {
+    let pg = Pg::start().await.expect("start postgres");
+    let admin = pg.connect().await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh0").await.unwrap();
+    admin.batch_execute("CREATE DATABASE sh1").await.unwrap();
+    // Seed each shard directly so the values are placed deliberately across shards.
+    for (db, ids) in [("sh0", [2, 100]), ("sh1", [9, 10])] {
+        let conn = format!(
+            "host={} port={} user=postgres password=postgres dbname={db}",
+            pg.host(),
+            pg.port()
+        );
+        let (c, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        c.batch_execute("CREATE TABLE orders (customer_id int, note text)")
+            .await
+            .unwrap();
+        for id in ids {
+            let id: i32 = id;
+            c.execute(
+                "INSERT INTO orders (customer_id, note) VALUES ($1, 'x')",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let proxy = Arc::new(Proxy::new(
+        pgshard_router::shared(Router::build(&two_shard_topology(pg.host(), pg.port())).unwrap()),
+        backend_creds(),
+    ));
+    let conn = format!(
+        "host=127.0.0.1 port={} user=app dbname=app",
+        spawn_router(proxy).await
+    );
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    // A numeric ORDER BY scatter merges the shards in NUMERIC order — defeating
+    // the byte-order trap, which would place 10 and 100 before 2 and 9.
+    assert_eq!(
+        ordered_ids(
+            &client,
+            "SELECT customer_id FROM orders ORDER BY customer_id"
+        )
+        .await,
+        vec![2, 9, 10, 100]
+    );
+    assert_eq!(
+        ordered_ids(
+            &client,
+            "SELECT customer_id FROM orders ORDER BY customer_id DESC"
+        )
+        .await,
+        vec![100, 10, 9, 2]
+    );
+
+    // A scatter that also needs limiting or aggregation, or an ORDER BY on a type
+    // the merge cannot handle soundly (text), is still rejected with 0A000.
+    for q in [
+        "SELECT customer_id FROM orders ORDER BY customer_id LIMIT 2",
+        "SELECT count(*) FROM orders",
+        "SELECT note FROM orders ORDER BY note",
+    ] {
+        let err = client.simple_query(q).await.unwrap_err();
+        assert_eq!(err.code().map(|c| c.code()), Some("0A000"), "{q}");
+    }
+}
+
+/// Run `query` through the router and collect its `customer_id` column, in the
+/// order the rows arrive (the router's merge order).
+async fn ordered_ids(client: &tokio_postgres::Client, query: &str) -> Vec<i32> {
+    client
+        .simple_query(query)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some(r.get("customer_id").unwrap().parse::<i32>().unwrap())
+            }
+            _ => None,
+        })
+        .collect()
+}

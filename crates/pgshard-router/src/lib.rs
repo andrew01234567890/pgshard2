@@ -19,6 +19,7 @@
 //! to [`Route::Unavailable`] rather than a wrong endpoint.
 
 pub mod backend;
+pub mod merge;
 pub mod sequence;
 pub mod wire;
 
