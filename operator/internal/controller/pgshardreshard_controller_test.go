@@ -94,6 +94,53 @@ var _ = Describe("PgShardReshard validation", func() {
 		Expect(apimeta.IsStatusConditionFalse(got.Status.Conditions, "Validated")).To(BeTrue())
 	})
 
+	It("fails when the source shard belongs to a different cluster", func() {
+		src := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: "rs-src-xc", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "other-cluster",
+				KeyRange:   pgshardv1alpha1.KeyRange{Start: "40", End: "80"},
+				Replicas:   1,
+			},
+		}
+		Expect(k8sClient.Create(ctx, src)).To(Succeed())
+		createReshard("rs-xc", "rs-src-xc",
+			pgshardv1alpha1.KeyRange{Start: "40", End: "60"},
+			pgshardv1alpha1.KeyRange{Start: "60", End: "80"})
+
+		_, err := reconcile("rs-xc")
+		Expect(err).NotTo(HaveOccurred())
+
+		got := getReshard("rs-xc")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(apimeta.IsStatusConditionFalse(got.Status.Conditions, "Validated")).To(BeTrue())
+	})
+
+	It("fails when the source shard is the system shard", func() {
+		src := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: "rs-src-sys", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c",
+				Role:       pgshardv1alpha1.ShardRoleSystem,
+				KeyRange:   pgshardv1alpha1.KeyRange{},
+				Replicas:   1,
+			},
+		}
+		Expect(k8sClient.Create(ctx, src)).To(Succeed())
+		// A well-formed partition of the full range — so the rejection is on the
+		// system role, not the ranges.
+		createReshard("rs-sys", "rs-src-sys",
+			pgshardv1alpha1.KeyRange{Start: "", End: "80"},
+			pgshardv1alpha1.KeyRange{Start: "80", End: ""})
+
+		_, err := reconcile("rs-sys")
+		Expect(err).NotTo(HaveOccurred())
+
+		got := getReshard("rs-sys")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(apimeta.IsStatusConditionFalse(got.Status.Conditions, "Validated")).To(BeTrue())
+	})
+
 	It("holds in Validating and retries when the source shard is absent", func() {
 		createReshard("rs-nosrc", "does-not-exist",
 			pgshardv1alpha1.KeyRange{Start: "40", End: "60"},

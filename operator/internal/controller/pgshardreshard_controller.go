@@ -50,9 +50,8 @@ type PgShardReshardReconciler struct {
 // The condition that records whether the requested split is well-formed.
 const reshardValidatedCondition = "Validated"
 
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch
 
 func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -61,9 +60,14 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Terminal states need no further work.
+	// This slice owns only the pre-provisioning phases. Terminal states and the
+	// later (not-yet-built) workflow phases are left untouched, so a future slice
+	// — or a controller restart hitting an already-advanced reshard — never
+	// regresses a Seeding/Finalizing/... reshard back to Validating.
 	switch reshard.Status.Phase {
-	case pgshardv1alpha1.ReshardCompleted, pgshardv1alpha1.ReshardFailed:
+	case "", pgshardv1alpha1.ReshardPending, pgshardv1alpha1.ReshardValidating:
+		// This controller drives these; continue below.
+	default:
 		return ctrl.Result{}, nil
 	}
 
@@ -100,6 +104,25 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// The source must actually belong to this reshard's cluster. Both the
+	// reshard's clusterRef/sourceShard and the shard's clusterRef are immutable,
+	// so a mismatch is a permanent misconfiguration — fail rather than validate a
+	// split that would later seed and cut over another cluster's shard.
+	if source.Spec.ClusterRef != reshard.Spec.ClusterRef {
+		r.fail(reshard, "SourceClusterMismatch",
+			fmt.Sprintf("source shard %q belongs to cluster %q, not this reshard's cluster %q",
+				source.Name, source.Spec.ClusterRef, reshard.Spec.ClusterRef))
+		return ctrl.Result{}, nil
+	}
+
+	// The system shard holds control-plane state (sequences, migrations) and is
+	// never a data-routing partition; resharding it is never valid.
+	if source.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
+		r.fail(reshard, "SourceNotReshardable",
+			fmt.Sprintf("source shard %q is the system shard and cannot be resharded", source.Name))
+		return ctrl.Result{}, nil
 	}
 
 	sourceRange, err := toRange(source.Spec.KeyRange)
@@ -148,10 +171,11 @@ func setReshardCondition(
 	reason, message string,
 ) {
 	apimeta.SetStatusCondition(&reshard.Status.Conditions, metav1.Condition{
-		Type:    reshardValidatedCondition,
-		Status:  status,
-		Reason:  reason,
-		Message: message,
+		Type:               reshardValidatedCondition,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: reshard.Generation,
 	})
 }
 
