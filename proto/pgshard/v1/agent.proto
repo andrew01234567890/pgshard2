@@ -156,6 +156,13 @@ message StanzaCheckResponse {
 message PrepareSourceRequest {
   string publication = 1;
   repeated TableRef tables = 2;
+  // The source shard's database on this node (a node hosts many shard
+  // databases; the publication lives inside one). Required.
+  string database = 3;
+  // Pod-identity fence, as in StartWorkflow/CreateDatabase: ABORTED on
+  // mismatch so a reassigned pod IP cannot aim publication DDL at another
+  // node incarnation.
+  string target_pod_uid = 4;
 }
 
 message PrepareSourceResponse {
