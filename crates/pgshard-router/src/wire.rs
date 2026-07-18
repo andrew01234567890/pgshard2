@@ -191,6 +191,7 @@ impl Proxy {
                 let BackendResult::Rows {
                     schema: shard_schema,
                     rows: shard_rows,
+                    ..
                 } = shard_result
                 else {
                     // A plain scatter read is a single SELECT; a no-row result is
@@ -216,7 +217,8 @@ impl Proxy {
             }
         }
         match schema {
-            Some(schema) => Ok(vec![rows_response(schema, rows)]),
+            // A scatter is a plain SELECT, so it keeps the default `SELECT n` tag.
+            Some(schema) => Ok(vec![rows_response(schema, rows, None)]),
             // A scatter only comes from a SELECT, which always describes its
             // columns; guard defensively rather than panic.
             None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
@@ -346,18 +348,32 @@ fn schemas_match(a: &[FieldInfo], b: &[FieldInfo]) -> bool {
         })
 }
 
-/// A row-returning response from a schema plus already-encoded rows.
-fn rows_response(schema: Arc<Vec<FieldInfo>>, rows: Vec<DataRow>) -> Response {
+/// A row-returning response from a schema, already-encoded rows, and an optional
+/// command-tag prefix. The frontend appends the streamed row count (so
+/// `"INSERT 0"` becomes `"INSERT 0 n"`); `None` keeps the default `SELECT`.
+fn rows_response(
+    schema: Arc<Vec<FieldInfo>>,
+    rows: Vec<DataRow>,
+    command_tag: Option<&str>,
+) -> Response {
     let row_stream = stream::iter(rows.into_iter().map(Ok));
-    Response::Query(QueryResponse::new(schema, row_stream))
+    let mut response = QueryResponse::new(schema, row_stream);
+    if let Some(tag) = command_tag {
+        response.set_command_tag(tag);
+    }
+    Response::Query(response)
 }
 
 /// Turn one backend statement result into a wire response: rows (a
-/// `QueryResponse` carrying the backend's schema), a command tag (an
-/// `Execution` with the tag string), or an empty-query response.
+/// `QueryResponse` carrying the backend's schema and command-tag verb), a command
+/// tag (an `Execution` with the tag string), or an empty-query response.
 fn response_from(result: BackendResult) -> Response {
     match result {
-        BackendResult::Rows { schema, rows } => rows_response(schema, rows),
+        BackendResult::Rows {
+            schema,
+            rows,
+            command_tag,
+        } => rows_response(schema, rows, command_tag.as_deref()),
         BackendResult::Command { tag } => Response::Execution(Tag::new(&tag)),
         BackendResult::Empty => Response::EmptyQuery,
     }
