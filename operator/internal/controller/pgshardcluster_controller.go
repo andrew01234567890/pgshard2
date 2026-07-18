@@ -72,15 +72,7 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	inputs := pgconfig.Inputs{
-		UserParameters: cluster.Spec.Postgres.Parameters,
-		SlotHeadroom:   16,
-	}
-	if cluster.Spec.Size != nil {
-		inputs.Class = cluster.Spec.Size.Class
-		inputs.Overrides = cluster.Spec.Size.Overrides
-	}
-	rendered, err := pgconfig.Render(inputs)
+	rendered, err := pgconfig.Render(clusterRenderInputs(&cluster))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("rendering configuration: %w", err)
 	}
@@ -218,24 +210,27 @@ func desiredShards(
 		}
 		name := shardName(cluster.Name, start, end)
 		shards = append(shards, shardFor(cluster, name,
-			pgshardv1alpha1.KeyRange{Start: start, End: end}, pgshardv1alpha1.ShardRoleData, rendered))
+			pgshardv1alpha1.KeyRange{Start: start, End: end}, pgshardv1alpha1.ShardRoleData, rendered, true))
 	}
 	// The system shard is unsharded: its Role — not its key range — is what
 	// excludes it from data routing, so the zero (full-range) KeyRange is never
 	// consulted for placement. Partition/routing logic keys on Role==system.
 	systemName := fmt.Sprintf("%s-system", cluster.Name)
 	shards = append(shards, shardFor(cluster, systemName,
-		pgshardv1alpha1.KeyRange{}, pgshardv1alpha1.ShardRoleSystem, rendered))
+		pgshardv1alpha1.KeyRange{}, pgshardv1alpha1.ShardRoleSystem, rendered, true))
 	return shards, nil
 }
 
 // shardFor builds a PgShardShard with the fields the cluster controller owns.
+// serving is true for the initial expansion and false for reshard targets, which
+// stay hidden from routing until cutover.
 func shardFor(
 	cluster *pgshardv1alpha1.PgShardCluster,
 	name string,
 	kr pgshardv1alpha1.KeyRange,
 	role pgshardv1alpha1.ShardRole,
 	rendered pgconfig.Rendered,
+	serving bool,
 ) pgshardv1alpha1.PgShardShard {
 	return pgshardv1alpha1.PgShardShard{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace},
@@ -244,13 +239,28 @@ func shardFor(
 			KeyRange:           kr,
 			Role:               role,
 			Replicas:           rendered.ReplicasPerShard,
-			Serving:            true,
+			Serving:            serving,
 			PostgresConfigHash: rendered.ConfigHash,
 			Image:              cluster.Spec.Postgres.Image,
 			Resources:          rendered.Resources.DeepCopy(),
 			Stanza:             fmt.Sprintf("%s-g1", name),
 		},
 	}
+}
+
+// clusterRenderInputs builds the pgconfig inputs from a cluster's spec. Shared by
+// the cluster reconcile and the reshard controller so target shards/nodes render
+// identically to the cluster's own.
+func clusterRenderInputs(cluster *pgshardv1alpha1.PgShardCluster) pgconfig.Inputs {
+	inputs := pgconfig.Inputs{
+		UserParameters: cluster.Spec.Postgres.Parameters,
+		SlotHeadroom:   16,
+	}
+	if cluster.Spec.Size != nil {
+		inputs.Class = cluster.Spec.Size.Class
+		inputs.Overrides = cluster.Spec.Size.Overrides
+	}
+	return inputs
 }
 
 func shardName(cluster, start, end string) string {
