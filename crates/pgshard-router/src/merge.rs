@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 
 use pgwire::api::Type;
-use pgwire::api::results::FieldInfo;
+use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 
@@ -123,6 +123,15 @@ fn resolve_keys(schema: &[FieldInfo], keys: &[SortKey]) -> PgWireResult<Vec<Reso
                     first.0
                 }
             };
+            // The decode path parses the text wire form; a binary-format column
+            // would be misread. Simple-query results are always text, so this only
+            // guards against an unexpected backend rather than a real query shape.
+            if schema[index].format() != FieldFormat::Text {
+                return Err(reject(
+                    "0A000",
+                    "cross-shard ORDER BY on a binary-format column is not supported".to_owned(),
+                ));
+            }
             let ty = schema[index].datatype();
             let kind = sort_kind(ty).ok_or_else(|| {
                 reject(
@@ -155,7 +164,7 @@ pub fn merge_ordered(
         .map(|row| {
             let values = resolved
                 .iter()
-                .map(|k| decode(field_bytes(&row, k.index), k.kind))
+                .map(|k| decode(field_bytes(&row, k.index)?, k.kind))
                 .collect::<PgWireResult<Vec<_>>>()?;
             Ok((values, row))
         })
@@ -242,35 +251,60 @@ fn decode(bytes: Option<&[u8]>, kind: SortKind) -> PgWireResult<SortValue> {
             text.parse()
                 .map_err(|e| reject("XX000", format!("unparsable float sort key {text:?}: {e}")))?,
         ),
-        SortKind::Bool => SortValue::Bool(text == "t"),
+        SortKind::Bool => SortValue::Bool(match text {
+            "t" => true,
+            "f" => false,
+            other => {
+                return Err(reject(
+                    "XX000",
+                    format!("unparsable boolean sort key {other:?}"),
+                ));
+            }
+        }),
     })
 }
 
-/// The raw text bytes of column `idx` in `row`, or `None` for SQL NULL. Walks the
-/// wire row body: each field is a big-endian `i32` length (`-1` = NULL) followed
-/// by that many bytes. The caller guarantees `idx` is a valid column.
-fn field_bytes(row: &DataRow, idx: usize) -> Option<&[u8]> {
+/// The raw text bytes of column `idx` in `row`, `Ok(None)` for a SQL NULL cell.
+/// Walks the wire row body: each field is a big-endian `i32` length (`-1` = NULL)
+/// followed by that many bytes. A row that ends before `idx`, carries a length
+/// that overruns the buffer, or states a length below `-1` is malformed — this
+/// fails closed (`XX000`) rather than mistaking a truncated cell for a NULL that
+/// would silently sort into the wrong place.
+fn field_bytes(row: &DataRow, idx: usize) -> PgWireResult<Option<&[u8]>> {
     let data: &[u8] = &row.data;
     let mut offset = 0usize;
     for field in 0..=idx {
-        let len_bytes = data.get(offset..offset + 4)?;
-        let len = i32::from_be_bytes(len_bytes.try_into().ok()?);
-        offset += 4;
-        if len < 0 {
-            // A NULL field carries no bytes.
+        let len_end = offset.checked_add(4).ok_or_else(malformed_row)?;
+        let len_bytes = data.get(offset..len_end).ok_or_else(malformed_row)?;
+        let len = i32::from_be_bytes(len_bytes.try_into().map_err(|_| malformed_row())?);
+        offset = len_end;
+        if len == -1 {
             if field == idx {
-                return None;
+                return Ok(None);
             }
+            // A NULL field carries no value bytes; move to the next field.
+        } else if len < -1 {
+            return Err(malformed_row());
         } else {
-            let len = len as usize;
-            let value = data.get(offset..offset + len)?;
+            let val_end = offset
+                .checked_add(len as usize)
+                .filter(|&end| end <= data.len())
+                .ok_or_else(malformed_row)?;
             if field == idx {
-                return Some(value);
+                return Ok(Some(&data[offset..val_end]));
             }
-            offset += len;
+            offset = val_end;
         }
     }
-    None
+    // The schema promised a column at `idx` the row does not contain.
+    Err(malformed_row())
+}
+
+fn malformed_row() -> PgWireError {
+    reject(
+        "XX000",
+        "malformed DataRow from backend: field is truncated or out of range".to_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -296,9 +330,36 @@ mod tests {
     #[test]
     fn field_bytes_walks_to_the_column_including_nulls() {
         let r = row(&[Some("9"), None, Some("hello")]);
-        assert_eq!(field_bytes(&r, 0), Some(b"9".as_slice()));
-        assert_eq!(field_bytes(&r, 1), None); // SQL NULL
-        assert_eq!(field_bytes(&r, 2), Some(b"hello".as_slice()));
+        assert_eq!(field_bytes(&r, 0).unwrap(), Some(b"9".as_slice()));
+        assert_eq!(field_bytes(&r, 1).unwrap(), None); // SQL NULL
+        assert_eq!(field_bytes(&r, 2).unwrap(), Some(b"hello".as_slice()));
+    }
+
+    #[test]
+    fn field_bytes_fails_closed_on_a_missing_or_truncated_field() {
+        // The row has two cells; asking for a third must error, not read as NULL —
+        // otherwise a short row would silently sort under NULL ordering.
+        let short = row(&[Some("1"), Some("2")]);
+        assert!(field_bytes(&short, 2).is_err());
+        // A field whose declared length overruns the buffer is malformed.
+        let mut truncated = row(&[Some("hello")]);
+        truncated.data.truncate(6); // 4-byte length says 5, only 2 value bytes remain
+        assert!(field_bytes(&truncated, 0).is_err());
+    }
+
+    #[test]
+    fn bool_decode_rejects_non_boolean_text() {
+        assert!(matches!(
+            decode(Some(b"t"), SortKind::Bool).unwrap(),
+            SortValue::Bool(true)
+        ));
+        assert!(matches!(
+            decode(Some(b"f"), SortKind::Bool).unwrap(),
+            SortValue::Bool(false)
+        ));
+        // Anything else fails closed rather than decoding as `false`.
+        assert!(decode(Some(b"x"), SortKind::Bool).is_err());
+        assert!(decode(Some(b"true"), SortKind::Bool).is_err());
     }
 
     #[test]
@@ -405,7 +466,7 @@ mod tests {
         let ids: Vec<i64> = merged
             .iter()
             .map(|r| {
-                std::str::from_utf8(field_bytes(r, 0).unwrap())
+                std::str::from_utf8(field_bytes(r, 0).unwrap().unwrap())
                     .unwrap()
                     .parse()
                     .unwrap()

@@ -458,6 +458,7 @@ fn classify_scatter(query: &str) -> ScatterPlan {
         && select.into_clause.is_none()
         && select.locking_clause.is_empty()
         && select.group_clause.is_empty()
+        && select.having_clause.is_none()
         && select.distinct_clause.is_empty()
         && !select.group_distinct
         && select.limit_count.is_none()
@@ -493,17 +494,25 @@ fn classify_scatter(query: &str) -> ScatterPlan {
     ScatterPlan::Ordered(keys)
 }
 
-/// The output column a sort item names — by trailing name (`ORDER BY t.note`) or
-/// 1-based position (`ORDER BY 2`) — or `None` for an expression the merge cannot
-/// resolve to one output column.
+/// The output column a sort item names — by unqualified name (`ORDER BY note`) or
+/// 1-based position (`ORDER BY 2`) — or `None` for anything the merge cannot
+/// soundly resolve to one output column.
+///
+/// A qualified reference (`ORDER BY t.note`) is deliberately rejected. It names a
+/// *source* column, which each shard sorts by, but the merge can only resolve
+/// names against the *output* schema — and a bare trailing name (`note`) may there
+/// alias a different column, so merging on it would reorder rows wrongly. An
+/// unqualified name is safe because PostgreSQL binds it to the output column of
+/// that name first, which is exactly what the merge resolves.
 fn sort_column(sb: &pg_query::protobuf::SortBy) -> Option<merge::SortColumn> {
     match sb.node.as_deref().and_then(|n| n.node.as_ref())? {
-        pg_query::NodeEnum::ColumnRef(cr) => {
-            match cr.fields.last().and_then(|f| f.node.as_ref())? {
+        pg_query::NodeEnum::ColumnRef(cr) => match cr.fields.as_slice() {
+            [field] => match field.node.as_ref()? {
                 pg_query::NodeEnum::String(s) => Some(merge::SortColumn::Name(s.sval.clone())),
                 _ => None,
-            }
-        }
+            },
+            _ => None,
+        },
         pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
             pg_query::protobuf::a_const::Val::Ival(i) if i.ival >= 1 => {
                 Some(merge::SortColumn::Position(i.ival as usize))
@@ -640,8 +649,14 @@ mod tests {
             "SELECT count(*) FROM orders",
             "SELECT DISTINCT note FROM orders",
             "SELECT note FROM orders GROUP BY note",
+            "SELECT note FROM orders HAVING count(*) > 0",
             "SELECT lower(note) FROM orders",
             "SELECT * FROM orders ORDER BY lower(note)",
+            // A qualified reference names a source column; resolving its trailing
+            // name against the output schema could merge on a different column of
+            // that name (e.g. an alias), so it is rejected as unsound.
+            "SELECT * FROM orders ORDER BY orders.id",
+            "SELECT value AS sort_key FROM orders ORDER BY orders.sort_key",
             "SELECT * FROM orders ORDER BY id USING >",
             "WITH orders AS (VALUES (1)) SELECT * FROM orders",
             "SELECT * FROM orders FOR UPDATE",
