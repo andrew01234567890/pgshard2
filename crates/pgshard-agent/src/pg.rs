@@ -58,8 +58,15 @@ impl Instance for PgInstance {
         // a numeric cast, and each side's LSN is NULL on the other role.
         let row = client
             .query_one(
+                // On a primary the live timeline comes from the current WAL file
+                // name (pg_control_checkpoint lags a promotion until its async
+                // checkpoint); on a standby pg_current_wal_lsn errors, so the
+                // control file's replayed timeline is used.
                 "SELECT pg_is_in_recovery(),
-                        (SELECT timeline_id FROM pg_control_checkpoint()),
+                        CASE WHEN pg_is_in_recovery()
+                             THEN (SELECT timeline_id FROM pg_control_checkpoint())
+                             ELSE ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int
+                        END,
                         CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_lsn()::text END,
                         CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()::text ELSE NULL END,
                         CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text ELSE NULL END,
