@@ -254,6 +254,13 @@ message CreateDatabaseRequest {
   // provenance (INVALID_ARGUMENT otherwise). Set from a deliberate
   // restore/adopt action, never on the routine reconcile path.
   bool adopt = 4;
+  // Kubernetes UID of the pod this request is intended for. Pod IPs are
+  // reusable: a request routed to a reassigned address could otherwise land
+  // on a different node incarnation — with `adopt`, silently re-stamping the
+  // wrong instance's database. When set, an agent whose own pod UID (from
+  // the downward API) differs answers FAILED_PRECONDITION. Empty skips the
+  // check (legacy caller, or an agent without the downward-API wiring).
+  string target_pod_uid = 5;
 }
 
 message CreateDatabaseResponse {}

@@ -56,8 +56,19 @@ type FakeAgent struct {
 	// exercise the operator's empty-status handling.
 	emptyStatus bool
 
+	// podUID, when set, mirrors the real agent's downward-API identity check:
+	// identity-sensitive requests naming another pod uid are refused.
+	podUID string
+
 	server   *grpc.Server
 	listener net.Listener
+}
+
+// SetPodUID scripts the agent's own pod UID (downward API identity).
+func (f *FakeAgent) SetPodUID(uid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.podUID = uid
 }
 
 // SetEmptyStatus makes GetStatus return a nil Status message.
@@ -333,6 +344,12 @@ func (f *FakeAgent) CreateDatabase(
 	// controller's terminal-error handling.
 	if len(req.Name) > 63 || len(req.Owner) > 63 {
 		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
+	}
+	if req.TargetPodUid != "" && f.podUID != "" && req.TargetPodUid != f.podUID {
+		// Mirror the real agent: a routing accident is ABORTED (retry), never
+		// FAILED_PRECONDITION (which reads as a database needing adoption).
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.TargetPodUid, f.podUID)
 	}
 	if req.Adopt && req.Provenance == "" {
 		return nil, status.Error(codes.InvalidArgument, "adopt requires a provenance marker to stamp")

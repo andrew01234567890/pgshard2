@@ -125,6 +125,7 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.PodIP = fixtureIP
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		agent.SetPodUID(string(pod.UID))
 
 		const dbShard = "dbshard"
 		shard := &pgshardv1alpha1.PgShardShard{
@@ -207,6 +208,18 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(k8sClient.Create(ctx, fresh2)).To(Succeed())
 		fresh2.Status.PodIP = fixtureIP
 		Expect(k8sClient.Status().Update(ctx, fresh2)).To(Succeed())
+
+		// Pod IPs are reusable: while the agent behind the address still
+		// identifies as the OLD pod, the uid-bound request is ABORTED — it
+		// must never be treated as a database needing adoption.
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		var misrouted pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbShard, Namespace: ns}, &misrouted)).To(Succeed())
+		Expect(misrouted.Status.CurrentPrimary).To(BeEmpty(),
+			"a uid-mismatched agent must not verify the shard")
+
+		agent.SetPodUID(string(fresh2.UID))
 		callsBefore = len(agent.Calls)
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: dbShard, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -237,6 +250,7 @@ var _ = Describe("PgShardShard placed on a node", func() {
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.PodIP = fixtureIP
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		agent.SetPodUID(string(pod.UID))
 
 		// A retained database from an earlier placement: same name, different
 		// (stale, partially-seeded) contents.

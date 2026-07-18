@@ -24,6 +24,10 @@ pub struct AgentSvc<I: Instance> {
     /// This instance's pod name (`PGSHARD_POD`); a Promote aimed at a different
     /// target is refused.
     pod: String,
+    /// This pod's Kubernetes UID (`PGSHARD_POD_UID`, downward API). Pod IPs
+    /// are reusable, so identity-sensitive requests carry the intended pod
+    /// UID and are refused on a mismatch. Empty = unwired (checks skipped).
+    pod_uid: String,
     epoch: EpochGuard,
     schema: SchemaLog,
     /// Restore points already created, by name. PostgreSQL does not deduplicate
@@ -37,9 +41,14 @@ pub struct AgentSvc<I: Instance> {
 
 impl<I: Instance> AgentSvc<I> {
     pub fn new(instance: Arc<I>, pod: String) -> Self {
+        Self::with_pod_uid(instance, pod, String::new())
+    }
+
+    pub fn with_pod_uid(instance: Arc<I>, pod: String, pod_uid: String) -> Self {
         Self {
             instance,
             pod,
+            pod_uid,
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
             restore_points: Mutex::new(HashMap::new()),
@@ -396,6 +405,21 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         request: Request<v1::CreateDatabaseRequest>,
     ) -> Result<Response<v1::CreateDatabaseResponse>, Status> {
         let req = request.into_inner();
+        // A reassigned pod IP could route this to another node incarnation;
+        // with `adopt` that would silently re-stamp the wrong database.
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            // ABORTED, not FAILED_PRECONDITION: this is a routing accident (a
+            // reassigned pod IP), not a data verdict — the caller must retry
+            // against a re-resolved address, never treat it as a database that
+            // needs adopting.
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
         check_ident("database name", &req.name, true)?;
         check_ident("owner", &req.owner, false)?;
         check_provenance(&req.provenance)?;

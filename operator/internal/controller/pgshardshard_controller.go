@@ -325,6 +325,9 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		// it (FAILED_PRECONDITION) instead of adopting it silently.
 		Provenance: string(shard.UID),
 		Adopt:      adopt,
+		// Pod IPs are reusable: bind the request to the pod we verified, so a
+		// reassigned address cannot land it on another incarnation.
+		TargetPodUid: string(pod.UID),
 	}); err != nil {
 		switch grpcstatus.Code(err) {
 		// InvalidArgument is a permanent contract violation; record it terminally

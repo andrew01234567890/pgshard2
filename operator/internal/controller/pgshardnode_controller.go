@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -188,21 +189,31 @@ func nodeSelector(node *pgshardv1alpha1.PgShardNode) map[string]string {
 	return map[string]string{labelNode: node.Name}
 }
 
+// nodeInstanceSelector additionally pins the node's UID: the selector for
+// pods and services, so only THIS incarnation's instances are addressed.
+func nodeInstanceSelector(node *pgshardv1alpha1.PgShardNode) map[string]string {
+	return map[string]string{labelNode: node.Name, labelNodeUID: string(node.UID)}
+}
+
 // ensureServices maintains the CNPG-style trio plus stable per-pod DNS:
 // -rw (primary only), -ro (replicas), -r (all instances), and a headless
 // service so native logical-replication subscribers can pin a standby.
 func (r *PgShardNodeReconciler) ensureServices(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
 ) error {
+	// Selectors carry the node UID: pods are selected by their INCARNATION,
+	// so a same-named pod left by a deleted-and-recreated node (whose role
+	// labels nothing may touch — it is not controlled by this node) can never
+	// sit behind this node's services.
 	services := []struct {
 		suffix   string
 		selector map[string]string
 		headless bool
 	}{
-		{svcSuffixRW, withRole(nodeSelector(node), roleLabelPrimary), false},
-		{svcSuffixRO, withRole(nodeSelector(node), roleLabelReplica), false},
-		{"-r", nodeSelector(node), false},
-		{headlessSvcSuffix, nodeSelector(node), true},
+		{svcSuffixRW, withRole(nodeInstanceSelector(node), roleLabelPrimary), false},
+		{svcSuffixRO, withRole(nodeInstanceSelector(node), roleLabelReplica), false},
+		{"-r", nodeInstanceSelector(node), false},
+		{headlessSvcSuffix, nodeInstanceSelector(node), true},
 	}
 	for _, spec := range services {
 		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
@@ -326,9 +337,31 @@ func (r *PgShardNodeReconciler) ensurePVC(
 func (r *PgShardNodeReconciler) preflightStorage(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
 ) ([]*foreignPVCError, error) {
-	var foreigns []*foreignPVCError
+	// Desired ordinals AND every controlled pod already running: a scale-down
+	// leaves excess pods (an excess primary is deliberately never pruned)
+	// whose claims would otherwise escape verification entirely.
+	instances := map[string]bool{}
 	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
-		name := nodeInstanceName(node, ordinal)
+		instances[nodeInstanceName(node, ordinal)] = true
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(node.Namespace),
+		client.MatchingLabels(nodeSelector(node))); err != nil {
+		return nil, err
+	}
+	for i := range pods.Items {
+		if metav1.IsControlledBy(&pods.Items[i], node) {
+			instances[pods.Items[i].Name] = true
+		}
+	}
+	names := make([]string, 0, len(instances))
+	for name := range instances {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	var foreigns []*foreignPVCError
+	for _, name := range names {
 		claims := []string{name + "-data"}
 		if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
 			claims = append(claims, name+"-wal")
@@ -474,7 +507,7 @@ func (r *PgShardNodeReconciler) instancePod(
 	if postgresImage == "" {
 		postgresImage = r.Images.Postgres
 	}
-	labels := nodeSelector(node)
+	labels := nodeInstanceSelector(node)
 	labels[labelRole] = roleLabelReplica // promoted after status polls
 
 	var resources corev1.ResourceRequirements
@@ -513,6 +546,11 @@ func (r *PgShardNodeReconciler) instancePod(
 					{Name: "PGSHARD_NODE", Value: node.Name},
 					{Name: "PGSHARD_POD", ValueFrom: &corev1.EnvVarSource{
 						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+					}},
+					// Pod IPs are reusable; identity-sensitive RPCs carry the
+					// intended pod UID and the agent refuses a mismatch.
+					{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
 					}},
 				},
 				Ports: []corev1.ContainerPort{

@@ -2212,7 +2212,14 @@ type CreateDatabaseRequest struct {
 	// `provenance` instead of failing. Only meaningful with a nonempty
 	// provenance (INVALID_ARGUMENT otherwise). Set from a deliberate
 	// restore/adopt action, never on the routine reconcile path.
-	Adopt         bool `protobuf:"varint,4,opt,name=adopt,proto3" json:"adopt,omitempty"`
+	Adopt bool `protobuf:"varint,4,opt,name=adopt,proto3" json:"adopt,omitempty"`
+	// Kubernetes UID of the pod this request is intended for. Pod IPs are
+	// reusable: a request routed to a reassigned address could otherwise land
+	// on a different node incarnation — with `adopt`, silently re-stamping the
+	// wrong instance's database. When set, an agent whose own pod UID (from
+	// the downward API) differs answers FAILED_PRECONDITION. Empty skips the
+	// check (legacy caller, or an agent without the downward-API wiring).
+	TargetPodUid  string `protobuf:"bytes,5,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2273,6 +2280,13 @@ func (x *CreateDatabaseRequest) GetAdopt() bool {
 		return x.Adopt
 	}
 	return false
+}
+
+func (x *CreateDatabaseRequest) GetTargetPodUid() string {
+	if x != nil {
+		return x.TargetPodUid
+	}
+	return ""
 }
 
 type CreateDatabaseResponse struct {
@@ -2736,14 +2750,15 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06events\x18\x01 \x03(\v2\x12.pgshard.v1.VEventR\x06events\"%\n" +
 	"\x0fDropSlotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\"\x12\n" +
-	"\x10DropSlotResponse\"w\n" +
+	"\x10DropSlotResponse\"\x9d\x01\n" +
 	"\x15CreateDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05owner\x18\x02 \x01(\tR\x05owner\x12\x1e\n" +
 	"\n" +
 	"provenance\x18\x03 \x01(\tR\n" +
 	"provenance\x12\x14\n" +
-	"\x05adopt\x18\x04 \x01(\bR\x05adopt\"\x18\n" +
+	"\x05adopt\x18\x04 \x01(\bR\x05adopt\x12$\n" +
+	"\x0etarget_pod_uid\x18\x05 \x01(\tR\ftargetPodUid\"\x18\n" +
 	"\x16CreateDatabaseResponse\")\n" +
 	"\x13DropDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x16\n" +
