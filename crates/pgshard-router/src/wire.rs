@@ -67,9 +67,9 @@ pub struct Proxy {
     /// system-database routing decision; the connection itself goes through
     /// `conn`.
     backend: Backend,
-    /// How a routed query reaches a shard's PostgreSQL. Defaults to the proven
-    /// text-mode tokio-postgres backend; [`Proxy::verbatim`] swaps in the
-    /// type-aware pgwire backend.
+    /// How a routed query reaches a shard's PostgreSQL. Defaults to the type-aware
+    /// pgwire backend (real column type OIDs + verbatim command tags);
+    /// [`Proxy::text`] swaps in the text-mode tokio-postgres backend.
     conn: Arc<dyn BackendConnection>,
     /// Allocates global-sequence ids for INSERTs that omit a sequence column.
     /// `None` disables injection (such an INSERT then errors rather than routing
@@ -80,7 +80,7 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(router: SharedRouter, backend: Backend) -> Self {
         Self {
-            conn: Arc::new(TokioPostgresBackend::new(backend.clone())),
+            conn: Arc::new(PgWireBackend::new(backend.clone())),
             router,
             backend,
             seq: None,
@@ -91,18 +91,19 @@ impl Proxy {
     /// through `seq`.
     pub fn with_sequences(router: SharedRouter, backend: Backend, seq: SequenceAllocator) -> Self {
         Self {
-            conn: Arc::new(TokioPostgresBackend::new(backend.clone())),
+            conn: Arc::new(PgWireBackend::new(backend.clone())),
             router,
             backend,
             seq: Some(seq),
         }
     }
 
-    /// Route backend traffic through the verbatim (type-aware) backend instead of
-    /// the default text-mode one: results then carry real column type OIDs and
-    /// the backend's verbatim command tag.
-    pub fn verbatim(mut self) -> Self {
-        self.conn = Arc::new(PgWireBackend::new(self.backend.clone()));
+    /// Route backend traffic through the text-mode tokio-postgres backend instead
+    /// of the default type-aware one. Results then advertise every column as text
+    /// and the command tag is rebuilt from the leading keyword — the escape hatch
+    /// kept for parity and quick fallback.
+    pub fn text(mut self) -> Self {
+        self.conn = Arc::new(TokioPostgresBackend::new(self.backend.clone()));
         self
     }
 
