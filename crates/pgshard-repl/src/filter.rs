@@ -52,6 +52,19 @@ pub fn shard_key_index(relation: &Relation, shard_key_column: &str) -> Result<us
 ///
 /// `shard_key_type` is required (not optional): see the module docs for why the
 /// declared type is what makes this reproduce the router's placement soundly.
+///
+/// Two soundness constraints on the *topology*, not enforceable here (the shard
+/// function and declared type are all this sees):
+/// - `Text` must be a non-space-padded type (`text`/`varchar`), never `char(n)`
+///   /`bpchar`. The router hashes the unpadded literal a client wrote (`'abc'`),
+///   but pgoutput ships the *stored* value, which for `char(n)` is space-padded
+///   (`'abc   '`) — so a `bpchar` `Text` key would hash differently here and be
+///   seeded to the wrong shard. The operator must not declare a `char(n)` column
+///   as `shardKeyType: text`.
+/// - `Bytea` assumes the source's `bytea_output = hex` (the default): pgoutput
+///   then ships `\x…`, which matches the router's own `\x` literal form. Under
+///   `bytea_output = escape` a bytea key fails closed (`Uncoercible`) — rejected,
+///   never misplaced.
 pub fn cell_keyspace_id(
     cell: &TupleColumn,
     shard_key_type: ScalarType,
