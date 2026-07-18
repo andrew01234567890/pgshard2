@@ -120,6 +120,39 @@ impl Applier {
     /// privilege fails here, before anything is applied.
     pub async fn new(target: Client, consumer: impl Into<String>) -> Result<Self> {
         let consumer = consumer.into();
+
+        // The stream lease FIRST: one live applier per consumer per target. A
+        // session-level advisory lock keyed by the consumer id is held for this
+        // connection's lifetime, so a replacement worker cannot start applying
+        // while a delayed predecessor still can. Acquiring it before any other
+        // statement keeps the whole startup bounded: once the lease is held the
+        // predecessor's session is gone, so the schema DDL below cannot block on
+        // its locks either. The wait is bounded — a healthy handover only waits
+        // for the old session's teardown — and a timeout fails loudly rather
+        // than risking two writers. The checkpoint CAS in `commit` is the
+        // second, independent guard.
+        target.batch_execute("SET lock_timeout = '5s'").await?;
+        let lease = target
+            .execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                &[&consumer],
+            )
+            .await;
+        target.batch_execute("SET lock_timeout = 0").await?;
+        if let Err(e) = lease {
+            // Only genuine lock contention is the lease being held; anything
+            // else (permissions, cancellation) is a database error in its own
+            // right and must not masquerade as retriable fencing.
+            let contended = e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE);
+            return Err(if contended {
+                ApplyError::Fenced(format!(
+                    "another applier holds the stream lease for consumer {consumer:?}"
+                ))
+            } else {
+                ApplyError::Db(e)
+            });
+        }
+
         target
             .batch_execute(
                 // Pin the settings the literal quoting depends on: with
@@ -148,27 +181,6 @@ impl Applier {
                      ADD COLUMN IF NOT EXISTS end_lsn bigint NOT NULL DEFAULT 0",
             )
             .await?;
-
-        // The stream lease: one live applier per consumer per target. A
-        // session-level advisory lock keyed by the consumer id is held for this
-        // connection's lifetime, so a replacement worker cannot start applying
-        // while a delayed predecessor still can. The wait is bounded — a healthy
-        // handover only waits for the old session's teardown — and a timeout
-        // fails loudly here rather than risking two writers. The checkpoint CAS
-        // in `commit` is the second, independent guard.
-        target.batch_execute("SET lock_timeout = '5s'").await?;
-        let lease = target
-            .execute(
-                "SELECT pg_advisory_lock(hashtextextended($1, 0))",
-                &[&consumer],
-            )
-            .await;
-        target.batch_execute("SET lock_timeout = 0").await?;
-        if let Err(e) = lease {
-            return Err(ApplyError::Fenced(format!(
-                "could not acquire the stream lease for consumer {consumer:?}: {e}"
-            )));
-        }
 
         let (checkpoint, ack) = match target
             .query_opt(
