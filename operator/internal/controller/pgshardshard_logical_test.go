@@ -399,6 +399,83 @@ var _ = Describe("PgShardShard placed on a node", func() {
 			"the adopt annotation is consumed by a successful adoption")
 	})
 
+	It("never routes on a legacy agent's unattested success", func() {
+		agent, err := fakes.NewFakeAgent()
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(agent.Stop)
+		// A pre-provenance agent build: ignores every new field, reports bare
+		// success, attests nothing — it may be fronting a stale same-named
+		// database and would consume an adoption grant without stamping.
+		agent.SetLegacyResponses(true)
+
+		const lgNode = "legacynode"
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: lgNode, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		node.Status.Phase = pgshardv1alpha1.NodeReady
+		node.Status.CurrentPrimary = lgNode + "-0"
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: lgNode + "-0", Namespace: ns},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: portNamePostgres, Image: "pg"},
+			}},
+		}
+		Expect(controllerutil.SetControllerReference(node, pod, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.PodIP = fixtureIP
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		const lgShard = "legacyshard"
+		shard := &pgshardv1alpha1.PgShardShard{
+			ObjectMeta: metav1.ObjectMeta{Name: lgShard, Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardShardSpec{
+				ClusterRef: "c", KeyRange: pgshardv1alpha1.KeyRange{End: "80"},
+				Replicas: 1, NodeRef: lgNode,
+			},
+		}
+		Expect(k8sClient.Create(ctx, shard)).To(Succeed())
+		r := &PgShardShardReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			dialAgent: func(string, int32) (pgshardv1.AgentServiceClient, error) {
+				return agent.Client()
+			},
+		}
+		reconcile := func() {
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: lgShard, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		reconcile()
+		var got pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lgShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.CurrentPrimary).To(BeEmpty(),
+			"an unattested success must never make the shard routable")
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, shardDatabaseReadyCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("UnattestedAgent"))
+
+		// The pod rolls to a current agent. The database the LEGACY agent
+		// created carries no marker, so the current agent rightly refuses it
+		// as unverifiable — the operator must adopt it deliberately, exactly
+		// like any other unmarked pre-provenance database.
+		agent.SetLegacyResponses(false)
+		agent.SetPodUID(string(pod.UID))
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lgShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.CurrentPrimary).To(BeEmpty())
+		cond = apimeta.FindStatusCondition(got.Status.Conditions, shardDatabaseReadyCondition)
+		Expect(cond.Reason).To(Equal("ForeignDatabase"))
+
+		got.Annotations = map[string]string{adoptDatabaseAnnotation: string(node.UID)}
+		Expect(k8sClient.Update(ctx, &got)).To(Succeed())
+		reconcile()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lgShard, Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.CurrentPrimary).To(Equal(lgNode+"-0"),
+			"adopting the legacy-created database restores routing")
+	})
+
 	It("marks an overlong database name terminal without calling the agent or wedging the mirror", func() {
 		agent, err := fakes.NewFakeAgent()
 		Expect(err).NotTo(HaveOccurred())

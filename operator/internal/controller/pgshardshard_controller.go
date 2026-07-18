@@ -313,7 +313,7 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		return false
 	}
 	adopt := shard.Annotations[adoptDatabaseAnnotation] == string(node.UID)
-	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{
+	resp, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{
 		Name: name,
 		// The shard UID binds the database to this placement: deterministic
 		// names plus retained volumes mean a same-named database can hold a
@@ -324,7 +324,8 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		// Pod IPs are reusable: bind the request to the pod we verified, so a
 		// reassigned address cannot land it on another incarnation.
 		TargetPodUid: string(pod.UID),
-	}); err != nil {
+	})
+	if err != nil {
 		switch grpcstatus.Code(err) {
 		// InvalidArgument is a permanent contract violation; record it terminally
 		// rather than retrying forever. Other errors are transient — the poll
@@ -339,6 +340,19 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		default:
 			log.Error(err, "creating shard database", "database", name)
 		}
+		return false
+	}
+	// The response must ATTEST what was verified: a legacy (pre-provenance)
+	// agent ignores the new request fields and reports bare success while
+	// having checked nothing — routing on that would serve an unverified
+	// database, and an adoption annotation would be consumed without any
+	// marker being stamped.
+	if resp.GetVerifiedProvenance() != string(shard.UID) ||
+		resp.GetServedPodUid() != string(pod.UID) {
+		r.setDatabaseCondition(shard, metav1.ConditionFalse, "UnattestedAgent",
+			fmt.Sprintf("agent on pod %s did not attest the provenance protocol "+
+				"(a pre-provenance agent build?); the database stays unverified until the pod runs a current agent",
+				pod.Name))
 		return false
 	}
 	if adopt {

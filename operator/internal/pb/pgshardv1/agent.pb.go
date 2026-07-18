@@ -2291,9 +2291,17 @@ func (x *CreateDatabaseRequest) GetTargetPodUid() string {
 }
 
 type CreateDatabaseResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Attestation that the agent actually ran the provenance protocol: the
+	// marker value it verified or stamped, and the pod uid it serves. A LEGACY
+	// agent (predating these fields) returns an empty response — proto3
+	// ignores unknown request fields, so it would otherwise report success
+	// while having checked nothing; the operator treats a response that does
+	// not echo the expected values as UNVERIFIED and never routes on it.
+	VerifiedProvenance string `protobuf:"bytes,1,opt,name=verified_provenance,json=verifiedProvenance,proto3" json:"verified_provenance,omitempty"`
+	ServedPodUid       string `protobuf:"bytes,2,opt,name=served_pod_uid,json=servedPodUid,proto3" json:"served_pod_uid,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *CreateDatabaseResponse) Reset() {
@@ -2324,6 +2332,20 @@ func (x *CreateDatabaseResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CreateDatabaseResponse.ProtoReflect.Descriptor instead.
 func (*CreateDatabaseResponse) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *CreateDatabaseResponse) GetVerifiedProvenance() string {
+	if x != nil {
+		return x.VerifiedProvenance
+	}
+	return ""
+}
+
+func (x *CreateDatabaseResponse) GetServedPodUid() string {
+	if x != nil {
+		return x.ServedPodUid
+	}
+	return ""
 }
 
 // Drop the Postgres DATABASE for a placed (decommissioned) shard. Idempotent:
@@ -2759,8 +2781,10 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"provenance\x18\x03 \x01(\tR\n" +
 	"provenance\x12\x14\n" +
 	"\x05adopt\x18\x04 \x01(\bR\x05adopt\x12$\n" +
-	"\x0etarget_pod_uid\x18\x05 \x01(\tR\ftargetPodUid\"\x18\n" +
-	"\x16CreateDatabaseResponse\")\n" +
+	"\x0etarget_pod_uid\x18\x05 \x01(\tR\ftargetPodUid\"o\n" +
+	"\x16CreateDatabaseResponse\x12/\n" +
+	"\x13verified_provenance\x18\x01 \x01(\tR\x12verifiedProvenance\x12$\n" +
+	"\x0eserved_pod_uid\x18\x02 \x01(\tR\fservedPodUid\")\n" +
 	"\x13DropDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x16\n" +
 	"\x14DropDatabaseResponse\"H\n" +

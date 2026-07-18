@@ -60,8 +60,20 @@ type FakeAgent struct {
 	// identity-sensitive requests naming another pod uid are refused.
 	podUID string
 
+	// legacyResponses models a pre-provenance agent: requests succeed but the
+	// response carries no attestation (proto3 ignores the unknown fields).
+	legacyResponses bool
+
 	server   *grpc.Server
 	listener net.Listener
+}
+
+// SetLegacyResponses makes the fake behave like a pre-provenance agent:
+// success with an empty (unattested) response, all new fields ignored.
+func (f *FakeAgent) SetLegacyResponses(legacy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacyResponses = legacy
 }
 
 // SetPodUID scripts the agent's own pod UID (downward API identity).
@@ -345,6 +357,14 @@ func (f *FakeAgent) CreateDatabase(
 	if len(req.Name) > 63 || len(req.Owner) > 63 {
 		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
 	}
+	if f.legacyResponses {
+		// A pre-provenance agent: ignores every new field, reports bare
+		// success, attests nothing.
+		if _, ok := f.databases[req.Name]; !ok {
+			f.databases[req.Name] = req.Owner
+		}
+		return &pgshardv1.CreateDatabaseResponse{}, nil
+	}
 	if req.TargetPodUid != "" && f.podUID != "" && req.TargetPodUid != f.podUID {
 		// Mirror the real agent: a routing accident is ABORTED (retry), never
 		// FAILED_PRECONDITION (which reads as a database needing adoption).
@@ -375,13 +395,20 @@ func (f *FakeAgent) CreateDatabase(
 			}
 			f.dbProvenance[req.Name] = req.Provenance
 		}
-		return &pgshardv1.CreateDatabaseResponse{}, nil
+		return f.attestedResponse(req), nil
 	}
 	f.databases[req.Name] = req.Owner
 	if req.Provenance != "" {
 		f.dbProvenance[req.Name] = req.Provenance
 	}
-	return &pgshardv1.CreateDatabaseResponse{}, nil
+	return f.attestedResponse(req), nil
+}
+
+func (f *FakeAgent) attestedResponse(req *pgshardv1.CreateDatabaseRequest) *pgshardv1.CreateDatabaseResponse {
+	return &pgshardv1.CreateDatabaseResponse{
+		VerifiedProvenance: req.Provenance,
+		ServedPodUid:       f.podUID,
+	}
 }
 
 func (f *FakeAgent) DropDatabase(

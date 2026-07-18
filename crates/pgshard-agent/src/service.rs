@@ -435,7 +435,12 @@ impl<I: Instance> AgentService for AgentSvc<I> {
                 Ok(foreign) => Status::failed_precondition(foreign.to_string()),
                 Err(other) => internal(other),
             })?;
-        Ok(Response::new(v1::CreateDatabaseResponse {}))
+        // Attest what was actually verified: a legacy agent returns an empty
+        // response, which the caller must treat as unverified.
+        Ok(Response::new(v1::CreateDatabaseResponse {
+            verified_provenance: req.provenance,
+            served_pod_uid: self.pod_uid.clone(),
+        }))
     }
     async fn drop_database(
         &self,

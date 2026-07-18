@@ -264,7 +264,16 @@ message CreateDatabaseRequest {
   string target_pod_uid = 5;
 }
 
-message CreateDatabaseResponse {}
+message CreateDatabaseResponse {
+  // Attestation that the agent actually ran the provenance protocol: the
+  // marker value it verified or stamped, and the pod uid it serves. A LEGACY
+  // agent (predating these fields) returns an empty response — proto3
+  // ignores unknown request fields, so it would otherwise report success
+  // while having checked nothing; the operator treats a response that does
+  // not echo the expected values as UNVERIFIED and never routes on it.
+  string verified_provenance = 1;
+  string served_pod_uid = 2;
+}
 
 // Drop the Postgres DATABASE for a placed (decommissioned) shard. Idempotent:
 // a database that is already absent is a success. Existing sessions are
