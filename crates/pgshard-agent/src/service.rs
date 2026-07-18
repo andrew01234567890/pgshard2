@@ -4,8 +4,9 @@
 //! remaining RPCs (backups, restore, stanzas, replication, DDL, CDC) are wired
 //! in later steps and currently return `Unimplemented`.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -14,7 +15,7 @@ use pgshard_proto::v1;
 use v1::agent_service_server::AgentService;
 
 use crate::epoch::{EpochError, EpochGuard, Outcome};
-use crate::instance::Instance;
+use crate::instance::{Instance, RestorePoint};
 use crate::schema::{Claim, SchemaError, SchemaLog};
 use crate::status::to_status;
 
@@ -25,6 +26,13 @@ pub struct AgentSvc<I: Instance> {
     pod: String,
     epoch: EpochGuard,
     schema: SchemaLog,
+    /// Restore points already created, by name. PostgreSQL does not deduplicate
+    /// restore-point names (a second create writes a second record, and recovery
+    /// by name stops at the first), so a retried barrier must get its original
+    /// point back instead of writing a divergent second one. Names are unique
+    /// per barrier. In-memory, like the schema log: a retry after an agent
+    /// restart is out of scope for M1.
+    restore_points: Mutex<HashMap<String, RestorePoint>>,
 }
 
 impl<I: Instance> AgentSvc<I> {
@@ -34,7 +42,15 @@ impl<I: Instance> AgentSvc<I> {
             pod,
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
+            restore_points: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+fn restore_point_response(rp: RestorePoint) -> v1::CreateRestorePointResponse {
+    v1::CreateRestorePointResponse {
+        lsn: Some(v1::Lsn { value: rp.lsn }),
+        timeline: rp.timeline,
     }
 }
 
@@ -194,24 +210,30 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         }
     }
 
-    // Create a cross-shard consistency point on this (primary) instance.
     async fn create_restore_point(
         &self,
         request: Request<v1::CreateRestorePointRequest>,
     ) -> Result<Response<v1::CreateRestorePointResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("restore point name is required"));
+        // Reject an empty or over-63-byte name up front: PostgreSQL silently
+        // truncates a restore-point name to 63 bytes, so two long names sharing
+        // a prefix would collide onto one record.
+        check_ident("restore point name", &req.name, true)?;
+        // Idempotent by name: a retried barrier gets its original point back
+        // rather than writing a divergent second one (see the field doc).
+        if let Some(rp) = self.restore_points.lock().unwrap().get(&req.name).copied() {
+            return Ok(Response::new(restore_point_response(rp)));
         }
         let rp = self
             .instance
             .create_restore_point(&req.name)
             .await
             .map_err(internal)?;
-        Ok(Response::new(v1::CreateRestorePointResponse {
-            lsn: Some(v1::Lsn { value: rp.lsn }),
-            timeline: rp.timeline,
-        }))
+        self.restore_points
+            .lock()
+            .unwrap()
+            .insert(req.name.clone(), rp);
+        Ok(Response::new(restore_point_response(rp)))
     }
 
     async fn switch_wal(
@@ -691,6 +713,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_restore_point_is_idempotent_by_name() {
+        let instance = FakeInstance::primary();
+        instance.set(|s| s.write_lsn = 0xAA);
+        let s = svc(instance);
+        let req = || {
+            Request::new(v1::CreateRestorePointRequest {
+                name: "pgshard_barrier_1".into(),
+            })
+        };
+        let first = s.create_restore_point(req()).await.unwrap().into_inner();
+        // The instance advances between attempts, but a retry of the same barrier
+        // returns the original point, not a divergent second one.
+        s.instance.set(|st| st.write_lsn = 0xBB);
+        let retry = s.create_restore_point(req()).await.unwrap().into_inner();
+        assert_eq!(retry.lsn.unwrap().value, first.lsn.unwrap().value);
+        assert_eq!(retry.timeline, first.timeline);
+        // Only one PostgreSQL restore point was written.
+        assert_eq!(s.instance.restore_points(), vec!["pgshard_barrier_1"]);
+    }
+
+    #[tokio::test]
+    async fn create_restore_point_rejects_an_overlong_name() {
+        // PostgreSQL truncates a restore-point name at 63 bytes; reject upfront so
+        // two long names cannot collide onto one record.
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .create_restore_point(Request::new(v1::CreateRestorePointRequest {
+                name: "b".repeat(64),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn switch_wal_returns_the_switch_lsn() {
         let instance = FakeInstance::primary();
         instance.set(|s| s.write_lsn = 0x5000);
@@ -704,5 +761,22 @@ mod tests {
             .into_inner();
         assert_eq!(resp.lsn.unwrap().value, 0x5000);
         assert_eq!(s.instance.wal_switches(), 1);
+    }
+
+    #[tokio::test]
+    async fn switch_wal_rejects_wait_archived_without_switching() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .switch_wal(Request::new(v1::SwitchWalRequest {
+                wait_archived: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(
+            s.instance.wal_switches(),
+            0,
+            "no switch happens on rejection"
+        );
     }
 }

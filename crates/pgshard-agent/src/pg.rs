@@ -171,13 +171,17 @@ impl Instance for PgInstance {
 
     async fn create_restore_point(&self, name: &str) -> anyhow::Result<RestorePoint> {
         let client = self.connect().await?;
-        // pg_create_restore_point returns the point's LSN; the timeline comes
-        // from the control file. On a standby PostgreSQL errors ("recovery is in
-        // progress"), which propagates — the caller targets the primary.
+        // pg_create_restore_point returns the point's LSN; the timeline is read
+        // from that LSN's WAL file name, not pg_control_checkpoint() — the latter
+        // reflects the last completed checkpoint, so right after a promotion it
+        // would report the pre-promotion timeline while the new point sits on the
+        // new one (the same trap `promote` avoids). On a standby PostgreSQL errors
+        // ("recovery is in progress"), which propagates — the caller targets the
+        // primary.
         let row = client
             .query_one(
-                "SELECT pg_create_restore_point($1)::text,
-                        (SELECT timeline_id FROM pg_control_checkpoint())",
+                "SELECT lsn::text, ('x' || substr(pg_walfile_name(lsn), 1, 8))::bit(32)::int
+                 FROM pg_create_restore_point($1) AS lsn",
                 &[&name],
             )
             .await?;

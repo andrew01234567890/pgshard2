@@ -211,7 +211,13 @@ pub mod fake {
                 timeline: s.timeline,
             })
         }
-        async fn switch_wal(&self, _wait_archived: bool) -> anyhow::Result<u64> {
+        async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64> {
+            // Mirror the real instance's contract so the fast unit path enforces
+            // it: the archive-wait is not implemented yet.
+            anyhow::ensure!(
+                !wait_archived,
+                "switch_wal with wait_archived is not implemented yet"
+            );
             let s = self.state.lock().unwrap();
             anyhow::ensure!(!s.in_recovery, "cannot switch WAL on a standby");
             self.wal_switches
