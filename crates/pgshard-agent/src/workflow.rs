@@ -107,6 +107,8 @@ pub enum WorkflowError {
     Conflict(String),
     #[error("workflow {0} is already seeding target database {1}")]
     TargetBusy(String, String),
+    #[error("workflow {0} is stopping; retry once it has terminated")]
+    Stopping(String),
     #[error("{0} is not implemented in M1: {1}")]
     Unimplemented(&'static str, String),
 }
@@ -197,6 +199,19 @@ fn plan(spec: &v1::WorkflowSpec, config: &WorkflowConfig) -> Result<RunPlan, Wor
     if spec.tables.is_empty() {
         return invalid("at least one table mapping is required".into());
     }
+    // Duplicate mappings would seed under the LAST one (each truncates) but
+    // stream under the FIRST — two filters for one table.
+    for (i, m) in spec.tables.iter().enumerate() {
+        if let Some(a) = &m.source
+            && spec.tables[..i].iter().any(|prev| {
+                prev.source
+                    .as_ref()
+                    .is_some_and(|b| b.schema == a.schema && b.name == a.name)
+            })
+        {
+            return invalid(format!("table {}.{} is mapped twice", a.schema, a.name));
+        }
+    }
     let (range, hash) = match spec.filter.as_ref().and_then(|f| f.filter.as_ref()) {
         Some(v1::row_filter::Filter::All(true)) => (KeyRange::FULL, "xxhash64_v1".to_owned()),
         Some(v1::row_filter::Filter::KeyRange(kr)) => {
@@ -284,6 +299,12 @@ impl WorkflowRegistry {
         if let Some(existing) = inner.get(&run.id)
             && existing.live()
         {
+            // A stop has been signaled but not yet observed: the old worker
+            // may still be mid-copy. Acknowledging a byte-identical restart
+            // now would return success whose only worker is about to exit.
+            if *existing.stop.borrow() {
+                return Err(WorkflowError::Stopping(run.id));
+            }
             if existing.spec_bytes == spec_bytes {
                 return Ok(());
             }
@@ -433,41 +454,60 @@ struct PublicationShape {
     truncate: bool,
     via_partition_root: bool,
     publishes_generated: bool,
-    /// Row versions (xmin) of the pg_publication row and every
-    /// pg_publication_rel row. A sampled shape comparison alone would miss a
-    /// toggle-away-and-back between polls; ANY ALTER PUBLICATION rewrites at
-    /// least one of these rows, and xids never repeat, so the version set
-    /// cannot match unless the publication was untouched the whole time.
-    versions: Vec<(u32, String)>,
+    all_tables: bool,
+    /// Row versions (catalog kind, oid, xmin) of the pg_publication row and
+    /// every pg_publication_rel / pg_publication_namespace row. A sampled
+    /// shape comparison alone would miss a toggle-away-and-back between
+    /// polls; ANY ALTER PUBLICATION rewrites at least one of these rows, so
+    /// the version set cannot match unless the publication was untouched
+    /// the whole time (xid reuse is separately fenced by the wrap horizon).
+    versions: Vec<(i32, u32, String)>,
     tables: Vec<PublishedTable>,
 }
+
+/// The publication's validated shape plus the xid horizon fencing xmin reuse:
+/// 32-bit xmins can repeat after 2^32 transactions, so the poll also refuses
+/// to continue once the source has consumed half the xid space since
+/// preflight — long before a captured version could recur.
+struct PublicationBaseline {
+    shape: PublicationShape,
+    xid: u64,
+}
+
+const XID_HORIZON: u64 = 1 << 31;
 
 async fn fetch_publication(
     source_sql: &tokio_postgres::Client,
     publication: &str,
-) -> anyhow::Result<PublicationShape> {
+) -> anyhow::Result<PublicationBaseline> {
     let row = source_sql
         .query_opt(
             "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot,
-                    pubgencols::text <> 'n'
+                    pubgencols::text <> 'n', puballtables,
+                    pg_current_xact_id()::text
              FROM pg_publication WHERE pubname = $1",
             &[&publication],
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("publication {publication} does not exist on the source"))?;
+    let xid: u64 = row.get::<_, String>(7).parse()?;
     let versions = source_sql
         .query(
-            "SELECT oid, xmin::text FROM pg_publication WHERE pubname = $1
+            "SELECT 0, oid, xmin::text FROM pg_publication WHERE pubname = $1
              UNION ALL
-             SELECT pr.oid, pr.xmin::text FROM pg_publication_rel pr
+             SELECT 1, pr.oid, pr.xmin::text FROM pg_publication_rel pr
              JOIN pg_publication p ON p.oid = pr.prpubid
              WHERE p.pubname = $1
-             ORDER BY oid",
+             UNION ALL
+             SELECT 2, pn.oid, pn.xmin::text FROM pg_publication_namespace pn
+             JOIN pg_publication p ON p.oid = pn.pnpubid
+             WHERE p.pubname = $1
+             ORDER BY 1, 2",
             &[&publication],
         )
         .await?
         .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
     let tables = source_sql
         .query(
@@ -485,15 +525,19 @@ async fn fetch_publication(
             row_filter: r.get(3),
         })
         .collect();
-    Ok(PublicationShape {
-        insert: row.get(0),
-        update: row.get(1),
-        delete: row.get(2),
-        truncate: row.get(3),
-        via_partition_root: row.get(4),
-        publishes_generated: row.get(5),
-        versions,
-        tables,
+    Ok(PublicationBaseline {
+        shape: PublicationShape {
+            insert: row.get(0),
+            update: row.get(1),
+            delete: row.get(2),
+            truncate: row.get(3),
+            via_partition_root: row.get(4),
+            publishes_generated: row.get(5),
+            all_tables: row.get(6),
+            versions,
+            tables,
+        },
+        xid,
     })
 }
 
@@ -504,7 +548,7 @@ async fn preflight(
     run: &RunPlan,
     source_sql: &tokio_postgres::Client,
     target_sql: &tokio_postgres::Client,
-) -> anyhow::Result<(Vec<TablePreflight>, PublicationShape)> {
+) -> anyhow::Result<(Vec<TablePreflight>, PublicationBaseline)> {
     // The target database must be the shard this workflow was aimed at: its
     // provenance marker is stamped by CreateDatabase and never by hand.
     let marker: Option<String> = target_sql
@@ -532,7 +576,8 @@ async fn preflight(
     // tables: a mapped table missing from it would be seeded once and then
     // silently never receive changes; an unmapped table in it would kill the
     // stream mid-flight after seeding.
-    let shape = fetch_publication(source_sql, &run.publication).await?;
+    let baseline = fetch_publication(source_sql, &run.publication).await?;
+    let shape = &baseline.shape;
     anyhow::ensure!(
         shape.insert && shape.update && shape.delete && shape.truncate,
         "publication {} does not publish all of insert/update/delete/truncate: disabled kinds would be silently omitted from the stream",
@@ -550,6 +595,21 @@ async fn preflight(
     anyhow::ensure!(
         !shape.publishes_generated,
         "publication {} publishes generated columns, which this runner cannot stream soundly",
+        run.publication
+    );
+    // FOR ALL TABLES and TABLES IN SCHEMA memberships expand DYNAMICALLY —
+    // a mapped table can be dropped and recreated between polls with the
+    // expanded list returning to its original value and (for all-tables) no
+    // catalog row to version. Only explicit FOR TABLE publications give
+    // every member a versioned pg_publication_rel row.
+    anyhow::ensure!(
+        !shape.all_tables,
+        "publication {} is FOR ALL TABLES; its membership cannot be pinned — use an explicit FOR TABLE publication",
+        run.publication
+    );
+    anyhow::ensure!(
+        shape.versions.iter().all(|(kind, ..)| *kind != 2),
+        "publication {} publishes TABLES IN SCHEMA; its membership cannot be pinned — use an explicit FOR TABLE publication",
         run.publication
     );
     let published = &shape.tables;
@@ -782,7 +842,7 @@ async fn preflight(
             columns: src.iter().map(|c| c.name.clone()).collect(),
         });
     }
-    Ok((plans, shape))
+    Ok((plans, baseline))
 }
 
 /// One column as both sides' compatibility check needs it.
@@ -966,9 +1026,13 @@ async fn run_workflow(
             _ = pub_recheck.tick() => {
                 let now = fetch_publication(&source_sql, &run.publication).await?;
                 anyhow::ensure!(
-                    now == publication,
+                    now.shape == publication.shape,
                     "publication {} changed while streaming: the stream may have silently omitted changes",
                     run.publication
+                );
+                anyhow::ensure!(
+                    now.xid.wrapping_sub(publication.xid) < XID_HORIZON,
+                    "the source has consumed half the xid space since this workflow began; catalog row versions can no longer be trusted"
                 );
                 continue;
             }

@@ -187,7 +187,26 @@ async fn seeds_then_streams_only_the_target_keyrange() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // A deliberate stop parks the workflow.
+    // A deliberate stop parks the workflow — and a restart racing the stop
+    // must NEVER be acknowledged against the dying worker: it is either
+    // refused as Stopping (retry) or actually replaces it. Looping on the
+    // retry must end with a REAL new worker streaming again; the old bug
+    // (silent ack, no worker) would leave the status parked at Stopped.
+    registry.stop("wf1").await;
+    loop {
+        match registry
+            .start(&spec(&pg, "wf1", "pgshard_wf1"), &config)
+            .await
+        {
+            Ok(()) => break,
+            Err(WorkflowError::Stopping(_)) => tokio::task::yield_now().await,
+            other => panic!("restart during stop must be Stopping or success, got {other:?}"),
+        }
+    }
+    wait_for(&registry, "wf1", "streaming again after the restart", |s| {
+        s.phase == v1::WorkflowPhase::Streaming as i32
+    })
+    .await;
     registry.stop("wf1").await;
     wait_for(&registry, "wf1", "the stopped phase", |s| {
         s.phase == v1::WorkflowPhase::Stopped as i32
@@ -255,6 +274,13 @@ async fn rejects_specs_the_runner_cannot_execute_honestly() -> anyhow::Result<()
     no_provenance.expect_provenance = String::new();
     assert!(matches!(
         registry.start(&no_provenance, &config).await,
+        Err(WorkflowError::Invalid(_))
+    ));
+
+    let mut duplicated = spec(&pg, "wfd", "pgshard_wfd");
+    duplicated.tables.push(duplicated.tables[0].clone());
+    assert!(matches!(
+        registry.start(&duplicated, &config).await,
         Err(WorkflowError::Invalid(_))
     ));
     Ok(())
@@ -363,6 +389,15 @@ async fn preflight_refuses_destructive_work_before_touching_the_target() -> anyh
     col_listed.publication = "pub_cols".into();
     registry.start(&col_listed, &config).await?;
     wait_for_error(&registry, "wf_cols", "different column set").await;
+
+    // Dynamic membership cannot be pinned by catalog row versions.
+    source
+        .batch_execute("CREATE PUBLICATION pub_all FOR ALL TABLES")
+        .await?;
+    let mut all_tables = spec(&pg, "wf_all", "pgshard_all");
+    all_tables.publication = "pub_all".into();
+    registry.start(&all_tables, &config).await?;
+    wait_for_error(&registry, "wf_all", "FOR ALL TABLES").await;
 
     // A partition-root publication announces leaf relations the mapping
     // does not know, and direct leaf truncates go unpublished.

@@ -80,6 +80,7 @@ fn workflow_status(err: WorkflowError) -> Status {
         WorkflowError::Conflict(_) | WorkflowError::TargetBusy(..) => {
             Status::failed_precondition(err.to_string())
         }
+        WorkflowError::Stopping(_) => Status::unavailable(err.to_string()),
         WorkflowError::Unimplemented(..) => Status::unimplemented(err.to_string()),
     }
 }
