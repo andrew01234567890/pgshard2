@@ -2010,6 +2010,8 @@ dependencies = [
  "pg_query",
  "pgshard-core",
  "pgshard-sql",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

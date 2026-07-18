@@ -190,19 +190,6 @@ pub fn insert_key_values(ins: &InsertStmt, key_col: &str) -> Option<Vec<KeyVal>>
     Some(out)
 }
 
-/// True when any `VALUES` cell of an `INSERT` contains a sub-select. Such a
-/// subquery runs only on the shard the INSERT routes to, yet may reference rows
-/// on other shards — so a keyed INSERT carrying one must be rejected, not routed.
-pub fn insert_values_have_sublink(ins: &InsertStmt) -> bool {
-    let Some(NodeEnum::SelectStmt(sel)) = ins.select_stmt.as_deref().and_then(as_enum) else {
-        return false;
-    };
-    sel.values_lists.iter().any(|row| {
-        matches!(as_enum(row), Some(NodeEnum::List(list))
-            if list.items.iter().any(|item| contains_sublink(Some(item))))
-    })
-}
-
 /// True when a `SET` target list (UPDATE) assigns to `key_col`.
 pub fn sets_column(target_list: &[Node], key_col: &str) -> bool {
     target_list
@@ -248,46 +235,38 @@ fn collect_from(node: &Node, fc: &mut FromClause) {
     }
 }
 
-/// True when an expression subtree contains a sub-select (`SubLink`). A sharded
-/// statement whose WHERE both pins a shard key and runs a subquery is rejected:
-/// the subquery would execute only on the routed shard and could reference rows
-/// on other shards. Covers the common boolean/comparison/function containers;
-/// sub-selects buried in rarer expression nodes are conservatively not the
-/// key-routing fast path's concern (documented in the crate root).
-pub fn contains_sublink(clause: Option<&Node>) -> bool {
-    clause.is_some_and(child_has_sublink)
+/// True when a parse-tree fragment contains an expression subquery (`SubLink`)
+/// anywhere within it. A statement routed to a single shard must reject any such
+/// subquery: it would execute only on the routed shard yet could reference rows
+/// on others, silently reading or writing the wrong data. This holds no matter
+/// where the subquery sits — a `WHERE` predicate, a target-list expression, an
+/// `UPDATE ... SET` value, an aggregate `FILTER`, an array element — so callers
+/// pass the whole statement, not just its `WHERE`.
+///
+/// Detection is structural over the serialized tree rather than a hand-listed
+/// walk of expression node types: serde visits every field, so a subquery cannot
+/// hide in a node the walk forgot. This matters because neither a bespoke match
+/// nor libpg_query's own `nodes()` iterator descends into every node — each
+/// misses different shapes (an aggregate `FILTER`, an `ARRAY[...]` element).
+/// A serialization error — which a well-formed parse tree does not produce — is
+/// treated as "contains a subquery" so the planner fails closed and rejects.
+pub fn contains_sublink<T: serde::Serialize>(tree: &T) -> bool {
+    match serde_json::to_value(tree) {
+        Ok(json) => json_contains_sublink(&json),
+        Err(_) => true,
+    }
 }
 
-fn child_has_sublink(node: &Node) -> bool {
-    as_enum(node).is_some_and(node_has_sublink)
-}
-
-fn node_has_sublink(node: &NodeEnum) -> bool {
-    match node {
-        NodeEnum::SubLink(_) => true,
-        NodeEnum::BoolExpr(b) => b.args.iter().any(child_has_sublink),
-        NodeEnum::AExpr(e) => {
-            e.lexpr.as_deref().is_some_and(child_has_sublink)
-                || e.rexpr.as_deref().is_some_and(child_has_sublink)
+/// libpg_query serializes a `Node`'s oneof arm as an object keyed by the node's
+/// type name, so an expression subquery is an object with a `"SubLink"` key.
+/// A string *value* (e.g. a literal `'SubLink'`) is never an object key, so the
+/// structural check cannot mistake one for a subquery.
+fn json_contains_sublink(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key("SubLink") || map.values().any(json_contains_sublink)
         }
-        NodeEnum::List(l) => l.items.iter().any(child_has_sublink),
-        NodeEnum::FuncCall(f) => f.args.iter().any(child_has_sublink),
-        NodeEnum::CoalesceExpr(c) => c.args.iter().any(child_has_sublink),
-        NodeEnum::MinMaxExpr(m) => m.args.iter().any(child_has_sublink),
-        NodeEnum::RowExpr(r) => r.args.iter().any(child_has_sublink),
-        NodeEnum::AArrayExpr(a) => a.elements.iter().any(child_has_sublink),
-        NodeEnum::NullTest(n) => n.arg.as_deref().is_some_and(child_has_sublink),
-        NodeEnum::BooleanTest(b) => b.arg.as_deref().is_some_and(child_has_sublink),
-        NodeEnum::TypeCast(t) => t.arg.as_deref().is_some_and(child_has_sublink),
-        NodeEnum::CaseExpr(c) => {
-            c.arg.as_deref().is_some_and(child_has_sublink)
-                || c.args.iter().any(child_has_sublink)
-                || c.defresult.as_deref().is_some_and(child_has_sublink)
-        }
-        NodeEnum::CaseWhen(w) => {
-            w.expr.as_deref().is_some_and(child_has_sublink)
-                || w.result.as_deref().is_some_and(child_has_sublink)
-        }
+        serde_json::Value::Array(items) => items.iter().any(json_contains_sublink),
         _ => false,
     }
 }
