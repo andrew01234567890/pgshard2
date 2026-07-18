@@ -312,9 +312,14 @@ impl WorkflowRegistry {
         }
         // One running workflow per target database: seeding truncates, so a
         // second worker under a DIFFERENT id would destroy the first's copy.
-        if let Some((other, _)) = inner.iter().find(|(id, h)| {
+        if let Some((other, holder)) = inner.iter().find(|(id, h)| {
             **id != run.id && !h.join.is_finished() && h.target_database == run.target_database
         }) {
+            // A winding-down holder releases the target momentarily — that is
+            // the retryable Stopping case, not the persistent TargetBusy one.
+            if holder.winding_down() {
+                return Err(WorkflowError::Stopping(other.clone()));
+            }
             return Err(WorkflowError::TargetBusy(
                 other.clone(),
                 run.target_database,
@@ -1192,4 +1197,51 @@ fn rel_filter(relations: &HashMap<u32, RelFilter>, oid: u32) -> anyhow::Result<&
     relations
         .get(&oid)
         .ok_or_else(|| anyhow::anyhow!("row for unknown relation oid {oid}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xid_recurrence_horizon;
+
+    fn v(xmins: &[&str]) -> Vec<(i32, u32, String)> {
+        xmins.iter().map(|x| (0, 1, x.to_string())).collect()
+    }
+
+    const FULL_CYCLE: u64 = 1 << 32;
+
+    #[test]
+    fn the_nearest_forward_xmin_bounds_the_horizon() {
+        let h = xid_recurrence_horizon(1000, &v(&["1010", "500000"])).unwrap();
+        assert_eq!(h, 10);
+    }
+
+    #[test]
+    fn an_xmin_behind_the_counter_recurs_only_after_wrapping_forward() {
+        let h = xid_recurrence_horizon(1000, &v(&["990"])).unwrap();
+        assert_eq!(h, FULL_CYCLE - 10);
+    }
+
+    #[test]
+    fn an_xmin_equal_to_the_baseline_means_a_full_cycle() {
+        let h = xid_recurrence_horizon(1000, &v(&["1000"])).unwrap();
+        assert_eq!(h, FULL_CYCLE);
+    }
+
+    #[test]
+    fn special_xids_never_recur_and_do_not_bound_the_horizon() {
+        let h = xid_recurrence_horizon(1000, &v(&["0", "1", "2"])).unwrap();
+        assert_eq!(h, FULL_CYCLE);
+    }
+
+    #[test]
+    fn a_64_bit_baseline_bounds_by_its_low_32_bits() {
+        let base = (7 << 32) | 1000;
+        let h = xid_recurrence_horizon(base, &v(&["1010"])).unwrap();
+        assert_eq!(h, 10);
+    }
+
+    #[test]
+    fn an_unparseable_xmin_is_an_error() {
+        assert!(xid_recurrence_horizon(1000, &v(&["not-an-xid"])).is_err());
+    }
 }

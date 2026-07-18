@@ -193,13 +193,20 @@ async fn seeds_then_streams_only_the_target_keyrange() -> anyhow::Result<()> {
     // retry must end with a REAL new worker streaming again; the old bug
     // (silent ack, no worker) would leave the status parked at Stopped.
     registry.stop("wf1").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match registry
             .start(&spec(&pg, "wf1", "pgshard_wf1"), &config)
             .await
         {
             Ok(()) => break,
-            Err(WorkflowError::Stopping(_)) => tokio::task::yield_now().await,
+            Err(WorkflowError::Stopping(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the stopped workflow never became replaceable"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             other => panic!("restart during stop must be Stopping or success, got {other:?}"),
         }
     }
