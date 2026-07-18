@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::model::Topology;
-use crate::{TopologyError, TopologyWatcher, validate};
+use crate::{SourceValidation, TopologyError, TopologyWatcher, validate};
 
 pub struct FileWatcher {
     sender: Arc<watch::Sender<Arc<Topology>>>,
@@ -27,7 +27,7 @@ pub struct FileWatcher {
     /// this epoch matches its ACTIVE snapshot (or when a newer epoch actually
     /// builds and swaps) — a source the router cannot accept must not keep its
     /// lease alive.
-    validated: Arc<watch::Sender<u64>>,
+    validated: Arc<watch::Sender<SourceValidation>>,
 }
 
 impl FileWatcher {
@@ -50,7 +50,7 @@ impl FileWatcher {
         let initial_epoch = initial.epoch;
         let (sender, _) = watch::channel(Arc::new(initial));
         let sender = Arc::new(sender);
-        let (validated, _) = watch::channel(initial_epoch);
+        let (validated, _) = watch::channel(SourceValidation::now(initial_epoch));
         let validated = Arc::new(validated);
 
         let poller = Arc::clone(&sender);
@@ -70,14 +70,14 @@ impl FileWatcher {
                 }
                 match load(&poll_path).await {
                     Ok(candidate) => {
-                        let epoch = candidate.epoch;
-                        apply(&poller, candidate);
-                        // Announce the validated epoch AFTER applying so a
-                        // consumer that reacts to it never observes it before
-                        // the snapshot it refers to is available. An error
+                        // Stamp at validation time, announce AFTER applying so
+                        // a consumer never observes the announcement before the
+                        // snapshot it refers to is available. An error
                         // deliberately announces nothing, so lease-style
                         // consumers see their view age.
-                        poll_validated.send_replace(epoch);
+                        let stamp = SourceValidation::now(candidate.epoch);
+                        apply(&poller, candidate);
+                        poll_validated.send_replace(stamp);
                     }
                     Err(err) => {
                         warn!(path = %poll_path.display(), error = %err,
@@ -98,15 +98,16 @@ impl FileWatcher {
     /// the poll tick). Returns whether the snapshot was applied.
     pub async fn reload(&self) -> Result<bool, TopologyError> {
         let candidate = load(&self.path).await?;
-        let epoch = candidate.epoch;
+        let stamp = SourceValidation::now(candidate.epoch);
         let applied = apply(&self.sender, candidate);
-        self.validated.send_replace(epoch);
+        self.validated.send_replace(stamp);
         Ok(applied)
     }
 
-    /// The epoch of the last successful source read+validate, updated on every
-    /// successful poll. The router's write-lease renewal subscribes here.
-    pub fn subscribe_validated(&self) -> watch::Receiver<u64> {
+    /// The last successful source read+validate (epoch + validation-time
+    /// clocks), updated on every successful poll. The router's write-lease
+    /// renewal subscribes here.
+    pub fn subscribe_validated(&self) -> watch::Receiver<SourceValidation> {
         self.validated.subscribe()
     }
 }

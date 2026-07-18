@@ -84,7 +84,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(pgshard_router::watch_topology_leased(
         router.clone(),
         updates,
-        Some((watcher.subscribe_validated(), freshness.clone())),
+        Some(pgshard_router::LeaseWiring {
+            validated: watcher.subscribe_validated(),
+            freshness: freshness.clone(),
+            poll_interval: Duration::from_secs(args.poll_seconds),
+        }),
     ));
 
     let backend = Backend {

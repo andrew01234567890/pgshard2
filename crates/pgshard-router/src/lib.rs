@@ -275,11 +275,11 @@ pub async fn watch_topology(target: SharedRouter, updates: watch::Receiver<Arc<T
 pub async fn watch_topology_leased(
     target: SharedRouter,
     mut updates: watch::Receiver<Arc<Topology>>,
-    lease: Option<(watch::Receiver<u64>, pgshard_topo::Freshness)>,
+    lease: Option<LeaseWiring>,
 ) {
-    let (mut validated, freshness) = match lease {
-        Some((v, f)) => (Some(v), Some(f)),
-        None => (None, None),
+    let (mut validated, freshness, poll) = match lease {
+        Some(w) => (Some(w.validated), Some(w.freshness), Some(w.poll_interval)),
+        None => (None, None, None),
     };
     loop {
         let changed = async {
@@ -297,16 +297,20 @@ pub async fn watch_topology_leased(
             return; // watcher dropped
         };
         if !is_update {
-            // A validated-epoch announcement: renew the lease only if it
-            // confirms the epoch this router is actually serving.
-            let epoch = *validated
+            // A validation announcement: renew the lease only if it confirms
+            // the epoch this router is actually serving, and install the
+            // stamps captured AT VALIDATION — never delivery time, so a
+            // delivery delayed across a suspend cannot launder a pre-suspend
+            // read into a fresh confirmation. A swap never renews by itself;
+            // its poll's announcement (sent after apply) does.
+            let stamp = *validated
                 .as_mut()
                 .expect("validated stream")
                 .borrow_and_update();
-            if epoch == target.load().epoch()
+            if stamp.epoch == target.load().epoch()
                 && let Some(f) = &freshness
             {
-                f.bump();
+                f.install(&stamp);
             }
             continue;
         }
@@ -314,9 +318,35 @@ pub async fn watch_topology_leased(
         match Router::build(&topology) {
             Ok(router) => {
                 let epoch = router.epoch();
+                if let Some(poll) = poll
+                    && router.write_lease() <= poll
+                {
+                    // Startup validated the initial pairing; a later epoch can
+                    // still shrink the lease below the poll cadence, which
+                    // would flap writes off between healthy polls. The lease
+                    // is the operator's call, so warn loudly rather than
+                    // refuse the epoch.
+                    tracing::warn!(
+                        lease_secs = router.write_lease().as_secs(),
+                        poll_secs = poll.as_secs(),
+                        "writeLeaseSeconds is not longer than the poll interval; writes will flap off between polls"
+                    );
+                }
                 target.store(Arc::new(router));
-                if let Some(f) = &freshness {
-                    f.bump();
+                // Both channels fire from one poll, and select! may consume
+                // the validation announcement BEFORE this swap — with the old
+                // epoch active it installed nothing, and no further event
+                // would come. Consult the latest announcement now: if it
+                // confirms the epoch just swapped in, install its stamps.
+                // (If the announcement has not been sent yet, its pending
+                // event arrives next and matches the now-active epoch.)
+                if let Some(v) = &validated {
+                    let stamp = *v.borrow();
+                    if stamp.epoch == epoch
+                        && let Some(f) = &freshness
+                    {
+                        f.install(&stamp);
+                    }
                 }
                 tracing::info!(epoch, "applied topology update");
             }
@@ -325,6 +355,15 @@ pub async fn watch_topology_leased(
             }
         }
     }
+}
+
+/// The plumbing [`watch_topology_leased`] needs to renew a write lease: the
+/// watcher's validation announcements, the proxy's freshness stamp, and the
+/// watcher's poll cadence (for the lease-vs-poll sanity warning).
+pub struct LeaseWiring {
+    pub validated: watch::Receiver<pgshard_topo::SourceValidation>,
+    pub freshness: pgshard_topo::Freshness,
+    pub poll_interval: std::time::Duration,
 }
 
 fn build_vschema(topo: &Topology) -> Result<VSchema, BuildError> {

@@ -60,17 +60,28 @@ impl Freshness {
             (std::time::Instant::now(), std::time::SystemTime::now());
     }
 
+    /// Install a source-captured confirmation: the stamp is the moment the
+    /// source was VALIDATED, not the moment this call runs — a delivery delayed
+    /// across a suspend must not launder a pre-suspend validation into a fresh
+    /// one.
+    pub fn install(&self, v: &SourceValidation) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = (v.instant, v.wall);
+    }
+
     /// How long ago the view was last confirmed. Takes the LARGER of the
     /// monotonic and wall-clock elapsed times: Linux's monotonic clock stops
     /// during system suspend, so a resumed node would otherwise think a
-    /// pre-suspend confirmation is recent. A wall-clock jump (NTP step) can
-    /// only make the age look larger — a false expiry fails closed.
+    /// pre-suspend confirmation is recent. A wall clock that stepped BACKWARD
+    /// past the stamp is indistinguishable from a suspend-plus-step that
+    /// under-reports both clocks, so it reports maximal age — a false expiry
+    /// fails closed and the next renewal clears it within a poll interval.
     pub fn age(&self) -> std::time::Duration {
         let (instant, wall) = *self.0.read().unwrap_or_else(|e| e.into_inner());
         let monotonic = instant.elapsed();
-        let wall_elapsed = std::time::SystemTime::now()
-            .duration_since(wall)
-            .unwrap_or_default();
+        let wall_elapsed = match std::time::SystemTime::now().duration_since(wall) {
+            Ok(d) => d,
+            Err(_) => return std::time::Duration::MAX,
+        };
         monotonic.max(wall_elapsed)
     }
 
@@ -87,6 +98,27 @@ impl Freshness {
 impl Default for Freshness {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One successful source read+validate: the epoch it observed and the clocks
+/// captured AT VALIDATION TIME (both, for the same suspend-awareness as
+/// [`Freshness::age`]). Consumers install these stamps rather than stamping
+/// delivery time, so a delayed delivery never inflates freshness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceValidation {
+    pub epoch: u64,
+    pub instant: std::time::Instant,
+    pub wall: std::time::SystemTime,
+}
+
+impl SourceValidation {
+    pub fn now(epoch: u64) -> Self {
+        Self {
+            epoch,
+            instant: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
     }
 }
 

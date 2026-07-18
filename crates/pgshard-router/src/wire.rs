@@ -372,6 +372,11 @@ impl Proxy {
     ) -> PgWireResult<Vec<Response>> {
         // The write lease: once the view's last confirmation is older than the
         // lease, this router can no longer prove its routing is current —
+        // (The freshness stamp is deliberately not epoch-bound to this
+        // request's pinned router snapshot: a request in flight across an
+        // epoch swap completes on the outgoing snapshot by the router's own
+        // hot-swap semantics, lease or no lease — that window is one request's
+        // latency, not the staleness the lease bounds.)
         // refuse write statements outright, and run everything that remains
         // (reads) under a backend-enforced read-only transaction, so even a
         // write hidden inside a function body the router cannot see is refused

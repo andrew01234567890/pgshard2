@@ -619,6 +619,34 @@ async fn expired_write_lease_blocks_writes_but_not_reads() {
         .simple_query("INSERT INTO orders (customer_id, note) VALUES (1, 'again')")
         .await
         .unwrap();
+
+    // The text (tokio-postgres) backend enforces the same stale read-only
+    // session via connection options.
+    let text_proxy = Arc::new(
+        Proxy::new(
+            pgshard_router::shared(
+                Router::build(&single_shard_topology(pg.host(), pg.port())).unwrap(),
+            ),
+            Backend {
+                user: "postgres".into(),
+                password: "postgres".into(),
+                system_database: "postgres".into(),
+            },
+        )
+        .text()
+        .with_freshness(freshness.clone()),
+    );
+    let conn2 = spawn_router(text_proxy).await;
+    let (client2, connection2) = tokio_postgres::connect(&conn2, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection2);
+    freshness.backdate(std::time::Duration::from_secs(11));
+    let err = client2
+        .simple_query("SELECT sneaky_write()")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("25006"));
 }
 
 /// The production lease path end to end: the lease renews only when the ACTIVE
@@ -659,7 +687,11 @@ async fn lease_renews_only_when_the_active_view_is_confirmed() {
     tokio::spawn(pgshard_router::watch_topology_leased(
         router.clone(),
         watcher.subscribe(),
-        Some((watcher.subscribe_validated(), freshness.clone())),
+        Some(pgshard_router::LeaseWiring {
+            validated: watcher.subscribe_validated(),
+            freshness: freshness.clone(),
+            poll_interval: Duration::from_secs(1),
+        }),
     ));
     let proxy = Arc::new(
         Proxy::new(
