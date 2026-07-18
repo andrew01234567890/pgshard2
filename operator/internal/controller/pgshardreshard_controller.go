@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
+	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
 	"github.com/andrew01234567890/pgshard2/operator/internal/topology"
 )
 
@@ -46,6 +48,21 @@ import (
 type PgShardReshardReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Agents dials seeding RPCs on source and target agents. Nil until the
+	// Seeding phase needs it (tests inject dialAgent instead).
+	Agents *agentclient.Pool
+	// dialAgent overrides agent resolution in tests.
+	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
+}
+
+func (r *PgShardReshardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+	if r.dialAgent != nil {
+		return r.dialAgent(host, port)
+	}
+	if r.Agents == nil {
+		return nil, fmt.Errorf("no agent pool configured")
+	}
+	return r.Agents.Get(host, port)
 }
 
 // The condition that records whether the requested split is well-formed.
@@ -60,6 +77,8 @@ const reshardTargetsProvisionedCondition = "TargetsProvisioned"
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardnodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardtableconfigs,verbs=get;list;watch
 
 func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var reshard pgshardv1alpha1.PgShardReshard
@@ -81,6 +100,8 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileValidating(ctx, &reshard)
 	case pgshardv1alpha1.ReshardProvisioningTargets:
 		result, err = r.reconcileProvisioningTargets(ctx, &reshard)
+	case pgshardv1alpha1.ReshardSeeding:
+		result, err = r.reconcileSeeding(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}

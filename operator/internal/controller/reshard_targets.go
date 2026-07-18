@@ -149,9 +149,11 @@ func (r *PgShardReshardReconciler) reconcileProvisioningTargets(
 
 	reshard.Status.TargetShards = names
 	setReshardCondition(reshard, reshardTargetsProvisionedCondition, metav1.ConditionTrue,
-		"TargetsProvisioned",
-		"target shards created (non-serving); seeding and cutover are later slices")
-	return ctrl.Result{}, nil
+		"TargetsProvisioned", "target shards created (non-serving)")
+	// Requeue explicitly: a status-only write does not re-enqueue under
+	// GenerationChangedPredicate.
+	reshard.Status.Phase = pgshardv1alpha1.ReshardSeeding
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // handleTargetErr maps a name collision to a surfaced condition plus a delayed

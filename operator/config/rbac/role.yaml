@@ -73,6 +73,7 @@ rules:
   - pgshard.dev
   resources:
   - pgshardreshards
+  - pgshardtableconfigs
   verbs:
   - get
   - list
