@@ -196,7 +196,24 @@ func (r *PgShardShardReconciler) reconcileLogicalShard(
 		shard.Status.CurrentPrimary = node.Status.CurrentPrimary
 		// Best-effort and never fatal: a database-provisioning problem must not
 		// stop the shard from mirroring its node's health.
-		r.reconcileShardDatabase(ctx, shard, &node)
+		verified := r.reconcileShardDatabase(ctx, shard, &node)
+		// The compiled routing view reads CurrentPrimary: a placed shard is
+		// routable only when its database was verified against the CURRENT
+		// node incarnation AND current primary pod — a stale True (previous
+		// node, or a previous primary whose adoption marker may not have
+		// replicated to the promoted standby) must not route. A refused
+		// database reads Degraded; an unverified one is merely not Ready yet —
+		// either way the cluster must not count a shard with no writer route
+		// as Ready.
+		if !verified {
+			shard.Status.CurrentPrimary = ""
+			switch {
+			case apimeta.IsStatusConditionFalse(shard.Status.Conditions, shardDatabaseReadyCondition):
+				shard.Status.Phase = pgshardv1alpha1.ShardDegraded
+			case shard.Status.Phase == pgshardv1alpha1.ShardReady:
+				shard.Status.Phase = pgshardv1alpha1.ShardProvisioning
+			}
+		}
 	}
 
 	interval := r.pollInterval()
@@ -214,6 +231,14 @@ const shardDatabaseReadyCondition = "DatabaseReady"
 // longer name). Validating here turns an otherwise permanent gRPC error into a
 // terminal condition instead of an endless retry.
 const maxDatabaseNameBytes = 63
+
+// adoptDatabaseAnnotation authorizes taking over an existing same-named
+// database whose provenance marker does not match this shard — a deliberate
+// restore/adopt action. Its VALUE must be the UID of the PgShardNode the
+// takeover was granted for: a bare capability would silently adopt whatever
+// stale database the shard's NEXT node happens to hold (a NodeRef move, or a
+// crash between adoption and consuming the annotation). Consumed on success.
+const adoptDatabaseAnnotation = "pgshard.dev/adopt-database"
 
 // shardDatabaseName is the Postgres DATABASE a placed shard lives in. Shard
 // names are namespace-unique, and a node hosts many shards' databases, so the
@@ -234,31 +259,26 @@ func (r *PgShardShardReconciler) setDatabaseCondition(
 	})
 }
 
-// reconcileShardDatabase ensures the shard's Postgres database exists on its
-// node by asking the node's primary agent to create it. It is best-effort,
-// idempotent, and never returns an error: it waits until the node has a ready
-// primary with a reachable address, and once it has provisioned the database on
-// a given node it records both the DatabaseReady condition and the node identity
-// so the round trip is skipped until the shard moves to a different node.
+// reconcileShardDatabase verifies the shard's Postgres database against the
+// node's CURRENT primary pod, creating it when absent. It returns true only
+// when the database is verified against the current node incarnation AND
+// current primary pod — the caller withholds routing otherwise. A failover
+// re-verifies: the promoted standby's copy of the database (and of a
+// just-stamped adoption marker) may not have replicated.
 func (r *PgShardShardReconciler) reconcileShardDatabase(
 	ctx context.Context, shard *pgshardv1alpha1.PgShardShard, node *pgshardv1alpha1.PgShardNode,
-) {
+) bool {
 	log := logf.FromContext(ctx)
 	name := shardDatabaseName(shard)
 	if len(name) > maxDatabaseNameBytes {
 		// A name PostgreSQL would truncate is terminal, not retriable.
 		r.setDatabaseCondition(shard, metav1.ConditionFalse, "InvalidName",
 			fmt.Sprintf("database name %q exceeds %d bytes", name, maxDatabaseNameBytes))
-		return
-	}
-	// Already provisioned on this node; a move to another node re-provisions.
-	if shard.Status.DatabaseNode == node.Name &&
-		apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) {
-		return
+		return false
 	}
 	primary := node.Status.CurrentPrimary
 	if node.Status.Phase != pgshardv1alpha1.NodeReady || primary == "" {
-		return
+		return false
 	}
 	var pod corev1.Pod
 	if err := r.Get(ctx,
@@ -266,30 +286,98 @@ func (r *PgShardShardReconciler) reconcileShardDatabase(
 		if !apierrors.IsNotFound(err) {
 			log.Error(err, "fetching primary pod for database provisioning", "pod", primary)
 		}
-		return
+		return false
+	}
+	// The node and pod reads are not an atomic snapshot: a same-named pod
+	// owned by a DIFFERENT node incarnation (the node was just recreated)
+	// must not be dialed — an adoption grant scoped to the node we read
+	// could otherwise re-stamp the replacement's unverified database.
+	if !metav1.IsControlledBy(&pod, node) {
+		return false
+	}
+	// Already verified against THIS node incarnation AND this primary pod; a
+	// move, a recreated node, or a failover all fail this check and
+	// re-verify before the shard becomes routable again.
+	if shard.Status.DatabaseNode == node.Name &&
+		shard.Status.DatabaseNodeUID == string(node.UID) &&
+		shard.Status.DatabasePodUID == string(pod.UID) &&
+		apimeta.IsStatusConditionTrue(shard.Status.Conditions, shardDatabaseReadyCondition) {
+		return true
 	}
 	if pod.Status.PodIP == "" {
-		return
+		return false
 	}
 	agent, err := r.agentClient(pod.Status.PodIP, agentPort)
 	if err != nil {
 		log.Error(err, "dialing agent for database provisioning")
-		return
+		return false
 	}
-	if _, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{Name: name}); err != nil {
+	adopt := shard.Annotations[adoptDatabaseAnnotation] == string(node.UID)
+	resp, err := agent.CreateDatabase(ctx, &pgshardv1.CreateDatabaseRequest{
+		Name: name,
+		// The shard UID binds the database to this placement: deterministic
+		// names plus retained volumes mean a same-named database can hold a
+		// prior placement's stale, partially-seeded data, and the agent fences
+		// it (FAILED_PRECONDITION) instead of adopting it silently.
+		Provenance: string(shard.UID),
+		Adopt:      adopt,
+		// Pod IPs are reusable: bind the request to the pod we verified, so a
+		// reassigned address cannot land it on another incarnation.
+		TargetPodUid: string(pod.UID),
+	})
+	if err != nil {
+		switch grpcstatus.Code(err) {
 		// InvalidArgument is a permanent contract violation; record it terminally
 		// rather than retrying forever. Other errors are transient — the poll
 		// interval retries.
-		if grpcstatus.Code(err) == codes.InvalidArgument {
+		case codes.InvalidArgument:
 			r.setDatabaseCondition(shard, metav1.ConditionFalse, "Rejected", err.Error())
-		} else {
+		case codes.FailedPrecondition:
+			r.setDatabaseCondition(shard, metav1.ConditionFalse, "ForeignDatabase",
+				err.Error()+fmt.Sprintf(
+					" (annotate the shard with %s=%s to adopt it on this node deliberately)",
+					adoptDatabaseAnnotation, node.UID))
+		default:
 			log.Error(err, "creating shard database", "database", name)
 		}
-		return
+		return false
+	}
+	// The response must ATTEST what was verified: a legacy (pre-provenance)
+	// agent ignores the new request fields and reports bare success while
+	// having checked nothing — routing on that would serve an unverified
+	// database, and an adoption annotation would be consumed without any
+	// marker being stamped.
+	if resp.GetVerifiedProvenance() != string(shard.UID) ||
+		resp.GetServedPodUid() != string(pod.UID) {
+		r.setDatabaseCondition(shard, metav1.ConditionFalse, "UnattestedAgent",
+			fmt.Sprintf("agent on pod %s did not attest the provenance protocol "+
+				"(a pre-provenance agent build?); the database stays unverified until the pod runs a current agent",
+				pod.Name))
+		return false
+	}
+	if adopt {
+		// Adoption is ONE-SHOT: the annotation authorized taking over this
+		// specific database, and left standing it would silently adopt any
+		// stale same-named database on the shard's NEXT node too. A failed
+		// removal retries next poll — re-sending adopt for a marker that is
+		// already ours re-stamps the same value, a no-op.
+		patched := shard.DeepCopy()
+		delete(patched.Annotations, adoptDatabaseAnnotation)
+		if err := r.Patch(ctx, patched, client.MergeFrom(shard)); err != nil {
+			log.Error(err, "consuming the adopt-database annotation")
+		} else {
+			// Carry the patched metadata forward so the caller's status write
+			// does not conflict on the pre-patch resource version.
+			shard.Annotations = patched.Annotations
+			shard.ResourceVersion = patched.ResourceVersion
+		}
 	}
 	shard.Status.DatabaseNode = node.Name
+	shard.Status.DatabaseNodeUID = string(node.UID)
+	shard.Status.DatabasePodUID = string(pod.UID)
 	r.setDatabaseCondition(shard, metav1.ConditionTrue, "Provisioned",
-		fmt.Sprintf("database %s created on node %s", name, node.Name))
+		fmt.Sprintf("database %s verified on node %s (pod %s)", name, node.Name, pod.Name))
+	return true
 }
 
 func (r *PgShardShardReconciler) pollInterval() time.Duration {

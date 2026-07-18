@@ -236,9 +236,44 @@ message CreateDatabaseRequest {
   // (bootstrap) role. At most 63 bytes when set. Only applied at creation —
   // ownership of an already existing database is not reconciled here.
   string owner = 2;
+  // Identity of the shard placement this database belongs to (the shard's
+  // Kubernetes UID). At creation the agent stamps it as the database comment
+  // ("pgshard-provenance:<value>"); when the database already exists the agent
+  // verifies the stamp and fails with FAILED_PRECONDITION on a different or
+  // missing marker — deterministic names plus retained volumes mean a
+  // same-named database can hold another placement's stale, partially-seeded
+  // data, and it must never be adopted silently. A crash between CREATE
+  // DATABASE and the comment leaves the marker missing; recovering from that
+  // window also requires the explicit adopt authorization below. At most 128
+  // bytes, characters restricted to [A-Za-z0-9._:-]. Empty skips stamping and
+  // verification.
+  string provenance = 3;
+  // Explicit authorization to take over an existing database whose provenance
+  // marker is missing or different: the agent re-stamps the marker with
+  // `provenance` instead of failing. Only meaningful with a nonempty
+  // provenance (INVALID_ARGUMENT otherwise). Set from a deliberate
+  // restore/adopt action, never on the routine reconcile path.
+  bool adopt = 4;
+  // Kubernetes UID of the pod this request is intended for. Pod IPs are
+  // reusable: a request routed to a reassigned address could otherwise land
+  // on a different node incarnation — with `adopt`, silently re-stamping the
+  // wrong instance's database. When set, an agent whose own pod UID (from
+  // the downward API) differs answers ABORTED — a routing accident to retry
+  // against a re-resolved address, never a data verdict. Empty skips the
+  // check (legacy caller, or an agent without the downward-API wiring).
+  string target_pod_uid = 5;
 }
 
-message CreateDatabaseResponse {}
+message CreateDatabaseResponse {
+  // Attestation that the agent actually ran the provenance protocol: the
+  // marker value it verified or stamped, and the pod uid it serves. A LEGACY
+  // agent (predating these fields) returns an empty response — proto3
+  // ignores unknown request fields, so it would otherwise report success
+  // while having checked nothing; the operator treats a response that does
+  // not echo the expected values as UNVERIFIED and never routes on it.
+  string verified_provenance = 1;
+  string served_pod_uid = 2;
+}
 
 // Drop the Postgres DATABASE for a placed (decommissioned) shard. Idempotent:
 // a database that is already absent is a success. Existing sessions are

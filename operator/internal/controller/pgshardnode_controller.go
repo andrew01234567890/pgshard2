@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -45,6 +48,37 @@ import (
 // is not scoped to a cluster (a shared node hosts several clusters' shard
 // databases), so — unlike a shard — its objects carry no cluster label.
 const labelNode = "pgshard.dev/node"
+
+// labelNodeUID binds a PVC to the exact PgShardNode (by Kubernetes UID) whose
+// data it holds. PVCs are retained across pod churn and node deletion, and
+// their names are deterministic — so a recreated node with the same name would
+// otherwise silently mount a prior node's stale data. A PVC whose UID label is
+// missing or different is never mounted; adopting it is an explicit human
+// action (relabel the PVC, or delete it for a fresh volume).
+const labelNodeUID = "pgshard.dev/node-uid"
+
+// storageProvenanceCondition reports whether every PVC this node would mount
+// carries its UID label (True/Verified) or a foreign volume blocked instance
+// creation (False/ForeignData).
+const storageProvenanceCondition = "StorageProvenance"
+
+// foreignPVCError blocks mounting a retained PVC that belongs to a different
+// (or unlabeled, pre-provenance) node identity.
+type foreignPVCError struct {
+	pvc      string
+	foundUID string
+	// pod is the instance that would (or does) mount the claim; stamped by
+	// ensureInstance so the degrade path can strip its routing label.
+	pod string
+}
+
+func (e *foreignPVCError) Error() string {
+	found := "no node-uid label"
+	if e.foundUID != "" {
+		found = "node-uid " + e.foundUID
+	}
+	return fmt.Sprintf("pvc %s exists with %s and does not belong to this node", e.pvc, found)
+}
 
 // PgShardNodeReconciler owns the physical objects of one node: pods, PVCs,
 // services, and the aggregated status (the operator polls the in-pod agents;
@@ -96,10 +130,31 @@ func (r *PgShardNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureServices(ctx, &node); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Storage provenance is PREFLIGHTED for every ordinal before any pod is
+	// created: pods are born with a replica role label, so creating a later
+	// ordinal's pod while an earlier one is foreign would put an unverified
+	// instance behind -ro — and stopping at the first foreign ordinal would
+	// leave a later one's serving pod routed until the earlier was fixed.
+	foreigns, err := r.preflightStorage(ctx, &node)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(foreigns) > 0 {
+		return r.degradeForeignStorage(ctx, &node, foreigns)
+	}
 	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
 		if err := r.ensureInstance(ctx, &node, ordinal); err != nil {
+			// A volume that turned foreign BETWEEN the preflight and here is a
+			// race; the retry's preflight degrades it properly.
+			var foreign *foreignPVCError
+			if errors.As(err, &foreign) {
+				return r.degradeForeignStorage(ctx, &node, []*foreignPVCError{foreign})
+			}
 			return ctrl.Result{}, err
 		}
+	}
+	if err := r.clearStorageProvenance(ctx, &node); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Role labels are synced even when aggregation errored mid-way (a failed
@@ -134,21 +189,31 @@ func nodeSelector(node *pgshardv1alpha1.PgShardNode) map[string]string {
 	return map[string]string{labelNode: node.Name}
 }
 
+// nodeInstanceSelector additionally pins the node's UID: the selector for
+// pods and services, so only THIS incarnation's instances are addressed.
+func nodeInstanceSelector(node *pgshardv1alpha1.PgShardNode) map[string]string {
+	return map[string]string{labelNode: node.Name, labelNodeUID: string(node.UID)}
+}
+
 // ensureServices maintains the CNPG-style trio plus stable per-pod DNS:
 // -rw (primary only), -ro (replicas), -r (all instances), and a headless
 // service so native logical-replication subscribers can pin a standby.
 func (r *PgShardNodeReconciler) ensureServices(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
 ) error {
+	// Selectors carry the node UID: pods are selected by their INCARNATION,
+	// so a same-named pod left by a deleted-and-recreated node (whose role
+	// labels nothing may touch — it is not controlled by this node) can never
+	// sit behind this node's services.
 	services := []struct {
 		suffix   string
 		selector map[string]string
 		headless bool
 	}{
-		{svcSuffixRW, withRole(nodeSelector(node), roleLabelPrimary), false},
-		{svcSuffixRO, withRole(nodeSelector(node), roleLabelReplica), false},
-		{"-r", nodeSelector(node), false},
-		{headlessSvcSuffix, nodeSelector(node), true},
+		{svcSuffixRW, withRole(nodeInstanceSelector(node), roleLabelPrimary), false},
+		{svcSuffixRO, withRole(nodeInstanceSelector(node), roleLabelReplica), false},
+		{"-r", nodeInstanceSelector(node), false},
+		{headlessSvcSuffix, nodeInstanceSelector(node), true},
 	}
 	for _, spec := range services {
 		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
@@ -183,11 +248,11 @@ func (r *PgShardNodeReconciler) ensureInstance(
 	name := nodeInstanceName(node, ordinal)
 
 	if err := r.ensurePVC(ctx, node, name+"-data"); err != nil {
-		return err
+		return tagForeignPod(err, name)
 	}
 	if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
 		if err := r.ensurePVC(ctx, node, name+"-wal"); err != nil {
-			return err
+			return tagForeignPod(err, name)
 		}
 	}
 
@@ -199,7 +264,9 @@ func (r *PgShardNodeReconciler) ensureInstance(
 		}
 		// A config/image/storage change (including toggling walSeparate on an
 		// existing instance) is rolled out separately — replicas first, primary
-		// last via switchover — never by blind recreation here.
+		// last via switchover — never by blind recreation here. (Incarnation-
+		// label backfill for verified pods lives in the storage preflight,
+		// which also covers excess scale-down pods.)
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -217,7 +284,10 @@ func (r *PgShardNodeReconciler) ensureInstance(
 
 // ensurePVC creates a node PVC if absent. PVCs deliberately carry no owner
 // reference: data outlives pod churn, and deletion is an explicit decommission
-// step — never on scale-down or pod recreation.
+// step — never on scale-down or pod recreation. An existing PVC is verified
+// against this node's UID on every pass: deterministic names mean a recreated
+// same-named node finds its predecessor's retained volume here, and mounting
+// it would silently serve another lineage's data.
 func (r *PgShardNodeReconciler) ensurePVC(
 	ctx context.Context, node *pgshardv1alpha1.PgShardNode, pvcName string,
 ) error {
@@ -226,6 +296,9 @@ func (r *PgShardNodeReconciler) ensurePVC(
 	}}
 	err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)
 	if err == nil {
+		if uid := pvc.Labels[labelNodeUID]; uid != string(node.UID) {
+			return &foreignPVCError{pvc: pvcName, foundUID: uid}
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -240,6 +313,7 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		}
 	}
 	pvc.Labels = nodeSelector(node)
+	pvc.Labels[labelNodeUID] = string(node.UID)
 	pvc.Spec = corev1.PersistentVolumeClaimSpec{
 		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		Resources: corev1.VolumeResourceRequirements{
@@ -247,10 +321,193 @@ func (r *PgShardNodeReconciler) ensurePVC(
 		},
 		StorageClassName: storageClass,
 	}
-	if err := r.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, pvc); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// The cached Get missed an existing claim (stale informer). It has
+			// NOT been verified — treating the 409 as success would mount a
+			// possibly-foreign volume this reconcile. Error out; the retry
+			// re-reads and verifies it.
+			return fmt.Errorf("pvc %s appeared concurrently and is unverified; retrying", pvcName)
+		}
 		return fmt.Errorf("pvc %s: %w", pvcName, err)
 	}
 	return nil
+}
+
+// preflightStorage verifies every ordinal's claims before any pod exists,
+// collecting all foreign volumes so they degrade together.
+func (r *PgShardNodeReconciler) preflightStorage(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) ([]*foreignPVCError, error) {
+	// Desired ordinals AND every controlled pod already running: a scale-down
+	// leaves excess pods (an excess primary is deliberately never pruned)
+	// whose claims would otherwise escape verification entirely.
+	instances := map[string]bool{}
+	for ordinal := int32(0); ordinal < node.Spec.Replicas; ordinal++ {
+		instances[nodeInstanceName(node, ordinal)] = true
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(node.Namespace),
+		client.MatchingLabels(nodeSelector(node))); err != nil {
+		return nil, err
+	}
+	// Claims are derived from what each existing pod ACTUALLY mounts (its
+	// volume list), not from the current desired layout: toggling
+	// walSeparate off leaves the old pod's WAL claim mounted, and checking
+	// only the desired names would let that claim go unverified.
+	claimsByPod := map[string][]string{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, node) {
+			continue
+		}
+		instances[pod.Name] = true
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil {
+				claimsByPod[pod.Name] = append(claimsByPod[pod.Name], vol.PersistentVolumeClaim.ClaimName)
+			}
+		}
+	}
+	names := make([]string, 0, len(instances))
+	for name := range instances {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	var foreigns []*foreignPVCError
+	foreignPods := map[string]bool{}
+	for _, name := range names {
+		claims := claimsByPod[name]
+		if len(claims) == 0 {
+			// No pod yet: verify the claims the desired layout will mount.
+			claims = []string{name + "-data"}
+			if node.Spec.Storage != nil && node.Spec.Storage.WalSeparate {
+				claims = append(claims, name+"-wal")
+			}
+		}
+		slices.Sort(claims)
+		for _, claim := range claims {
+			if err := r.ensurePVC(ctx, node, claim); err != nil {
+				var foreign *foreignPVCError
+				if errors.As(err, &foreign) {
+					foreign.pod = name
+					foreigns = append(foreigns, foreign)
+					foreignPods[name] = true
+					continue
+				}
+				return nil, err
+			}
+		}
+	}
+	// Backfill the incarnation label on every VERIFIED controlled pod (a
+	// pre-upgrade pod, or one restored after a quarantine): excess scale-down
+	// pods are covered here too — the uid-scoped services would otherwise
+	// silently drop them while the node reads Ready. A pod whose claims are
+	// foreign stays quarantined.
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, node) || foreignPods[pod.Name] {
+			continue
+		}
+		if pod.Labels[labelNodeUID] == string(node.UID) {
+			continue
+		}
+		patched := pod.DeepCopy()
+		if patched.Labels == nil {
+			patched.Labels = map[string]string{}
+		}
+		patched.Labels[labelNodeUID] = string(node.UID)
+		if err := r.Patch(ctx, patched, client.MergeFrom(pod)); err != nil {
+			return nil, fmt.Errorf("backfilling node-uid label on pod %s: %w", pod.Name, err)
+		}
+	}
+	return foreigns, nil
+}
+
+// tagForeignPod stamps the pod that would mount a foreign PVC onto the typed
+// error, so the degrade path can pull an ALREADY-RUNNING pod out of routing.
+func tagForeignPod(err error, pod string) error {
+	var foreign *foreignPVCError
+	if errors.As(err, &foreign) {
+		foreign.pod = pod
+	}
+	return err
+}
+
+// degradeForeignStorage records that retained volumes from another node
+// identity blocked instance reconciliation: pods that would mount them are
+// never created, and any ALREADY RUNNING (the volume turned foreign under it
+// — a relabel, or a pre-provenance upgrade) are pulled out of read/write
+// routing by stripping their role labels. Recovery is an explicit human
+// action — relabel the PVC to this node's UID to adopt its data
+// deliberately, or delete the pod and PVC for a fresh volume — retried at
+// the poll cadence, not by hot-looping an error.
+func (r *PgShardNodeReconciler) degradeForeignStorage(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode, foreigns []*foreignPVCError,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	reasons := make([]string, 0, len(foreigns))
+	for _, foreign := range foreigns {
+		log.Info("foreign PVC blocks instance reconciliation",
+			"node", node.Name, "pvc", foreign.pvc, "pod", foreign.pod, "foundUID", foreign.foundUID)
+		reasons = append(reasons, foreign.Error())
+		var pod corev1.Pod
+		err := r.Get(ctx, client.ObjectKey{Namespace: node.Namespace, Name: foreign.pod}, &pod)
+		switch {
+		case err == nil && metav1.IsControlledBy(&pod, node) &&
+			(pod.Labels[labelRole] != "" || pod.Labels[labelNodeUID] != ""):
+			// Quarantine from EVERY service: -rw/-ro select by role, but -r
+			// and the headless service select by incarnation alone, so the
+			// incarnation label comes off too. Verification restores it (the
+			// preflight backfills the label once the claims are clean again).
+			patched := pod.DeepCopy()
+			delete(patched.Labels, labelRole)
+			delete(patched.Labels, labelNodeUID)
+			if err := r.Patch(ctx, patched, client.MergeFrom(&pod)); err != nil {
+				return ctrl.Result{}, err
+			}
+		case err != nil && !apierrors.IsNotFound(err):
+			return ctrl.Result{}, err
+		}
+	}
+	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type:   storageProvenanceCondition,
+		Status: metav1.ConditionFalse,
+		Reason: "ForeignData",
+		Message: fmt.Sprintf(
+			"%s; relabel with %s=%s to adopt the data deliberately, or delete the pods and PVCs for fresh volumes",
+			strings.Join(reasons, "; "), labelNodeUID, node.UID),
+		ObservedGeneration: node.Generation,
+	})
+	node.Status.Phase = pgshardv1alpha1.NodeDegraded
+	if err := r.Status().Update(ctx, node); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	interval := r.StatusPollInterval
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// clearStorageProvenance flips a previously-failed provenance check back to
+// True once every PVC verifies (the operator relabeled or deleted the foreign
+// volume). Nodes that never failed carry no condition at all.
+func (r *PgShardNodeReconciler) clearStorageProvenance(
+	ctx context.Context, node *pgshardv1alpha1.PgShardNode,
+) error {
+	cond := apimeta.FindStatusCondition(node.Status.Conditions, storageProvenanceCondition)
+	if cond == nil || cond.Status == metav1.ConditionTrue {
+		return nil
+	}
+	apimeta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type:               storageProvenanceCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Verified",
+		Message:            "all PVCs carry this node's identity label",
+		ObservedGeneration: node.Generation,
+	})
+	return client.IgnoreNotFound(r.Status().Update(ctx, node))
 }
 
 // pruneExcessInstances deletes pods for ordinals at or above the desired
@@ -299,7 +556,7 @@ func (r *PgShardNodeReconciler) instancePod(
 	if postgresImage == "" {
 		postgresImage = r.Images.Postgres
 	}
-	labels := nodeSelector(node)
+	labels := nodeInstanceSelector(node)
 	labels[labelRole] = roleLabelReplica // promoted after status polls
 
 	var resources corev1.ResourceRequirements
@@ -338,6 +595,11 @@ func (r *PgShardNodeReconciler) instancePod(
 					{Name: "PGSHARD_NODE", Value: node.Name},
 					{Name: "PGSHARD_POD", ValueFrom: &corev1.EnvVarSource{
 						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+					}},
+					// Pod IPs are reusable; identity-sensitive RPCs carry the
+					// intended pod UID and the agent refuses a mismatch.
+					{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
 					}},
 				},
 				Ports: []corev1.ContainerPort{

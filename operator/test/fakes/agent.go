@@ -48,12 +48,39 @@ type FakeAgent struct {
 	// owner) so controller tests can assert placement provisioning.
 	databases map[string]string
 
+	// dbProvenance mirrors the real agent's database-comment marker (name ->
+	// provenance value; absent key = unmarked database).
+	dbProvenance map[string]string
+
 	// emptyStatus makes GetStatus return a response with a nil Status, to
 	// exercise the operator's empty-status handling.
 	emptyStatus bool
 
+	// podUID, when set, mirrors the real agent's downward-API identity check:
+	// identity-sensitive requests naming another pod uid are refused.
+	podUID string
+
+	// legacyResponses models a pre-provenance agent: requests succeed but the
+	// response carries no attestation (proto3 ignores the unknown fields).
+	legacyResponses bool
+
 	server   *grpc.Server
 	listener net.Listener
+}
+
+// SetLegacyResponses makes the fake behave like a pre-provenance agent:
+// success with an empty (unattested) response, all new fields ignored.
+func (f *FakeAgent) SetLegacyResponses(legacy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacyResponses = legacy
+}
+
+// SetPodUID scripts the agent's own pod UID (downward API identity).
+func (f *FakeAgent) SetPodUID(uid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.podUID = uid
 }
 
 // SetEmptyStatus makes GetStatus return a nil Status message.
@@ -134,6 +161,7 @@ func NewFakeAgent() (*FakeAgent, error) {
 		},
 		executedSchemaOps: map[string]string{},
 		databases:         map[string]string{},
+		dbProvenance:      map[string]string{},
 		server:            grpc.NewServer(),
 		listener:          listener,
 	}
@@ -329,10 +357,58 @@ func (f *FakeAgent) CreateDatabase(
 	if len(req.Name) > 63 || len(req.Owner) > 63 {
 		return nil, status.Error(codes.InvalidArgument, "identifier exceeds 63 bytes")
 	}
-	if _, ok := f.databases[req.Name]; !ok {
-		f.databases[req.Name] = req.Owner
+	if f.legacyResponses {
+		// A pre-provenance agent: ignores every new field, reports bare
+		// success, attests nothing.
+		if _, ok := f.databases[req.Name]; !ok {
+			f.databases[req.Name] = req.Owner
+		}
+		return &pgshardv1.CreateDatabaseResponse{}, nil
 	}
-	return &pgshardv1.CreateDatabaseResponse{}, nil
+	if req.TargetPodUid != "" && f.podUID != "" && req.TargetPodUid != f.podUID {
+		// Mirror the real agent: a routing accident is ABORTED (retry), never
+		// FAILED_PRECONDITION (which reads as a database needing adoption).
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.TargetPodUid, f.podUID)
+	}
+	if req.Adopt && req.Provenance == "" {
+		return nil, status.Error(codes.InvalidArgument, "adopt requires a provenance marker to stamp")
+	}
+	// Mirror the real agent's provenance validation so envtests cannot pass
+	// requests the Rust service rejects.
+	if len(req.Provenance) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "provenance exceeds 128 bytes")
+	}
+	for _, c := range req.Provenance {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == ':' || c == '-'
+		if !ok {
+			return nil, status.Error(codes.InvalidArgument, "provenance may only contain [A-Za-z0-9._:-]")
+		}
+	}
+	if _, ok := f.databases[req.Name]; ok {
+		if req.Provenance != "" && f.dbProvenance[req.Name] != req.Provenance {
+			if !req.Adopt {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"database %q already exists with provenance %q; refusing to adopt without explicit authorization",
+					req.Name, f.dbProvenance[req.Name])
+			}
+			f.dbProvenance[req.Name] = req.Provenance
+		}
+		return f.attestedResponse(req), nil
+	}
+	f.databases[req.Name] = req.Owner
+	if req.Provenance != "" {
+		f.dbProvenance[req.Name] = req.Provenance
+	}
+	return f.attestedResponse(req), nil
+}
+
+func (f *FakeAgent) attestedResponse(req *pgshardv1.CreateDatabaseRequest) *pgshardv1.CreateDatabaseResponse {
+	return &pgshardv1.CreateDatabaseResponse{
+		VerifiedProvenance: req.Provenance,
+		ServedPodUid:       f.podUID,
+	}
 }
 
 func (f *FakeAgent) DropDatabase(
@@ -345,6 +421,7 @@ func (f *FakeAgent) DropDatabase(
 		return nil, status.Error(codes.InvalidArgument, "database name is required")
 	}
 	delete(f.databases, req.Name)
+	delete(f.dbProvenance, req.Name)
 	return &pgshardv1.DropDatabaseResponse{}, nil
 }
 
@@ -355,4 +432,26 @@ func (f *FakeAgent) Databases() map[string]string {
 	out := make(map[string]string, len(f.databases))
 	maps.Copy(out, f.databases)
 	return out
+}
+
+// DatabaseProvenance returns the provenance marker stamped on a database
+// (empty = unmarked or absent).
+func (f *FakeAgent) DatabaseProvenance(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dbProvenance[name]
+}
+
+// SeedDatabase plants a pre-existing database with an arbitrary provenance
+// marker (empty = unmarked), as a retained volume from another placement
+// would leave behind.
+func (f *FakeAgent) SeedDatabase(name, owner, provenance string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.databases[name] = owner
+	if provenance == "" {
+		delete(f.dbProvenance, name)
+	} else {
+		f.dbProvenance[name] = provenance
+	}
 }

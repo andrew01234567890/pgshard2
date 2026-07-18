@@ -13,6 +13,48 @@ pub struct RestorePoint {
     pub timeline: u32,
 }
 
+/// Prefix of the database-comment marker binding a shard database to the
+/// placement (shard UID) that created it.
+pub const PROVENANCE_PREFIX: &str = "pgshard-provenance:";
+
+/// The full comment marker for a provenance value.
+pub fn provenance_marker(provenance: &str) -> String {
+    format!("{PROVENANCE_PREFIX}{provenance}")
+}
+
+/// A same-named database exists but carries a different or missing provenance
+/// marker: another placement's data (retained volume, reshard leftover), which
+/// must never be adopted silently. The service maps this to
+/// FAILED_PRECONDITION; taking the database over requires the request's
+/// explicit `adopt` authorization.
+#[derive(Debug)]
+pub struct ForeignDatabase {
+    pub name: String,
+    /// The marker found on the existing database, if any.
+    pub found: Option<String>,
+}
+
+impl std::error::Error for ForeignDatabase {}
+
+impl std::fmt::Display for ForeignDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.found {
+            Some(marker) => write!(
+                f,
+                "database {:?} already exists with provenance marker {marker:?}; \
+                 refusing to adopt without explicit authorization",
+                self.name
+            ),
+            None => write!(
+                f,
+                "database {:?} already exists without a provenance marker; \
+                 refusing to adopt without explicit authorization",
+                self.name
+            ),
+        }
+    }
+}
+
 /// A point-in-time reading of the local instance, from which the agent builds
 /// the `InstanceStatus` the operator polls.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,8 +97,19 @@ pub trait Instance: Send + Sync + 'static {
     async fn exec_sql(&self, sql: &str) -> anyhow::Result<()>;
 
     /// Ensure a Postgres DATABASE named `name` exists, owned by `owner` when it
-    /// is nonempty. Idempotent: succeeds when the database already exists.
-    async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()>;
+    /// is nonempty. Idempotent for the SAME placement: with a nonempty
+    /// `provenance` the marker is stamped as the database comment at creation,
+    /// and an already existing database must carry the matching marker — a
+    /// different or missing marker fails with [`ForeignDatabase`] unless
+    /// `adopt` explicitly authorizes re-stamping it. An empty `provenance`
+    /// skips stamping and verification.
+    async fn create_database(
+        &self,
+        name: &str,
+        owner: &str,
+        provenance: &str,
+        adopt: bool,
+    ) -> anyhow::Result<()>;
 
     /// Ensure the Postgres DATABASE named `name` does not exist, terminating any
     /// sessions still connected to it. Idempotent: succeeds when the database is
@@ -88,8 +141,9 @@ pub mod fake {
         exec_fails: std::sync::atomic::AtomicBool,
         db_fails: std::sync::atomic::AtomicBool,
         executed: Mutex<Vec<String>>,
-        /// Databases that exist, name -> owner (empty owner = bootstrap role).
-        databases: Mutex<BTreeMap<String, String>>,
+        /// Databases that exist, name -> (owner, provenance marker). Empty
+        /// owner = bootstrap role; `None` marker = no comment stamped.
+        databases: Mutex<BTreeMap<String, (String, Option<String>)>>,
         /// Restore points created, in order.
         restore_points: Mutex<Vec<String>>,
         /// When set, create_restore_point parks on this gate before executing —
@@ -144,7 +198,26 @@ pub mod fake {
             self.databases.lock().unwrap().keys().cloned().collect()
         }
         pub fn owner_of(&self, name: &str) -> Option<String> {
-            self.databases.lock().unwrap().get(name).cloned()
+            self.databases
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|(owner, _)| owner.clone())
+        }
+        pub fn marker_of(&self, name: &str) -> Option<String> {
+            self.databases
+                .lock()
+                .unwrap()
+                .get(name)
+                .and_then(|(_, marker)| marker.clone())
+        }
+        /// Seed a pre-existing database with an arbitrary marker (or none), as
+        /// a retained volume from another placement would leave behind.
+        pub fn seed_database(&self, name: &str, owner: &str, marker: Option<&str>) {
+            self.databases.lock().unwrap().insert(
+                name.to_owned(),
+                (owner.to_owned(), marker.map(str::to_owned)),
+            );
         }
         pub fn restore_points(&self) -> Vec<String> {
             self.restore_points.lock().unwrap().clone()
@@ -189,15 +262,33 @@ pub mod fake {
             self.executed.lock().unwrap().push(sql.to_owned());
             Ok(())
         }
-        async fn create_database(&self, name: &str, owner: &str) -> anyhow::Result<()> {
+        async fn create_database(
+            &self,
+            name: &str,
+            owner: &str,
+            provenance: &str,
+            adopt: bool,
+        ) -> anyhow::Result<()> {
             if self.db_fails.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("create database failed");
             }
-            self.databases
-                .lock()
-                .unwrap()
-                .entry(name.to_owned())
-                .or_insert_with(|| owner.to_owned());
+            let mut dbs = self.databases.lock().unwrap();
+            let want = (!provenance.is_empty()).then(|| provenance_marker(provenance));
+            match dbs.get_mut(name) {
+                None => {
+                    dbs.insert(name.to_owned(), (owner.to_owned(), want));
+                }
+                Some(_) if provenance.is_empty() => {}
+                Some((_, marker)) if *marker == want => {}
+                Some((_, marker)) if adopt => *marker = want,
+                Some((_, marker)) => {
+                    return Err(ForeignDatabase {
+                        name: name.to_owned(),
+                        found: marker.clone(),
+                    }
+                    .into());
+                }
+            }
             Ok(())
         }
         async fn drop_database(&self, name: &str) -> anyhow::Result<()> {
