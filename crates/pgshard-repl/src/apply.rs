@@ -104,6 +104,12 @@ pub struct Applier {
 impl Applier {
     /// Prepare an applier against `target` for the given `consumer` id, creating
     /// the progress table if needed and loading any prior checkpoint.
+    ///
+    /// The `target` role must be allowed to set `session_replication_role`
+    /// (superuser, or `GRANT SET ON PARAMETER session_replication_role`): the
+    /// session runs under replica semantics so the target's ordinary triggers
+    /// and rules do not re-fire on replicated rows. A role without that
+    /// privilege fails here, before anything is applied.
     pub async fn new(target: Client, consumer: impl Into<String>) -> Result<Self> {
         let consumer = consumer.into();
         target

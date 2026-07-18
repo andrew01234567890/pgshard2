@@ -393,9 +393,12 @@ impl ReplicationClient {
     ///
     /// CONTRACT — passing a position past what the target has *durably committed*
     /// silently breaks exactly-once (a crash then loses the gap). The only safe
-    /// argument is a checkpoint the consumer has committed, e.g.
-    /// `client.confirm(applier.checkpoint())` **after** `applier.handle` has
-    /// returned for a Commit — never a raw `wal_end`/`end_lsn` off the stream.
+    /// argument is `client.confirm(applier.ack_lsn())` **after** `applier.handle`
+    /// has returned for a Commit: the durable end of the last applied (or
+    /// replay-skipped) transaction. Never a raw `wal_end` off the stream, and
+    /// not `applier.checkpoint()` — the commit LSN sits *before* the commit
+    /// record's end, so confirming it leaves the final transaction eternally
+    /// re-sendable and pins the slot's WAL horizon.
     pub fn confirm(&mut self, lsn: Lsn) {
         if lsn > self.confirmed_lsn {
             self.confirmed_lsn = lsn;
