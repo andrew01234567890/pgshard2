@@ -42,6 +42,7 @@ use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::backend::{BackendConnection, BackendResult, PgWireBackend, TokioPostgresBackend};
+use crate::merge;
 use crate::sequence::PgBlockReserver;
 use crate::{Endpoint, Route, Router, SharedRouter, Target};
 
@@ -172,11 +173,16 @@ impl Proxy {
         Ok(Some(sql))
     }
 
-    /// Fan a plain scatter read out to every shard concurrently and concatenate
-    /// the rows. Only valid when the read needs no ordering, limiting, grouping,
-    /// or aggregation (checked by the caller); ordered/aggregated scatters need
-    /// the merge engine and are rejected until it lands.
-    async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
+    /// Fan `query` to every target concurrently, verify the shards agree on the
+    /// result schema, and return the agreed schema plus every shard's rows
+    /// concatenated. `None` when no shard returned a row-returning result. The
+    /// first shard error fails the whole scatter — a partial result set would be
+    /// silently wrong.
+    async fn collect_scatter(
+        &self,
+        targets: &[Target],
+        query: &str,
+    ) -> PgWireResult<Option<(Arc<Vec<FieldInfo>>, Vec<DataRow>)>> {
         let fetches = targets
             .iter()
             .map(|t| self.conn.run(&t.endpoint, &t.database, query));
@@ -185,8 +191,6 @@ impl Proxy {
         let mut schema: Option<Arc<Vec<FieldInfo>>> = None;
         let mut rows: Vec<DataRow> = Vec::new();
         for result in results {
-            // First shard error fails the whole scatter — a partial result set
-            // would be silently wrong.
             for shard_result in result? {
                 let BackendResult::Rows {
                     schema: shard_schema,
@@ -194,15 +198,15 @@ impl Proxy {
                     ..
                 } = shard_result
                 else {
-                    // A plain scatter read is a single SELECT; a no-row result is
-                    // not expected, but ignoring it is safe for concatenation.
+                    // A scatter read is a single SELECT; a no-row result is not
+                    // expected, but ignoring it is safe here.
                     continue;
                 };
                 match &schema {
                     None => schema = Some(shard_schema),
-                    // Shards must agree on the result shape. A column-count/name
+                    // Shards must agree on the result shape (count, name, type). A
                     // mismatch (e.g. a non-atomic broadcast DDL still rolling out)
-                    // would otherwise encode rows under the wrong schema — fail the
+                    // would otherwise emit rows under the wrong schema — fail the
                     // scatter instead.
                     Some(first) if !schemas_match(first, &shard_schema) => {
                         return Err(user_error(
@@ -216,11 +220,34 @@ impl Proxy {
                 rows.extend(shard_rows);
             }
         }
-        match schema {
+        Ok(schema.map(|schema| (schema, rows)))
+    }
+
+    /// A plain scatter read: concatenate every shard's rows in any order (valid
+    /// only when the read needs no ordering — checked by the caller).
+    async fn run_scatter(&self, targets: &[Target], query: &str) -> PgWireResult<Vec<Response>> {
+        match self.collect_scatter(targets, query).await? {
             // A scatter is a plain SELECT, so it keeps the default `SELECT n` tag.
-            Some(schema) => Ok(vec![rows_response(schema, rows, None)]),
-            // A scatter only comes from a SELECT, which always describes its
-            // columns; guard defensively rather than panic.
+            Some((schema, rows)) => Ok(vec![rows_response(schema, rows, None)]),
+            None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
+        }
+    }
+
+    /// An `ORDER BY` scatter read: each shard returns its rows already sorted (the
+    /// ORDER BY is forwarded unchanged), and the router merges them by decoding
+    /// the sort-key columns per their real type. Rejects (`0A000`) a sort key on a
+    /// type it cannot merge soundly.
+    async fn run_ordered_scatter(
+        &self,
+        targets: &[Target],
+        query: &str,
+        keys: &[merge::SortKey],
+    ) -> PgWireResult<Vec<Response>> {
+        match self.collect_scatter(targets, query).await? {
+            Some((schema, rows)) => {
+                let merged = merge::merge_ordered(&schema, rows, keys)?;
+                Ok(vec![rows_response(schema, merged, None)])
+            }
             None => Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))]),
         }
     }
@@ -314,16 +341,20 @@ impl Proxy {
             },
             Route::Reject { code, reason } => Err(user_error(code, reason)),
             Route::Unavailable(reason) => Err(user_error("57P01", reason)),
-            // A plain scatter read (no ordering/limit/grouping/aggregation) is
-            // fanned out and concatenated; anything needing a real merge waits
-            // for the merge engine.
-            Route::Scatter(targets) if is_concatenable_scatter(query) => {
-                self.run_scatter(&targets, query).await
-            }
-            Route::Scatter(_) => Err(user_error(
-                "0A000",
-                "ordered or aggregated scatter reads are not supported yet".to_owned(),
-            )),
+            // A scatter read is fanned out and either concatenated (no ORDER BY)
+            // or merged by its sort keys; a limit/grouping/aggregation scatter
+            // still needs work the router does not do and is rejected.
+            Route::Scatter(targets) => match classify_scatter(query) {
+                ScatterPlan::Concat => self.run_scatter(&targets, query).await,
+                ScatterPlan::Ordered(keys) => {
+                    self.run_ordered_scatter(&targets, query, &keys).await
+                }
+                ScatterPlan::Unsupported => Err(user_error(
+                    "0A000",
+                    "this scatter read needs limiting or aggregation that is not supported yet"
+                        .to_owned(),
+                )),
+            },
             Route::Broadcast(_) => Err(user_error(
                 "0A000",
                 "broadcast (multi-shard DDL) is not supported yet".to_owned(),
@@ -387,39 +418,110 @@ fn response_from(result: BackendResult) -> Response {
 ///
 /// This re-parses the query (the planner already parsed it once); the plan cache
 /// that avoids the double parse is a follow-up.
-fn is_concatenable_scatter(query: &str) -> bool {
+/// How a scatter read is merged back into one result.
+enum ScatterPlan {
+    /// Concatenate every shard's rows in any order.
+    Concat,
+    /// Merge every shard's (locally sorted) rows by these sort keys.
+    Ordered(Vec<merge::SortKey>),
+    /// Needs limiting, grouping, or aggregation the router does not do yet.
+    Unsupported,
+}
+
+/// Classify a scatter read into its merge strategy. A plain projection with no
+/// ORDER BY concatenates; a plain projection ordered only by resolvable columns
+/// merges; everything else (LIMIT/OFFSET, GROUP BY, DISTINCT, aggregates, set
+/// operations, a WITH/locking clause, a non-column output, or an ORDER BY the
+/// merge cannot honor) is unsupported and rejected.
+///
+/// This re-parses the query (the planner already parsed it once); the plan cache
+/// that avoids the double parse is a follow-up.
+fn classify_scatter(query: &str) -> ScatterPlan {
     let Ok(parsed) = pg_query::parse(query) else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
     let [stmt] = parsed.protobuf.stmts.as_slice() else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
     let Some(pg_query::NodeEnum::SelectStmt(select)) =
         stmt.stmt.as_ref().and_then(|n| n.node.as_ref())
     else {
-        return false;
+        return ScatterPlan::Unsupported;
     };
-    // These checks make the guard self-sufficient rather than trusting the
-    // planner to have filtered every unsafe shape upstream:
-    // - a set operation (UNION/…) keeps its operands in larg/rarg with an empty
-    //   target_list and needs real merging;
-    // - a WITH clause can shadow a sharded table name, so each shard would
-    //   re-evaluate the CTE and the rows would be duplicated on concatenation;
-    // - a locking clause (FOR UPDATE/SHARE) cannot be honored across ephemeral
-    //   per-shard connections;
-    // - SELECT ... INTO is a write.
-    select.op == pg_query::protobuf::SetOperation::SetopNone as i32
+    // The plain-projection gate, self-sufficient rather than trusting the planner:
+    // a set operation (operands in larg/rarg), a WITH clause (can shadow a table
+    // name → duplicated rows), a locking clause, SELECT ... INTO (a write),
+    // GROUP BY / DISTINCT / LIMIT / OFFSET, or a non-plain-column output all need
+    // more than a merge.
+    let plain = select.op == pg_query::protobuf::SetOperation::SetopNone as i32
         && select.with_clause.is_none()
         && select.into_clause.is_none()
         && select.locking_clause.is_empty()
-        && select.sort_clause.is_empty()
         && select.group_clause.is_empty()
         && select.distinct_clause.is_empty()
         && !select.group_distinct
         && select.limit_count.is_none()
         && select.limit_offset.is_none()
         && !select.target_list.is_empty()
-        && select.target_list.iter().all(is_plain_column_target)
+        && select.target_list.iter().all(is_plain_column_target);
+    if !plain {
+        return ScatterPlan::Unsupported;
+    }
+    if select.sort_clause.is_empty() {
+        return ScatterPlan::Concat;
+    }
+    let mut keys = Vec::with_capacity(select.sort_clause.len());
+    for item in &select.sort_clause {
+        let Some(pg_query::NodeEnum::SortBy(sb)) = item.node.as_ref() else {
+            return ScatterPlan::Unsupported;
+        };
+        // A custom `USING <op>` ordering cannot be proven sound against a decoded
+        // comparison, and an expression sort key resolves to no output column.
+        if sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyUsing as i32 {
+            return ScatterPlan::Unsupported;
+        }
+        let Some(column) = sort_column(sb) else {
+            return ScatterPlan::Unsupported;
+        };
+        let descending = sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyDesc as i32;
+        keys.push(merge::SortKey {
+            column,
+            descending,
+            nulls_first: nulls_first(sb, descending),
+        });
+    }
+    ScatterPlan::Ordered(keys)
+}
+
+/// The output column a sort item names — by trailing name (`ORDER BY t.note`) or
+/// 1-based position (`ORDER BY 2`) — or `None` for an expression the merge cannot
+/// resolve to one output column.
+fn sort_column(sb: &pg_query::protobuf::SortBy) -> Option<merge::SortColumn> {
+    match sb.node.as_deref().and_then(|n| n.node.as_ref())? {
+        pg_query::NodeEnum::ColumnRef(cr) => {
+            match cr.fields.last().and_then(|f| f.node.as_ref())? {
+                pg_query::NodeEnum::String(s) => Some(merge::SortColumn::Name(s.sval.clone())),
+                _ => None,
+            }
+        }
+        pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Ival(i) if i.ival >= 1 => {
+                Some(merge::SortColumn::Position(i.ival as usize))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether NULLs sort first for this item. PostgreSQL's default is NULLS LAST for
+/// ascending and NULLS FIRST for descending — unless the query states otherwise.
+fn nulls_first(sb: &pg_query::protobuf::SortBy, descending: bool) -> bool {
+    match sb.sortby_nulls {
+        x if x == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32 => true,
+        x if x == pg_query::protobuf::SortByNulls::SortbyNullsLast as i32 => false,
+        _ => descending,
+    }
 }
 
 /// A `ResTarget` whose value is a bare column reference (which also covers `*`),
@@ -479,7 +581,8 @@ impl PgWireServerHandlers for Handlers {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_tag, is_concatenable_scatter};
+    use super::{ScatterPlan, classify_scatter, command_tag};
+    use crate::merge::{SortColumn, SortKey};
 
     #[test]
     fn command_tag_uses_the_leading_keyword() {
@@ -491,32 +594,64 @@ mod tests {
     }
 
     #[test]
-    fn only_plain_selects_are_concatenable_scatters() {
-        // Plain projections (including *) concatenate correctly across shards.
-        assert!(is_concatenable_scatter("SELECT * FROM orders"));
-        assert!(is_concatenable_scatter(
-            "SELECT id, note FROM orders WHERE note = 'x'"
+    fn plain_projections_concatenate() {
+        assert!(matches!(
+            classify_scatter("SELECT * FROM orders"),
+            ScatterPlan::Concat
         ));
-        // Anything that needs cross-shard combining does not.
-        assert!(!is_concatenable_scatter("SELECT * FROM orders ORDER BY id"));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders LIMIT 10"));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders OFFSET 5"));
-        assert!(!is_concatenable_scatter("SELECT count(*) FROM orders"));
-        assert!(!is_concatenable_scatter("SELECT DISTINCT note FROM orders"));
-        assert!(!is_concatenable_scatter(
-            "SELECT note FROM orders GROUP BY note"
+        assert!(matches!(
+            classify_scatter("SELECT id, note FROM orders WHERE note = 'x'"),
+            ScatterPlan::Concat
         ));
-        assert!(!is_concatenable_scatter("SELECT lower(note) FROM orders"));
-        // A WITH clause can shadow a table name (each shard re-evaluates the CTE),
-        // and FOR UPDATE/SHARE cannot be honored across per-shard connections.
-        assert!(!is_concatenable_scatter(
-            "WITH orders AS (VALUES (1)) SELECT * FROM orders"
-        ));
-        assert!(!is_concatenable_scatter("SELECT * FROM orders FOR UPDATE"));
-        assert!(!is_concatenable_scatter(
-            "SELECT * FROM orders UNION SELECT * FROM orders"
-        ));
-        // Not a single plain SELECT at all.
-        assert!(!is_concatenable_scatter("UPDATE orders SET note = 'x'"));
+    }
+
+    #[test]
+    fn an_order_by_over_resolvable_columns_is_a_merge() {
+        // Sort keys parse to their output column, direction, and NULLS placement
+        // (DESC defaults to NULLS FIRST; an explicit clause wins).
+        let ScatterPlan::Ordered(keys) =
+            classify_scatter("SELECT id, note FROM orders ORDER BY note DESC, 1 ASC NULLS LAST")
+        else {
+            panic!("expected an ordered merge");
+        };
+        assert_eq!(
+            keys,
+            vec![
+                SortKey {
+                    column: SortColumn::Name("note".into()),
+                    descending: true,
+                    nulls_first: true,
+                },
+                SortKey {
+                    column: SortColumn::Position(1),
+                    descending: false,
+                    nulls_first: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merges_that_need_more_than_sorting_are_unsupported() {
+        for query in [
+            "SELECT * FROM orders LIMIT 10",
+            "SELECT * FROM orders ORDER BY id LIMIT 10",
+            "SELECT * FROM orders OFFSET 5",
+            "SELECT count(*) FROM orders",
+            "SELECT DISTINCT note FROM orders",
+            "SELECT note FROM orders GROUP BY note",
+            "SELECT lower(note) FROM orders",
+            "SELECT * FROM orders ORDER BY lower(note)",
+            "SELECT * FROM orders ORDER BY id USING >",
+            "WITH orders AS (VALUES (1)) SELECT * FROM orders",
+            "SELECT * FROM orders FOR UPDATE",
+            "SELECT * FROM orders UNION SELECT * FROM orders",
+            "UPDATE orders SET note = 'x'",
+        ] {
+            assert!(
+                matches!(classify_scatter(query), ScatterPlan::Unsupported),
+                "should be unsupported: {query}"
+            );
+        }
     }
 }
