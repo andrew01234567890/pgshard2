@@ -688,6 +688,76 @@ async fn dropping_replica_identity_mid_stream_fails_loudly() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn a_journal_barrier_converges_every_workflow_past_it() -> anyhow::Result<()> {
+    let pg = Pg::start().await?;
+    let source = pg.connect().await?;
+    source
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, note text);
+             CREATE PUBLICATION seed_pub FOR TABLE orders;",
+        )
+        .await?;
+    source.batch_execute("CREATE DATABASE shard_target").await?;
+    source
+        .batch_execute(&format!(
+            "COMMENT ON DATABASE shard_target IS 'pgshard-provenance:{TARGET_PROVENANCE}'"
+        ))
+        .await?;
+    let target_conn = format!(
+        "host={} port={} user=postgres password=postgres dbname=shard_target",
+        pg.host(),
+        pg.port()
+    );
+    let (target, conn) = tokio_postgres::connect(&target_conn, tokio_postgres::NoTls).await?;
+    tokio::spawn(conn);
+    target
+        .batch_execute("CREATE TABLE orders (id int PRIMARY KEY, note text)")
+        .await?;
+
+    let config = WorkflowConfig {
+        target: format!(
+            "host={} port={} user=postgres password=postgres",
+            pg.host(),
+            pg.port()
+        )
+        .parse()?,
+        source_user: "postgres".into(),
+        source_password: "postgres".into(),
+    };
+    let registry = WorkflowRegistry::default();
+    registry
+        .start(&spec(&pg, "wf_journal", "pgshard_journal"), &config)
+        .await?;
+    wait_for(&registry, "wf_journal", "the streaming phase", |s| {
+        s.phase == v1::WorkflowPhase::Streaming as i32
+    })
+    .await;
+
+    // The cutover freeze: a transactional logical message in the SOURCE
+    // database. Its commit reaches every slot of that database, so the
+    // workflow's applied watermark must pass the returned barrier even
+    // though no table row changed.
+    use pgshard_agent::instance::Instance;
+    let instance = pgshard_agent::pg::PgInstance::new(format!(
+        "host={} port={} user=postgres password=postgres",
+        pg.host(),
+        pg.port()
+    ));
+    let frozen = instance
+        .emit_journal(
+            "postgres",
+            &[1, 2, 3], // opaque payload; the runner treats it as a no-op
+        )
+        .await?;
+
+    wait_for(&registry, "wf_journal", "the barrier to converge", |s| {
+        s.applied_lsn.as_ref().is_some_and(|l| l.value >= frozen)
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn altering_the_publication_mid_stream_fails_loudly() -> anyhow::Result<()> {
     let pg = Pg::start().await?;
     let source = pg.connect().await?;

@@ -513,9 +513,34 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn emit_journal(
         &self,
-        _r: Request<v1::EmitJournalRequest>,
+        request: Request<v1::EmitJournalRequest>,
     ) -> Result<Response<v1::EmitJournalResponse>, Status> {
-        Err(Status::unimplemented("emit_journal"))
+        use prost::Message;
+        let req = request.into_inner();
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        check_ident("database", &req.database, true)?;
+        let journal = req
+            .journal
+            .ok_or_else(|| Status::invalid_argument("journal event is required"))?;
+        if journal.source_shard.is_empty() {
+            return Err(Status::invalid_argument("journal source_shard is required"));
+        }
+        let lsn = self
+            .instance
+            .emit_journal(&req.database, &journal.encode_to_vec())
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::EmitJournalResponse {
+            lsn: Some(v1::Lsn { value: lsn }),
+        }))
     }
     type ShardStreamStream = BoxStream<v1::ShardStreamResponse>;
     async fn shard_stream(
@@ -692,6 +717,63 @@ mod tests {
         req.target_pod_uid = "uid-stale".into();
         let err = s.prepare_source(Request::new(req)).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn emit_journal_returns_the_barrier_position() {
+        let s = svc(FakeInstance::primary());
+        s.instance.set(|st| st.write_lsn = 0x77);
+        s.instance.seed_database("shard_src", "", None);
+        let resp = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.lsn.unwrap().value, 0x77);
+        let journals = s.instance.journals();
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].0, "shard_src");
+    }
+
+    #[tokio::test]
+    async fn emit_journal_refuses_another_pods_uid() {
+        let s = AgentSvc::with_pod_uid(
+            Arc::new(FakeInstance::primary()),
+            "pod-0".into(),
+            "uid-live".into(),
+        );
+        let err = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                target_pod_uid: "uid-stale".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn emit_journal_requires_the_event() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                database: "shard_src".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

@@ -292,6 +292,26 @@ impl Instance for PgInstance {
         Ok(parse_lsn(&lsn))
     }
 
+    async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
+        let mut client = self.connect_to(database).await?;
+        // TRANSACTIONAL message: it decodes inside a Commit, so every
+        // consumer's existing commit-ack path advances past it — no special
+        // handling anywhere — and the commit (synchronous_commit) makes it
+        // durable before we read the flush position.
+        let tx = client.transaction().await?;
+        tx.execute(
+            "SELECT pg_logical_emit_message(true, 'pgshard', $1::bytea)",
+            &[&payload],
+        )
+        .await?;
+        tx.commit().await?;
+        let flush: String = client
+            .query_one("SELECT pg_current_wal_flush_lsn()::text", &[])
+            .await?
+            .get(0);
+        Ok(parse_lsn(&flush))
+    }
+
     async fn prepare_source(
         &self,
         database: &str,

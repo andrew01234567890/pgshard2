@@ -207,6 +207,13 @@ message CheckpointResponse {
 
 message EmitJournalRequest {
   JournalEvent journal = 1;
+  // The shard database the journal message is emitted IN: logical messages
+  // are database-scoped, which is exactly what makes this the cutover freeze
+  // barrier — it reaches every replication slot of that database and no
+  // other. Required.
+  string database = 2;
+  // Pod-identity fence, as elsewhere: ABORTED on mismatch.
+  string target_pod_uid = 3;
 }
 
 message EmitJournalResponse {

@@ -125,6 +125,14 @@ pub trait Instance: Send + Sync + 'static {
     /// the point is immediately restorable. Only valid on a primary.
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
 
+    /// Emit a transactional logical message (prefix `pgshard`, the given
+    /// payload) INTO `database` and return the WAL flush position after its
+    /// commit. Logical messages are database-scoped: every replication slot
+    /// of that database decodes the message's commit, which makes the
+    /// returned LSN a database-local barrier — a consumer whose applied
+    /// position reaches it has decoded everything before it.
+    async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64>;
+
     /// Ensure `publication` exists in `database` publishing EXACTLY `tables`
     /// with every DML kind, no row filter, no column list, and no generated
     /// columns — the shape the seeding runner's preflight demands. A same-name
@@ -176,6 +184,7 @@ pub mod fake {
         restore_point_gate: Mutex<Option<RestorePointGate>>,
         wal_switches: std::sync::atomic::AtomicU32,
         publications: Mutex<Publications>,
+        journals: Mutex<Vec<(String, Vec<u8>)>>,
     }
 
     impl FakeInstance {
@@ -247,6 +256,10 @@ pub mod fake {
         }
         pub fn publications(&self) -> Publications {
             self.publications.lock().unwrap().clone()
+        }
+
+        pub fn journals(&self) -> Vec<(String, Vec<u8>)> {
+            self.journals.lock().unwrap().clone()
         }
 
         pub fn restore_points(&self) -> Vec<String> {
@@ -374,6 +387,18 @@ pub mod fake {
             self.wal_switches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(s.write_lsn)
+        }
+
+        async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
+            anyhow::ensure!(
+                self.databases.lock().unwrap().contains_key(database),
+                "database {database} does not exist"
+            );
+            self.journals
+                .lock()
+                .unwrap()
+                .push((database.to_owned(), payload.to_vec()));
+            Ok(self.state.lock().unwrap().write_lsn)
         }
 
         async fn prepare_source(
