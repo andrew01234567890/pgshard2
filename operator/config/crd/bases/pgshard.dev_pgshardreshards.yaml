@@ -181,10 +181,12 @@ spec:
                 x-kubernetes-list-type: map
               cutoverGateDeadline:
                 description: |-
-                  CutoverGateDeadline, when set on a reshard in CuttingOver, asks the
-                  routing compiler to gate the SOURCE shard's key range (bufferWrites)
-                  until this absolute time. Routers that cannot apply a gated epoch stop
-                  renewing their write lease, so writes quiesce by lease expiry.
+                  CutoverGateDeadline asks the routing compiler to gate the SOURCE
+                  shard's key range (bufferWrites) until this absolute time — whenever
+                  it is set, regardless of phase. Routers that cannot apply a gated
+                  epoch stop renewing their write lease, so writes quiesce by lease
+                  expiry. The cutover machine clears it only after the switched serving
+                  set has been observed compiled into routing.
                 format: date-time
                 type: string
               observedGeneration:
@@ -257,6 +259,14 @@ spec:
                   deleted and recreated under the same name is a different placement
                   whose data was never validated.
                 type: string
+              switchCommitted:
+                description: |-
+                  SwitchCommitted is the cutover's point of no return, persisted BEFORE
+                  the serving flip and BEFORE the gate is withdrawn. The routing
+                  compiler refuses to publish UNGATED routing while a committed switch's
+                  source still serves — a crash between clearing the gate and flipping
+                  the shards can then never re-admit writes to the old source.
+                type: boolean
               targetShards:
                 description: |-
                   TargetShards are the names of the PgShardShard objects created for the

@@ -87,7 +87,14 @@ func (r *PgShardRoutingReconciler) compileAndWrite(
 	}
 	gates, err := r.cutoverGates(ctx, cluster, shards)
 	if err != nil {
-		return ctrl.Result{}, err
+		// Same posture as a compile refusal: surface it and KEEP the last
+		// good (gated) routing.
+		apimeta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type: routingCompiledCondition, Status: metav1.ConditionFalse,
+			Reason: "GateInconsistent", Message: err.Error(),
+			ObservedGeneration: cluster.Generation,
+		})
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	desired, err := routing.Compile(routing.CompileInputs{
@@ -162,8 +169,12 @@ func (r *PgShardRoutingReconciler) clusterShards(
 				node = nodes[ref]
 			}
 			if node != nil {
+				// Overlay ONLY the instance view: the shard's own
+				// CurrentPrimary is the attestation-gated value (the shard
+				// controller publishes it only for a database verified on
+				// this exact node incarnation and pod) — copying the node's
+				// raw primary would bypass that per-database verification.
 				s.Status.Instances = node.Status.Instances
-				s.Status.CurrentPrimary = node.Status.CurrentPrimary
 			} else {
 				// No node: publish the shard entry with NO endpoints rather
 				// than trust the stale mirrored status.
@@ -238,20 +249,35 @@ func (r *PgShardRoutingReconciler) cutoverGates(
 	}
 	var gates []pgshardv1alpha1.RoutingGate
 	for _, rs := range reshards.Items {
+		if rs.Spec.ClusterRef != cluster.Name {
+			continue
+		}
+		source := byName[rs.Spec.SourceShard]
 		// The gate follows the FIELD, never the phase: the cutover machine
 		// clears CutoverGateDeadline only after it has OBSERVED the switched
 		// serving set compiled into routing. A reordered phase transition can
 		// therefore never publish a fresh ungated epoch that still carries
 		// the pre-switch topology and re-admits writes to the old source.
-		if rs.Spec.ClusterRef != cluster.Name || rs.Status.CutoverGateDeadline == nil {
+		if rs.Status.CutoverGateDeadline == nil {
+			// A committed switch whose source STILL serves means the gate
+			// was cleared before the flip (a crash in between): publishing
+			// ungated routing now would re-admit writes to a source the
+			// targets have already snapshotted past. Refuse; the last good
+			// (gated) routing stands until the flip lands.
+			if rs.Status.SwitchCommitted && source != nil && source.Spec.Serving {
+				return nil, fmt.Errorf(
+					"reshard %s committed its switch but source %s still serves; refusing ungated routing",
+					rs.Name, rs.Spec.SourceShard)
+			}
 			continue
 		}
-		source, ok := byName[rs.Spec.SourceShard]
-		if !ok {
-			// The cutover controller validates the source exists before
-			// requesting a gate; a missing source here is transient reading
-			// order — skip this compile, the next event retries.
-			continue
+		if source == nil {
+			// An ACTIVE gate whose source is gone must not silently vanish:
+			// the targets could already partition the keyspace and compile
+			// cleanly UNGATED while the reshard still believes it is gated.
+			return nil, fmt.Errorf(
+				"reshard %s requests a gate but source shard %s does not exist",
+				rs.Name, rs.Spec.SourceShard)
 		}
 		gates = append(gates, pgshardv1alpha1.RoutingGate{
 			ID:   "reshard-" + rs.Name,
@@ -314,37 +340,40 @@ func (r *PgShardRoutingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				Namespace: rs.Namespace, Name: rs.Spec.ClusterRef,
 			}}}
 		})
+	// clustersForNode maps a node to every cluster with a shard placed on it
+	// (colocated clusters share nodes, so one node event can concern many).
+	clustersForNode := func(ctx context.Context, namespace, nodeName string) []ctrl.Request {
+		var shards pgshardv1alpha1.PgShardShardList
+		if err := r.List(ctx, &shards, client.InNamespace(namespace)); err != nil {
+			return nil
+		}
+		seen := map[string]bool{}
+		var reqs []ctrl.Request
+		for _, s := range shards.Items {
+			if s.Spec.NodeRef != nodeName || s.Spec.ClusterRef == "" || seen[s.Spec.ClusterRef] {
+				continue
+			}
+			seen[s.Spec.ClusterRef] = true
+			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+				Namespace: namespace, Name: s.Spec.ClusterRef,
+			}})
+		}
+		return reqs
+	}
+	mapNode := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []ctrl.Request {
+			return clustersForNode(ctx, obj.GetNamespace(), obj.GetName())
+		})
 	mapPod := handler.EnqueueRequestsFromMapFunc(
 		func(ctx context.Context, obj client.Object) []ctrl.Request {
 			ref := metav1.GetControllerOf(obj)
 			if ref == nil || ref.Kind != "PgShardNode" {
 				return nil
 			}
-			var node pgshardv1alpha1.PgShardNode
-			if err := r.Get(ctx,
-				types.NamespacedName{Namespace: obj.GetNamespace(), Name: ref.Name}, &node); err != nil {
-				return nil
-			}
-			owner := metav1.GetControllerOf(&node)
-			if owner == nil {
-				return nil
-			}
-			switch owner.Kind {
-			case "PgShardCluster":
-				return []ctrl.Request{{NamespacedName: types.NamespacedName{
-					Namespace: node.Namespace, Name: owner.Name,
-				}}}
-			case "PgShardReshard":
-				var rs pgshardv1alpha1.PgShardReshard
-				if err := r.Get(ctx,
-					types.NamespacedName{Namespace: node.Namespace, Name: owner.Name}, &rs); err != nil {
-					return nil
-				}
-				return []ctrl.Request{{NamespacedName: types.NamespacedName{
-					Namespace: node.Namespace, Name: rs.Spec.ClusterRef,
-				}}}
-			}
-			return nil
+			// Map through every shard REFERENCING the node, not just the
+			// node's owner: colocated clusters place shards on nodes they do
+			// not own.
+			return clustersForNode(ctx, obj.GetNamespace(), ref.Name)
 		})
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("pgshardrouting").
@@ -352,6 +381,7 @@ func (r *PgShardRoutingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgshardv1alpha1.PgShardShard{}, mapShard).
 		Watches(&pgshardv1alpha1.PgShardTableConfig{}, mapConfig).
 		Watches(&pgshardv1alpha1.PgShardReshard{}, mapReshard).
+		Watches(&pgshardv1alpha1.PgShardNode{}, mapNode).
 		Watches(&corev1.Pod{}, mapPod).
 		Complete(r)
 }

@@ -72,6 +72,10 @@ var _ = Describe("PgShardRouting compilation", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+		// The shard controller mirrors CurrentPrimary only after the
+		// database verification chain passes; instances stay on the node.
+		s.Status.CurrentPrimary = podName
+		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 	}
 
 	newCluster := func(name string) {
@@ -194,6 +198,77 @@ var _ = Describe("PgShardRouting compilation", func() {
 		rt = getRouting("rc3")
 		Expect(rt.Spec.Gates).To(BeEmpty())
 		Expect(rt.Spec.Epoch).To(BeNumerically(">", gatedEpoch))
+	})
+
+	It("refuses ungated routing while a committed switch's source still serves", func() {
+		newCluster("rc5")
+		makeShard("rc5", "rc5-a", "", "80", "rc5-n0", "rc5-p0", "127.0.5.1")
+		makeShard("rc5", "rc5-b", "80", "", "rc5-n1", "rc5-p1", "127.0.5.2")
+		reconcile("rc5")
+
+		rs := &pgshardv1alpha1.PgShardReshard{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc5-split", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardReshardSpec{
+				ClusterRef:  "rc5",
+				SourceShard: "rc5-a",
+				TargetRanges: []pgshardv1alpha1.KeyRange{
+					{Start: "", End: "40"}, {Start: "40", End: "80"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+		deadline := metav1.NewTime(time.Now().Add(time.Minute).Truncate(time.Second))
+		rs.Status.Phase = pgshardv1alpha1.ReshardCuttingOver
+		rs.Status.CutoverGateDeadline = &deadline
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc5")
+		gatedEpoch := getRouting("rc5").Spec.Epoch
+		Expect(getRouting("rc5").Spec.Gates).To(HaveLen(1))
+
+		// The crash window: switch committed, gate field cleared, but the
+		// serving flip never landed. Publishing ungated routing would
+		// re-admit writes to a source the targets snapshotted past.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc5-split", Namespace: ns}, rs)).To(Succeed())
+		rs.Status.SwitchCommitted = true
+		rs.Status.CutoverGateDeadline = nil
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc5")
+
+		rt := getRouting("rc5")
+		Expect(rt.Spec.Epoch).To(Equal(gatedEpoch), "the last good gated routing must stand")
+		Expect(rt.Spec.Gates).To(HaveLen(1))
+		var cl pgshardv1alpha1.PgShardCluster
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc5", Namespace: ns}, &cl)).To(Succeed())
+		cond := apimeta.FindStatusCondition(cl.Status.Conditions, "RoutingCompiled")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("GateInconsistent"))
+	})
+
+	It("refuses to compile when an active gate's source shard is gone", func() {
+		newCluster("rc6")
+		makeShard("rc6", "rc6-a", "", "80", "rc6-n0", "rc6-p0", "127.0.6.1")
+		makeShard("rc6", "rc6-b", "80", "", "rc6-n1", "rc6-p1", "127.0.6.2")
+		reconcile("rc6")
+		epoch := getRouting("rc6").Spec.Epoch
+
+		rs := &pgshardv1alpha1.PgShardReshard{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc6-split", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardReshardSpec{
+				ClusterRef:  "rc6",
+				SourceShard: "rc6-vanished",
+				TargetRanges: []pgshardv1alpha1.KeyRange{
+					{Start: "", End: "40"}, {Start: "40", End: "80"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+		deadline := metav1.NewTime(time.Now().Add(time.Minute).Truncate(time.Second))
+		rs.Status.CutoverGateDeadline = &deadline
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc6")
+
+		Expect(getRouting("rc6").Spec.Epoch).To(Equal(epoch),
+			"an active gate with no source must never compile away silently")
 	})
 
 	It("never publishes an endpoint for a pod another node incarnation owns", func() {
