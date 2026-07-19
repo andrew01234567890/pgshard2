@@ -85,7 +85,16 @@ func (r *PgShardRoutingReconciler) compileAndWrite(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	gates, err := r.cutoverGates(ctx, cluster, shards)
+	var reshards pgshardv1alpha1.PgShardReshardList
+	if err := r.List(ctx, &reshards, client.InNamespace(cluster.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Finalizer maintenance is a MUTATION: conflicts belong on the reconcile
+	// error/backoff path, not the semantic GateInconsistent condition.
+	if err := r.syncGateFinalizers(ctx, cluster, shards, reshards.Items); err != nil {
+		return ctrl.Result{}, err
+	}
+	gates, err := cutoverGates(cluster, shards, reshards.Items)
 	if err != nil {
 		// Same posture as a compile refusal: surface it and KEEP the last
 		// good (gated) routing.
@@ -219,7 +228,10 @@ func (r *PgShardRoutingReconciler) primaryStillVerified(
 
 // resolveEndpoints maps every instance pod to its directly-dialable address —
 // but ONLY when the live pod is still controlled by the node incarnation the
-// instance status describes. Names are reusable: a same-named replacement pod
+// instance status describes. NOTE: replica endpoints are gated on pod
+// ownership + the compiler's role/readiness checks but NOT the per-database
+// verification chain; M1 never routes reads to replicas, and replica-read
+// integration must gate them the same way primaries are. Names are reusable: a same-named replacement pod
 // under a recreated node must never inherit stale role/readiness evidence.
 // Anything unverifiable is simply absent; the compiler then omits that
 // endpoint (routers never dial a guess).
@@ -260,39 +272,57 @@ func (r *PgShardRoutingReconciler) resolveEndpoints(
 	return endpoints, nil
 }
 
-// cutoverGates emits one bufferWrites gate per reshard that is CUTTING OVER
-// with a declared gate deadline: the gate covers the SOURCE shard's key
-// range, and routers that cannot apply a gated epoch stop renewing their
-// write lease — writes quiesce by lease expiry.
-func (r *PgShardRoutingReconciler) cutoverGates(
+// syncGateFinalizers keeps every gating reshard pinned: the reshard object
+// is the ONLY durable record of an active gate or a committed-but-unflipped
+// switch, and deleting it would recompile ungated routing and re-admit
+// writes to the old source.
+func (r *PgShardRoutingReconciler) syncGateFinalizers(
 	ctx context.Context,
 	cluster *pgshardv1alpha1.PgShardCluster,
 	shards []pgshardv1alpha1.PgShardShard,
-) ([]pgshardv1alpha1.RoutingGate, error) {
-	var reshards pgshardv1alpha1.PgShardReshardList
-	if err := r.List(ctx, &reshards, client.InNamespace(cluster.Namespace)); err != nil {
-		return nil, err
-	}
-	byName := map[string]*pgshardv1alpha1.PgShardShard{}
-	for i := range shards {
-		byName[shards[i].Name] = &shards[i]
-	}
-	var gates []pgshardv1alpha1.RoutingGate
-	for i := range reshards.Items {
-		rs := &reshards.Items[i]
+	reshards []pgshardv1alpha1.PgShardReshard,
+) error {
+	byName := shardsByName(shards)
+	for i := range reshards {
+		rs := &reshards[i]
 		if rs.Spec.ClusterRef != cluster.Name {
 			continue
 		}
 		source := byName[rs.Spec.SourceShard]
-		// The reshard object is the ONLY durable record of an active gate or
-		// a committed-but-unflipped switch: deleting it would recompile
-		// ungated routing and re-admit writes to the old source. A finalizer
-		// holds the object while either is load-bearing.
 		holding := rs.Status.CutoverGateDeadline != nil ||
 			(rs.Status.SwitchCommitted && source != nil && source.Spec.Serving)
 		if err := r.syncGateFinalizer(ctx, rs, holding); err != nil {
-			return nil, err
+			return err
 		}
+	}
+	return nil
+}
+
+func shardsByName(shards []pgshardv1alpha1.PgShardShard) map[string]*pgshardv1alpha1.PgShardShard {
+	byName := map[string]*pgshardv1alpha1.PgShardShard{}
+	for i := range shards {
+		byName[shards[i].Name] = &shards[i]
+	}
+	return byName
+}
+
+// cutoverGates emits one bufferWrites gate per reshard with a declared gate
+// deadline: the gate covers the SOURCE shard's key range, and routers that
+// cannot apply a gated epoch stop renewing their write lease — writes
+// quiesce by lease expiry.
+func cutoverGates(
+	cluster *pgshardv1alpha1.PgShardCluster,
+	shards []pgshardv1alpha1.PgShardShard,
+	reshards []pgshardv1alpha1.PgShardReshard,
+) ([]pgshardv1alpha1.RoutingGate, error) {
+	byName := shardsByName(shards)
+	var gates []pgshardv1alpha1.RoutingGate
+	for i := range reshards {
+		rs := &reshards[i]
+		if rs.Spec.ClusterRef != cluster.Name {
+			continue
+		}
+		source := byName[rs.Spec.SourceShard]
 		// The gate follows the FIELD, never the phase: the cutover machine
 		// clears CutoverGateDeadline only after it has OBSERVED the switched
 		// serving set compiled into routing. A reordered phase transition can

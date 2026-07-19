@@ -367,10 +367,11 @@ var _ = Describe("PgShardRouting compilation", func() {
 		rs.Status.CutoverGateDeadline = nil
 		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
 		reconcile("rc8")
+		// The SAME reconcile that releases the finalizer publishes the
+		// withdrawal — no follow-up event required.
+		Expect(getRouting("rc8").Spec.Gates).To(BeEmpty())
 		Expect(apierrors.IsNotFound(
 			k8sClient.Get(ctx, types.NamespacedName{Name: rc8Split, Namespace: ns}, rs))).To(BeTrue())
-		reconcile("rc8")
-		Expect(getRouting("rc8").Spec.Gates).To(BeEmpty())
 	})
 
 	It("never publishes an endpoint for a pod another node incarnation owns", func() {
