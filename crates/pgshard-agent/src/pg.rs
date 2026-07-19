@@ -320,24 +320,51 @@ impl Instance for PgInstance {
                 .get(0);
             return Ok(0);
         }
-        // Terminate EVERY client backend on this database — not only the ones
-        // in a transaction: an idle pooled router session that was not in a
-        // transaction at the ALTER keeps its pre-ALTER read-write default and
-        // could still issue a write after the barrier. Its reconnect lands
-        // read-only. Replication walsenders (backend_type <> 'client
-        // backend') and this session are left alone.
-        let terminated: i64 = client
-            .query_one(
-                "SELECT count(pg_terminate_backend(pid))
-                 FROM pg_stat_activity
-                 WHERE datname = current_database()
-                   AND pid <> pg_backend_pid()
-                   AND backend_type = 'client backend'",
-                &[],
-            )
-            .await?
-            .get(0);
-        Ok(terminated.max(0) as u32)
+        // Terminate EVERY WRITER client backend on this database — not only
+        // the ones in a transaction: an idle pooled router session keeps its
+        // pre-ALTER read-write default and could still write after the
+        // barrier. Its reconnect lands read-only. SPARED: replication
+        // walsenders (backend_type <> 'client backend'), this session, and
+        // the reshard's OWN reader sessions (application_name starting
+        // pgshard_) — killing the workflow's source catalog connection would
+        // make it error and refuse the cutover. A bounded, VERIFIED wait: a
+        // zero-timeout pg_terminate_backend only SIGTERMs, so a backend mid
+        // COMMIT could finish after the RPC; wait up to 5s for actual exit
+        // and confirm none remain before returning.
+        const SELECT_WRITERS: &str = "SELECT pid FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND backend_type = 'client backend'
+               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'";
+        let mut terminated = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pids: Vec<i32> = client
+                .query(SELECT_WRITERS, &[])
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect();
+            if pids.is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "writer backends did not exit within the fence deadline"
+            );
+            for pid in pids {
+                // pg_terminate_backend(pid, timeout) returns true only when the
+                // backend has actually exited (or was already gone).
+                let gone: bool = client
+                    .query_one("SELECT pg_terminate_backend($1, 2000)", &[&pid])
+                    .await?
+                    .get(0);
+                if gone {
+                    terminated += 1;
+                }
+            }
+        }
+        Ok(terminated)
     }
 
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {

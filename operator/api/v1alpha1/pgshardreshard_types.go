@@ -146,6 +146,14 @@ type PgShardReshardStatus struct {
 	// +optional
 	CutoverGateObservedAt *metav1.Time `json:"cutoverGateObservedAt,omitempty"`
 
+	// SourceFenced records that the source database was set write-quiescent
+	// (read-only) by a freeze — INDEPENDENT of the barrier LSN, since the
+	// fence lands BEFORE the emit. Every terminal/rollback path un-fences
+	// while this is true, so a failed emit or crash can never strand the
+	// source read-only.
+	// +optional
+	SourceFenced bool `json:"sourceFenced,omitempty"`
+
 	// CutoverAttempt counts cutover attempts; a rollback increments it. The
 	// freeze's journal id embeds it, so a RETRIED cutover can never replay a
 	// previous attempt's barrier — workflows already acknowledged past the

@@ -71,7 +71,9 @@ const reshardValidatedCondition = "Validated"
 // The condition that records whether the target shards have been created.
 const reshardTargetsProvisionedCondition = "TargetsProvisioned"
 
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardroutings,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
@@ -84,6 +86,10 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	var reshard pgshardv1alpha1.PgShardReshard
 	if err := r.Get(ctx, req.NamespacedName, &reshard); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !reshard.DeletionTimestamp.IsZero() {
+		return r.cleanupCutoverClaim(ctx, &reshard)
 	}
 
 	before := reshard.Status.DeepCopy()

@@ -396,7 +396,11 @@ async fn connect_source_sql(run: &RunPlan) -> anyhow::Result<tokio_postgres::Cli
         .port(run.source.port)
         .user(&run.source.user)
         .password(&run.source.password)
-        .dbname(&run.source.database);
+        .dbname(&run.source.database)
+        // The cutover write-fence spares application_names starting pgshard_:
+        // this is a READER (catalog polls), not a writer, so terminating it
+        // would only make the workflow error and block the cutover.
+        .application_name("pgshard_seed_reader");
     let (client, connection) = config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {

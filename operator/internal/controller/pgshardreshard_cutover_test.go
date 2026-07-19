@@ -236,10 +236,15 @@ var _ = Describe("PgShardReshard cutover", func() {
 		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("happy")
 		name := "rco-happy"
 
-		// ReadyToCutover -> CuttingOver persists the gate deadline; the
-		// routing compiler publishes the gate.
-		_, err := reconcile()
-		Expect(err).NotTo(HaveOccurred())
+		// ReadyToCutover -> (finalizer) -> (claim) -> CuttingOver persists the
+		// gate deadline; the routing compiler publishes the gate.
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
 		rs := get(name)
 		Expect(rs.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCuttingOver))
 		Expect(rs.Status.CutoverGateDeadline).NotTo(BeNil())
@@ -262,7 +267,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(journals[0].GetJournal().GetSuccessors()).To(HaveLen(2))
 
 		// The switch must NOT commit before every target acks the barrier.
-		_, err = reconcile()
+		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(get(name).Status.SwitchCommitted).To(BeFalse())
 
@@ -290,8 +295,13 @@ var _ = Describe("PgShardReshard cutover", func() {
 		_, _, reconcile, routingReconcile, _ := cutoverSetup("roll")
 		name := "rco-roll"
 
-		_, err := reconcile()
-		Expect(err).NotTo(HaveOccurred())
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
 		rs := get(name)
 		Expect(rs.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCuttingOver))
 
@@ -301,7 +311,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		expired := metav1.NewTime(time.Now().Add(-time.Second))
 		rs.Status.CutoverGateDeadline = &expired
 		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
-		_, err = reconcile()
+		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
 
 		rs = get(name)

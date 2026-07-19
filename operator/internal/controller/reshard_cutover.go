@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -58,7 +59,40 @@ func (r *PgShardReshardReconciler) reconcileReadyToCutover(
 	return ctrl.Result{Requeue: true}, nil
 }
 
-const cutoverClaimAnnotation = "pgshard.dev/cutover-claim"
+const (
+	cutoverClaimAnnotation = "pgshard.dev/cutover-claim"
+	// cutoverClaimFinalizer keeps a reshard around while it holds a source
+	// claim (or a fence), so a delete-to-change-course cannot strand the
+	// source's claim annotation or leave it read-only.
+	cutoverClaimFinalizer = "pgshard.dev/cutover-cleanup"
+)
+
+// cleanupCutoverClaim runs on a reshard being deleted: un-fence the source if
+// fenced, release the claim, then drop the finalizer. Idempotent.
+func (r *PgShardReshardReconciler) cleanupCutoverClaim(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(reshard, cutoverClaimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	source := r.sourceForCleanup(ctx, reshard)
+	if source != nil && reshard.Status.SourceFenced {
+		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
+			return res, err
+		}
+		reshard.Status.SourceFenced = false
+		if err := r.Status().Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if source != nil {
+		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	controllerutil.RemoveFinalizer(reshard, cutoverClaimFinalizer)
+	return ctrl.Result{}, r.Update(ctx, reshard)
+}
 
 // failCutover marks the reshard Failed AND releases its source claim so a
 // replacement reshard is not blocked forever, and un-fences the source if a
@@ -69,10 +103,11 @@ func (r *PgShardReshardReconciler) failCutover(
 	source *pgshardv1alpha1.PgShardShard,
 	reason, message string,
 ) (ctrl.Result, error) {
-	if source != nil && reshard.Status.CutoverFrozenLSN != 0 {
+	if source != nil && reshard.Status.SourceFenced {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
 		}
+		reshard.Status.SourceFenced = false
 	}
 	if source != nil {
 		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
@@ -97,6 +132,13 @@ func (r *PgShardReshardReconciler) claimSource(
 		res, _ := r.holdCutover(reshard, "SourceClaimed",
 			fmt.Sprintf("source shard %q is being cut over by reshard %q", source.Name, holder))
 		return res, false, nil
+	}
+	if !controllerutil.ContainsFinalizer(reshard, cutoverClaimFinalizer) {
+		controllerutil.AddFinalizer(reshard, cutoverClaimFinalizer)
+		if err := r.Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
 	}
 	if source.Annotations == nil {
 		source.Annotations = map[string]string{}
@@ -138,9 +180,9 @@ func (r *PgShardReshardReconciler) reconcileCuttingOver(
 		return ctrl.Result{}, err
 	}
 	if reshard.Status.ClusterUID != string(cluster.UID) {
-		r.fail(reshard, reshardCutoverCondition, "ClusterReplaced",
+		src := r.sourceForCleanup(ctx, reshard)
+		return r.failCutover(ctx, reshard, src, "ClusterReplaced",
 			fmt.Sprintf("cluster %q is not the object this reshard was validated against", cluster.Name))
-		return ctrl.Result{}, nil
 	}
 
 	var source pgshardv1alpha1.PgShardShard
@@ -153,9 +195,18 @@ func (r *PgShardReshardReconciler) reconcileCuttingOver(
 		return ctrl.Result{}, err
 	}
 	if reshard.Status.SourceShardUID != string(source.UID) {
+		if err := r.releaseSourceClaim(ctx, reshard, &source); err != nil {
+			return ctrl.Result{}, err
+		}
 		r.fail(reshard, reshardCutoverCondition, "SourceReplaced",
 			fmt.Sprintf("source shard %q is not the object this reshard was validated against", source.Name))
 		return ctrl.Result{}, nil
+	}
+
+	// A target-list/spec mismatch must fail BEFORE any fence or freeze.
+	if len(reshard.Status.TargetShards) != len(reshard.Spec.TargetRanges) {
+		return r.failCutover(ctx, reshard, &source, "TargetListMismatch",
+			"status.targetShards does not match the spec target ranges")
 	}
 
 	if reshard.Status.SwitchCommitted {
@@ -256,10 +307,11 @@ func (r *PgShardReshardReconciler) rollBackCutover(
 	source *pgshardv1alpha1.PgShardShard,
 	message string,
 ) (ctrl.Result, error) {
-	if reshard.Status.CutoverFrozenLSN != 0 {
+	if reshard.Status.SourceFenced {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
 		}
+		reshard.Status.SourceFenced = false
 	}
 	// The claim is intentionally KEPT across a rollback: the reshard still
 	// owns this source and will retry from CatchingUp. It is released only
@@ -301,7 +353,37 @@ func (r *PgShardReshardReconciler) unfenceSource(
 		res, _ := r.holdCutover(reshard, "UnfenceFailed", err.Error())
 		return res, false, nil
 	}
+	// Re-confirm the primary held across the un-fence: a promotion mid-RPC
+	// would mean we cleared the read-only default on a DEPOSED instance while
+	// the live one stays fenced. Hold (SourceFenced stays true) and retry.
+	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if confirmPod == nil || confirmPod.UID != sourcePod.UID ||
+		!databaseVerified(source, confirmNode, confirmPod) {
+		res, _ := r.holdCutover(reshard, "SourceUnverified",
+			"the source primary changed during the un-fence; retrying")
+		return res, false, nil
+	}
 	return ctrl.Result{}, true, nil
+}
+
+// sourceForCleanup best-effort fetches the source shard for a cleanup path
+// (identity already failed), returning nil if it cannot be read.
+func (r *PgShardReshardReconciler) sourceForCleanup(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) *pgshardv1alpha1.PgShardShard {
+	var source pgshardv1alpha1.PgShardShard
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.SourceShard}, &source); err != nil {
+		return nil
+	}
+	if reshard.Status.SourceShardUID != "" && reshard.Status.SourceShardUID != string(source.UID) {
+		// A replaced source is a different database; never un-fence it.
+		return nil
+	}
+	return &source
 }
 
 func (r *PgShardReshardReconciler) holdCutover(
@@ -343,6 +425,12 @@ func (r *PgShardReshardReconciler) freezeSource(
 		default:
 			return r.holdCutover(reshard, "FenceFailed", err.Error())
 		}
+	}
+	// Record the fence DURABLY before the emit: a failed/rejected emit, a
+	// crash, or a deadline must still un-fence on cleanup.
+	if !reshard.Status.SourceFenced {
+		reshard.Status.SourceFenced = true
+		return ctrl.Result{Requeue: true}, nil
 	}
 	successors := make([]*pgshardv1.JournalSuccessor, 0, len(reshard.Status.TargetShards))
 	for i, name := range reshard.Status.TargetShards {
@@ -411,11 +499,6 @@ func (r *PgShardReshardReconciler) barrierAcknowledged(
 	source *pgshardv1alpha1.PgShardShard,
 ) (acked, held bool, res ctrl.Result, err error) {
 	frozen := uint64(reshard.Status.CutoverFrozenLSN)
-	if len(reshard.Status.TargetShards) != len(reshard.Spec.TargetRanges) {
-		res, err := r.failCutover(ctx, reshard, source, "TargetListMismatch",
-			"status.targetShards does not match the spec target ranges")
-		return false, true, res, err
-	}
 	for i, targetName := range reshard.Status.TargetShards {
 		var target pgshardv1alpha1.PgShardShard
 		if err := r.Get(ctx,

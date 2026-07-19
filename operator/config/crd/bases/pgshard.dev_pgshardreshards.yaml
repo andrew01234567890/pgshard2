@@ -275,6 +275,14 @@ spec:
                   SeedTablesPinned distinguishes "pinned an empty schema" (a cluster
                   with no sharded tables) from "not yet pinned".
                 type: boolean
+              sourceFenced:
+                description: |-
+                  SourceFenced records that the source database was set write-quiescent
+                  (read-only) by a freeze — INDEPENDENT of the barrier LSN, since the
+                  fence lands BEFORE the emit. Every terminal/rollback path un-fences
+                  while this is true, so a failed emit or crash can never strand the
+                  source read-only.
+                type: boolean
               sourceShardUID:
                 description: |-
                   SourceShardUID pins the exact source shard object validated at
