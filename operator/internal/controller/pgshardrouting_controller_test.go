@@ -46,7 +46,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 	// makeShard fabricates a placed shard whose status mirrors a ready
 	// primary instance (as the shard controller maintains in production).
-	makeShard := func(cluster, name, start, end string, role pgshardv1alpha1.ShardRole, pod string) {
+	makeShard := func(cluster, name, start, end, pod string) {
 		s := &pgshardv1alpha1.PgShardShard{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
@@ -54,7 +54,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 				KeyRange:   pgshardv1alpha1.KeyRange{Start: start, End: end},
 				Replicas:   1,
 				Serving:    true,
-				Role:       role,
+				Role:       pgshardv1alpha1.ShardRoleData,
 			},
 		}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
@@ -80,8 +80,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 		newCluster("rc1")
 		makePod("rc1-p0", "127.0.1.1")
 		makePod("rc1-p1", "127.0.1.2")
-		makeShard("rc1", "rc1-a", "", "80", pgshardv1alpha1.ShardRoleData, "rc1-p0")
-		makeShard("rc1", "rc1-b", "80", "", pgshardv1alpha1.ShardRoleData, "rc1-p1")
+		makeShard("rc1", "rc1-a", "", "80", "rc1-p0")
+		makeShard("rc1", "rc1-b", "80", "", "rc1-p1")
 
 		reconcile("rc1")
 		rt := getRouting("rc1")
@@ -116,8 +116,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 		newCluster("rc2")
 		makePod("rc2-p0", "127.0.2.1")
 		makePod("rc2-p1", "127.0.2.2")
-		makeShard("rc2", "rc2-a", "", "80", pgshardv1alpha1.ShardRoleData, "rc2-p0")
-		makeShard("rc2", "rc2-b", "80", "", pgshardv1alpha1.ShardRoleData, "rc2-p1")
+		makeShard("rc2", "rc2-a", "", "80", "rc2-p0")
+		makeShard("rc2", "rc2-b", "80", "", "rc2-p1")
 		reconcile("rc2")
 		Expect(getRouting("rc2").Spec.Epoch).To(Equal(int64(1)))
 
@@ -143,8 +143,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 		newCluster("rc3")
 		makePod("rc3-p0", "127.0.3.1")
 		makePod("rc3-p1", "127.0.3.2")
-		makeShard("rc3", "rc3-a", "", "80", pgshardv1alpha1.ShardRoleData, "rc3-p0")
-		makeShard("rc3", "rc3-b", "80", "", pgshardv1alpha1.ShardRoleData, "rc3-p1")
+		makeShard("rc3", "rc3-a", "", "80", "rc3-p0")
+		makeShard("rc3", "rc3-b", "80", "", "rc3-p1")
 		reconcile("rc3")
 
 		rs := &pgshardv1alpha1.PgShardReshard{
