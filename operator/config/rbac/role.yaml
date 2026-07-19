@@ -73,6 +73,26 @@ rules:
   - pgshard.dev
   resources:
   - pgshardreshards
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - pgshard.dev
+  resources:
+  - pgshardroutings
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - pgshard.dev
+  resources:
   - pgshardtableconfigs
   verbs:
   - get

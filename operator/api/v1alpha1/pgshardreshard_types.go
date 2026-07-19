@@ -131,6 +131,23 @@ type PgShardReshardStatus struct {
 	// +optional
 	SeedTablesPinned bool `json:"seedTablesPinned,omitempty"`
 
+	// CutoverGateDeadline asks the routing compiler to gate the SOURCE
+	// shard's key range (bufferWrites) until this absolute time — whenever
+	// it is set, regardless of phase. Routers that cannot apply a gated
+	// epoch stop renewing their write lease, so writes quiesce by lease
+	// expiry. The cutover machine clears it only after the switched serving
+	// set has been observed compiled into routing.
+	// +optional
+	CutoverGateDeadline *metav1.Time `json:"cutoverGateDeadline,omitempty"`
+
+	// SwitchCommitted is the cutover's point of no return, persisted BEFORE
+	// the serving flip and BEFORE the gate is withdrawn. The routing
+	// compiler refuses to publish UNGATED routing while a committed switch's
+	// source still serves — a crash between clearing the gate and flipping
+	// the shards can then never re-admit writes to the old source.
+	// +optional
+	SwitchCommitted bool `json:"switchCommitted,omitempty"`
+
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
