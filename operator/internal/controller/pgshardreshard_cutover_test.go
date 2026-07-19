@@ -47,6 +47,26 @@ func (f foreignClaimReader) Get(
 	return nil
 }
 
+// committedSwitchReader is an uncached reader stub: it reports one named
+// reshard as SwitchCommitted, simulating the API-server truth after a commit
+// the informer cache has not yet observed. Every other read delegates.
+type committedSwitchReader struct {
+	client.Reader
+	reshardName string
+}
+
+func (c committedSwitchReader) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if err := c.Reader.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	if r, ok := obj.(*pgshardv1alpha1.PgShardReshard); ok && r.Name == c.reshardName {
+		r.Status.SwitchCommitted = true
+	}
+	return nil
+}
+
 var _ = Describe("PgShardReshard cutover", func() {
 	const (
 		ns       = "default"
@@ -551,6 +571,44 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
 		Expect(sourceAgent.FencedDatabases()).To(HaveKey("car-src"),
 			"the uncached API reader showed a foreign holder, so A must not un-fence")
+	})
+
+	It("refuses to roll back and un-fence its own switch that the cache has not yet observed as committed", func() {
+		sourceAgent, _, reconcile, routingReconcile, _, rr := cutoverSetup("cs")
+		name := "rco-cs"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("ccs-src"))
+
+		// The switch has committed at the API server, but the reconcile's cached
+		// view still shows SwitchCommitted=false (controller-runtime writes
+		// status without refreshing the cache). The gate deadline has since
+		// crossed, so the stale reconcile would roll back and un-fence its OWN
+		// committed source — the claim is still legitimately this reshard's, so
+		// the ownership check alone cannot catch it. unfenceSource must re-read
+		// the reshard from the API server, see it committed, and refuse.
+		rr.APIReader = committedSwitchReader{Reader: k8sClient, reshardName: name}
+		rs := get(name)
+		expired := metav1.NewTime(time.Now().Add(-time.Second))
+		rs.Status.CutoverGateDeadline = &expired
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardCuttingOver),
+			"the stale rollback must bail, not regress a committed cutover")
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("ccs-src"),
+			"a committed switch the cache has not yet seen must never be un-fenced")
 	})
 
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {

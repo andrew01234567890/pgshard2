@@ -410,6 +410,21 @@ func (r *PgShardReshardReconciler) unfenceSource(
 	if live.Annotations[cutoverClaimAnnotation] != reshard.Name {
 		return ctrl.Result{}, true, nil
 	}
+	// Guard against this reshard's OWN just-committed switch. Controller-runtime
+	// persists status without refreshing the informer cache, so a reconcile that
+	// requeued immediately after SwitchCommitted was written can still read the
+	// pre-commit status and enter rollback/failure (e.g. the gate deadline
+	// crosses in that window) even though the switch has committed and the claim
+	// is legitimately still ours. Re-read the reshard from the API server: if it
+	// is in fact committed, never un-fence — requeue and let the cache catch up,
+	// after which the committed path completes the switch.
+	var liveReshard pgshardv1alpha1.PgShardReshard
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(reshard), &liveReshard); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if liveReshard.UID == reshard.UID && liveReshard.Status.SwitchCommitted {
+		return ctrl.Result{RequeueAfter: time.Second}, false, nil
+	}
 	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
 	if err != nil {
 		return ctrl.Result{}, false, err
