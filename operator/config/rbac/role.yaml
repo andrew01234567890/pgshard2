@@ -78,3 +78,14 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - pgshard.dev
+  resources:
+  - pgshardroutings
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch

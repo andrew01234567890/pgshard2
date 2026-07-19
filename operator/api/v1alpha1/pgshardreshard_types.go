@@ -131,6 +131,13 @@ type PgShardReshardStatus struct {
 	// +optional
 	SeedTablesPinned bool `json:"seedTablesPinned,omitempty"`
 
+	// CutoverGateDeadline, when set on a reshard in CuttingOver, asks the
+	// routing compiler to gate the SOURCE shard's key range (bufferWrites)
+	// until this absolute time. Routers that cannot apply a gated epoch stop
+	// renewing their write lease, so writes quiesce by lease expiry.
+	// +optional
+	CutoverGateDeadline *metav1.Time `json:"cutoverGateDeadline,omitempty"`
+
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }

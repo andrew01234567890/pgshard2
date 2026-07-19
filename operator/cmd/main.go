@@ -214,6 +214,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgshardnode")
 		os.Exit(1)
 	}
+	if err := (&controller.PgShardRoutingReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgshardrouting")
+		os.Exit(1)
+	}
 	if err := (&controller.PgShardReshardReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

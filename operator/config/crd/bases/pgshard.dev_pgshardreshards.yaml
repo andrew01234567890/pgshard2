@@ -179,6 +179,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              cutoverGateDeadline:
+                description: |-
+                  CutoverGateDeadline, when set on a reshard in CuttingOver, asks the
+                  routing compiler to gate the SOURCE shard's key range (bufferWrites)
+                  until this absolute time. Routers that cannot apply a gated epoch stop
+                  renewing their write lease, so writes quiesce by lease expiry.
+                format: date-time
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
