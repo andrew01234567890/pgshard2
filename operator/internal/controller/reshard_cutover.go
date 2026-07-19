@@ -121,26 +121,30 @@ func (r *PgShardReshardReconciler) cleanupCutoverClaim(
 	return ctrl.Result{}, r.Update(ctx, reshard)
 }
 
-// failCutover marks the reshard Failed AND releases its source claim so a
-// replacement reshard is not blocked forever, and un-fences the source if a
-// freeze had fenced it — but NEVER a committed switch: once the source is
-// hidden and the targets have snapshotted past the barrier, re-admitting
-// writes would resurrect a diverged source, so it stays fenced even on a
-// terminal failure (a validation like ClusterReplaced can reach here after
-// the commit).
+// failCutover marks the reshard Failed. On an UNCOMMITTED failure it un-fences
+// the source and releases the claim so a replacement reshard is not blocked.
+// On a COMMITTED failure (a validation like ClusterReplaced can trip after the
+// switch commits but before completeSwitch flips the serving set) it does
+// NEITHER: the committed source stays fenced, and its claim is RETAINED. The
+// committed fence is recorded only in THIS reshard's status, so releasing the
+// claim would let a replacement reshard claim the still-serving source, fence
+// it under its own uncommitted state, and later un-fence — reopening writes
+// past this reshard's freeze barrier. Holding the claim blocks that until this
+// reshard is deleted, whose cleanup completes the switch (hiding the source)
+// before releasing the claim.
 func (r *PgShardReshardReconciler) failCutover(
 	ctx context.Context,
 	reshard *pgshardv1alpha1.PgShardReshard,
 	source *pgshardv1alpha1.PgShardShard,
 	reason, message string,
 ) (ctrl.Result, error) {
-	if source != nil && reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
-		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
-			return res, err
+	if source != nil && !reshard.Status.SwitchCommitted {
+		if reshard.Status.SourceFenced {
+			if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
+				return res, err
+			}
+			reshard.Status.SourceFenced = false
 		}
-		reshard.Status.SourceFenced = false
-	}
-	if source != nil {
 		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
 			return ctrl.Result{}, err
 		}

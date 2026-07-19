@@ -397,6 +397,59 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"a terminal failure after commit must never re-admit writes to the diverged source")
 	})
 
+	It("retains the claim on a committed-but-unflipped source when a terminal validation fails", func() {
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("xo")
+		name := "rco-xo"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		// Stop the instant the switch commits — BEFORE completeSwitch flips the
+		// serving set — so the source is committed yet still Serving. Break on
+		// the reconcile that sets SwitchCommitted; do not reconcile again.
+		committed := false
+		for range 10 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.SwitchCommitted {
+				committed = true
+				break
+			}
+			routingReconcile()
+		}
+		Expect(committed).To(BeTrue())
+		Expect(getShard("cxo-src").Spec.Serving).To(BeTrue(),
+			"the source must still be serving in the committed-but-unflipped window")
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cxo-src"))
+		Expect(getShard("cxo-src").Annotations).To(HaveKeyWithValue(cutoverClaimAnnotation, name))
+
+		// A terminal validation trips after commit. failCutover must keep the
+		// source fenced AND retain the claim: the committed fence lives only in
+		// THIS reshard's status, so releasing the claim would let a replacement
+		// reshard claim the still-serving source and later un-fence it, reopening
+		// writes past this reshard's freeze barrier.
+		rs := get(name)
+		rs.Status.ClusterUID = "stale-cluster-uid"
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cxo-src"),
+			"a committed terminal failure must leave the source fenced")
+		Expect(getShard("cxo-src").Annotations).To(HaveKeyWithValue(cutoverClaimAnnotation, name),
+			"the claim is retained so no replacement reshard can claim and un-fence the committed source")
+	})
+
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
 		_, _, reconcile, routingReconcile, _ := cutoverSetup("roll")
 		name := "rco-roll"
