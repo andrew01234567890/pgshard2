@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -63,6 +65,19 @@ type FakeAgent struct {
 	// legacyResponses models a pre-provenance agent: requests succeed but the
 	// response carries no attestation (proto3 ignores the unknown fields).
 	legacyResponses bool
+
+	// preparedSources records PrepareSource calls (cloned requests, arrival
+	// order) so seeding tests assert the publication contract.
+	preparedSources []*pgshardv1.PrepareSourceRequest
+
+	// startedWorkflows records StartWorkflow calls; workflowPhases scripts the
+	// status WatchWorkflows reports per workflow id (default: STREAMING once
+	// started). workflowErrors scripts a per-id error message reported with
+	// WORKFLOW_PHASE_ERROR. startWorkflowErr, when set, fails StartWorkflow.
+	startedWorkflows []*pgshardv1.StartWorkflowRequest
+	workflowPhases   map[string]pgshardv1.WorkflowPhase
+	workflowErrors   map[string]string
+	startWorkflowErr error
 
 	server   *grpc.Server
 	listener net.Listener
@@ -402,6 +417,139 @@ func (f *FakeAgent) CreateDatabase(
 		f.dbProvenance[req.Name] = req.Provenance
 	}
 	return f.attestedResponse(req), nil
+}
+
+func (f *FakeAgent) PrepareSource(
+	_ context.Context, req *pgshardv1.PrepareSourceRequest,
+) (*pgshardv1.PrepareSourceResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "PrepareSource")
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	f.preparedSources = append(f.preparedSources,
+		proto.Clone(req).(*pgshardv1.PrepareSourceRequest))
+	headroom := uint64(1 << 30)
+	return &pgshardv1.PrepareSourceResponse{WalHeadroomBytes: &headroom}, nil
+}
+
+func (f *FakeAgent) StartWorkflow(
+	_ context.Context, req *pgshardv1.StartWorkflowRequest,
+) (*pgshardv1.StartWorkflowResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "StartWorkflow")
+	if f.startWorkflowErr != nil {
+		return nil, f.startWorkflowErr
+	}
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	spec := req.GetSpec()
+	if spec == nil || spec.GetId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "spec with id is required")
+	}
+	f.startedWorkflows = append(f.startedWorkflows,
+		proto.Clone(req).(*pgshardv1.StartWorkflowRequest))
+	if f.workflowPhases == nil {
+		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
+	}
+	if _, scripted := f.workflowPhases[spec.GetId()]; !scripted {
+		f.workflowPhases[spec.GetId()] = pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING
+	}
+	return &pgshardv1.StartWorkflowResponse{}, nil
+}
+
+func (f *FakeAgent) StopWorkflow(
+	_ context.Context, req *pgshardv1.StopWorkflowRequest,
+) (*pgshardv1.StopWorkflowResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "StopWorkflow")
+	if f.workflowPhases == nil {
+		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
+	}
+	f.workflowPhases[req.GetId()] = pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STOPPED
+	return &pgshardv1.StopWorkflowResponse{}, nil
+}
+
+func (f *FakeAgent) WatchWorkflows(
+	req *pgshardv1.WatchWorkflowsRequest, stream pgshardv1.AgentService_WatchWorkflowsServer,
+) error {
+	for {
+		f.mu.Lock()
+		type entry struct {
+			id    string
+			phase pgshardv1.WorkflowPhase
+			msg   string
+		}
+		var out []entry
+		for id, phase := range f.workflowPhases {
+			if len(req.GetIds()) > 0 && !slices.Contains(req.GetIds(), id) {
+				continue
+			}
+			out = append(out, entry{id, phase, f.workflowErrors[id]})
+		}
+		f.mu.Unlock()
+		for _, e := range out {
+			if err := stream.Send(&pgshardv1.WatchWorkflowsResponse{
+				Status: &pgshardv1.WorkflowStatus{
+					Id:    e.id,
+					Phase: e.phase,
+					Error: e.msg,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// SetWorkflowPhase scripts the status WatchWorkflows reports for a workflow.
+func (f *FakeAgent) SetWorkflowPhase(id string, phase pgshardv1.WorkflowPhase, errMsg string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.workflowPhases == nil {
+		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
+	}
+	if f.workflowErrors == nil {
+		f.workflowErrors = map[string]string{}
+	}
+	f.workflowPhases[id] = phase
+	f.workflowErrors[id] = errMsg
+}
+
+// SetStartWorkflowError scripts StartWorkflow to fail with err (nil clears).
+func (f *FakeAgent) SetStartWorkflowError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startWorkflowErr = err
+}
+
+// PreparedSources returns recorded PrepareSource requests.
+func (f *FakeAgent) PreparedSources() []*pgshardv1.PrepareSourceRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.PrepareSourceRequest, len(f.preparedSources))
+	copy(out, f.preparedSources)
+	return out
+}
+
+// StartedWorkflows returns recorded StartWorkflow requests.
+func (f *FakeAgent) StartedWorkflows() []*pgshardv1.StartWorkflowRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.StartWorkflowRequest, len(f.startedWorkflows))
+	copy(out, f.startedWorkflows)
+	return out
 }
 
 func (f *FakeAgent) attestedResponse(req *pgshardv1.CreateDatabaseRequest) *pgshardv1.CreateDatabaseResponse {

@@ -107,8 +107,42 @@ type PgShardReshardStatus struct {
 	// +optional
 	TargetShards []string `json:"targetShards,omitempty"`
 
+	// SourceShardUID pins the exact source shard object validated at
+	// Validating: seeding reads FROM this shard's database, and a shard
+	// deleted and recreated under the same name is a different placement
+	// whose data was never validated.
+	// +optional
+	SourceShardUID string `json:"sourceShardUID,omitempty"`
+
+	// ClusterUID pins the cluster object the reshard was validated against.
+	// +optional
+	ClusterUID string `json:"clusterUID,omitempty"`
+
+	// SeedTables pins the sharded-table schema captured when seeding began.
+	// Workflow specs are built ONLY from this list: live PgShardTableConfig
+	// edits mid-seed would otherwise change the copied table set or filter
+	// identity under running workflows, leaving targets that stream a
+	// different schema than they seeded.
+	// +optional
+	SeedTables []ReshardSeedTable `json:"seedTables,omitempty"`
+
+	// SeedTablesPinned distinguishes "pinned an empty schema" (a cluster
+	// with no sharded tables) from "not yet pinned".
+	// +optional
+	SeedTablesPinned bool `json:"seedTablesPinned,omitempty"`
+
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// ReshardSeedTable is one pinned sharded table a reshard seeds.
+type ReshardSeedTable struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	// +optional
+	ShardKeyColumn string `json:"shardKeyColumn,omitempty"`
+	// +optional
+	ShardKeyType ShardKeyType `json:"shardKeyType,omitempty"`
 }
 
 // +kubebuilder:object:root=true

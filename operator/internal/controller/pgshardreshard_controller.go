@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard2/operator/internal/agentclient"
+	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
 	"github.com/andrew01234567890/pgshard2/operator/internal/topology"
 )
 
@@ -46,6 +48,21 @@ import (
 type PgShardReshardReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Agents dials seeding RPCs on source and target agents. Nil until the
+	// Seeding phase needs it (tests inject dialAgent instead).
+	Agents *agentclient.Pool
+	// dialAgent overrides agent resolution in tests.
+	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
+}
+
+func (r *PgShardReshardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+	if r.dialAgent != nil {
+		return r.dialAgent(host, port)
+	}
+	if r.Agents == nil {
+		return nil, fmt.Errorf("no agent pool configured")
+	}
+	return r.Agents.Get(host, port)
 }
 
 // The condition that records whether the requested split is well-formed.
@@ -60,6 +77,8 @@ const reshardTargetsProvisionedCondition = "TargetsProvisioned"
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardnodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardtableconfigs,verbs=get;list;watch
 
 func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var reshard pgshardv1alpha1.PgShardReshard
@@ -81,6 +100,8 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileValidating(ctx, &reshard)
 	case pgshardv1alpha1.ReshardProvisioningTargets:
 		result, err = r.reconcileProvisioningTargets(ctx, &reshard)
+	case pgshardv1alpha1.ReshardSeeding:
+		result, err = r.reconcileSeeding(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -136,6 +157,27 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 		return ctrl.Result{}, nil
 	}
 
+	// Only a SERVING shard owns authoritative data: a hidden shard (another
+	// reshard's still-seeding target) holds an incomplete copy, and seeding
+	// from it would replicate that incompleteness into the new targets.
+	if !source.Spec.Serving {
+		r.fail(reshard, reshardValidatedCondition, "SourceNotServing",
+			fmt.Sprintf("source shard %q is not serving; its data is not authoritative", source.Name))
+		return ctrl.Result{}, nil
+	}
+
+	var cluster pgshardv1alpha1.PgShardCluster
+	clusterKey := client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}
+	if err := r.Get(ctx, clusterKey, &cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			reshard.Status.Phase = pgshardv1alpha1.ReshardValidating
+			setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionFalse,
+				"ClusterNotFound", fmt.Sprintf("cluster %q not found yet", reshard.Spec.ClusterRef))
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
 	sourceRange, err := toRange(source.Spec.KeyRange)
 	if err != nil {
 		r.fail(reshard, reshardValidatedCondition, "InvalidSourceRange",
@@ -164,6 +206,11 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	// status only, which does not bump the generation, so the watch's
 	// GenerationChangedPredicate would otherwise drop the self-update event and
 	// the reshard would stall here until the operator restarts.
+	// Pin the exact objects this validation ran against — ONCE, here: a
+	// same-named replacement of either is a different placement whose data
+	// and configuration were never validated. Later phases only verify.
+	reshard.Status.SourceShardUID = string(source.UID)
+	reshard.Status.ClusterUID = string(cluster.UID)
 	reshard.Status.Phase = pgshardv1alpha1.ReshardProvisioningTargets
 	setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionTrue, "PartitionValid",
 		"target ranges partition the source shard's key range")

@@ -116,6 +116,10 @@ spec:
               anchor: it records which target shard objects the controller has created, so a
               restart resumes rather than re-deriving and double-creating.
             properties:
+              clusterUID:
+                description: ClusterUID pins the cluster object the reshard was validated
+                  against.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -197,6 +201,53 @@ spec:
                 - Completed
                 - RollingBack
                 - Failed
+                type: string
+              seedTables:
+                description: |-
+                  SeedTables pins the sharded-table schema captured when seeding began.
+                  Workflow specs are built ONLY from this list: live PgShardTableConfig
+                  edits mid-seed would otherwise change the copied table set or filter
+                  identity under running workflows, leaving targets that stream a
+                  different schema than they seeded.
+                items:
+                  description: ReshardSeedTable is one pinned sharded table a reshard
+                    seeds.
+                  properties:
+                    name:
+                      type: string
+                    schema:
+                      type: string
+                    shardKeyColumn:
+                      type: string
+                    shardKeyType:
+                      description: |-
+                        ShardKeyType is the type of a shard-key column. The router coerces a literal
+                        to it before hashing so that different spellings of one value (e.g. `id = 1`
+                        and `id = '1'`) route to the same shard. The string values are the wire
+                        contract with the Rust router's `pgshard_topo::ShardKeyType` — keep them in
+                        sync.
+                      enum:
+                      - int
+                      - text
+                      - uuid
+                      - bytea
+                      type: string
+                  required:
+                  - name
+                  - schema
+                  type: object
+                type: array
+              seedTablesPinned:
+                description: |-
+                  SeedTablesPinned distinguishes "pinned an empty schema" (a cluster
+                  with no sharded tables) from "not yet pinned".
+                type: boolean
+              sourceShardUID:
+                description: |-
+                  SourceShardUID pins the exact source shard object validated at
+                  Validating: seeding reads FROM this shard's database, and a shard
+                  deleted and recreated under the same name is a different placement
+                  whose data was never validated.
                 type: string
               targetShards:
                 description: |-

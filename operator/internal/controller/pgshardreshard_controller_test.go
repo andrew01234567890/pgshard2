@@ -44,12 +44,24 @@ var _ = Describe("PgShardReshard validation", func() {
 		return got
 	}
 	createSource := func(name, start, end string) {
+		// Validation now pins the cluster; ensure "c" exists (idempotent).
+		cl := &pgshardv1alpha1.PgShardCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardClusterSpec{
+				Postgres: pgshardv1alpha1.PostgresSpec{Version: "18"},
+				Shards:   pgshardv1alpha1.ShardsSpec{InitialCount: 2},
+			},
+		}
+		if err := k8sClient.Create(ctx, cl); err != nil {
+			Expect(apierrors.IsAlreadyExists(err)).To(BeTrue())
+		}
 		src := &pgshardv1alpha1.PgShardShard{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
 				ClusterRef: "c",
 				KeyRange:   pgshardv1alpha1.KeyRange{Start: start, End: end},
 				Replicas:   1,
+				Serving:    true,
 			},
 		}
 		Expect(k8sClient.Create(ctx, src)).To(Succeed())
