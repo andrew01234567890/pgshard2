@@ -67,6 +67,28 @@ func (c committedSwitchReader) Get(
 	return nil
 }
 
+// recreatedReshardReader is an uncached reader stub: it reports one named
+// reshard under a different UID, simulating a same-name replacement object that
+// a stale reconcile of the deleted original might observe. Every other read
+// delegates.
+type recreatedReshardReader struct {
+	client.Reader
+	reshardName string
+	uid         types.UID
+}
+
+func (rr recreatedReshardReader) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if err := rr.Reader.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	if r, ok := obj.(*pgshardv1alpha1.PgShardReshard); ok && r.Name == rr.reshardName {
+		r.UID = rr.uid
+	}
+	return nil
+}
+
 var _ = Describe("PgShardReshard cutover", func() {
 	const (
 		ns       = "default"
@@ -609,6 +631,40 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(get(name).Status.SourceFenced).To(BeTrue())
 		Expect(sourceAgent.FencedDatabases()).To(HaveKey("ccs-src"),
 			"a committed switch the cache has not yet seen must never be un-fenced")
+	})
+
+	It("refuses to un-fence when the live claim holder is a same-name reshard of a different UID", func() {
+		sourceAgent, _, reconcile, routingReconcile, _, rr := cutoverSetup("un")
+		name := "rco-un"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cun-src"))
+
+		// The claim annotation holds only the reusable NAME. The live reshard the
+		// API server reports under that name is a DIFFERENT object (UID) — a
+		// same-name replacement of a since-deleted original. This stale reconcile
+		// must not prove ownership from a matching name alone; un-fence requires
+		// the same UID. Expire the deadline to force the rollback path.
+		rr.APIReader = recreatedReshardReader{Reader: k8sClient, reshardName: name, uid: "a-different-uid"}
+		rs := get(name)
+		expired := metav1.NewTime(time.Now().Add(-time.Second))
+		rs.Status.CutoverGateDeadline = &expired
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cun-src"),
+			"a same-name/different-UID live holder must not authorize this reshard's un-fence")
 	})
 
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
