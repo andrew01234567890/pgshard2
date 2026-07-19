@@ -88,4 +88,13 @@ message WorkflowStatus {
   uint64 lag_bytes = 5;
   double lag_seconds = 6;
   string error = 7;
+  // The pgshard journal message most recently DECODED by this workflow (its
+  // own WAL position, as carried in the Message frame). The cutover freeze
+  // compares journal_lsn >= the emitted barrier's LSN — never equality:
+  // journal messages decode in WAL order, so a LATER journal (another
+  // reshard of the same database) can only raise this value, and passing
+  // the barrier's position still proves everything before it was decoded.
+  // An explicit acknowledgement, immune to instance-global WAL positions
+  // moved by other databases (which produce no frames on this slot).
+  Lsn journal_lsn = 8;
 }

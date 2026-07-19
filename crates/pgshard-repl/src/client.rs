@@ -334,9 +334,12 @@ impl ReplicationClient {
                 "unsafe slot {slot:?} or publication {publication:?} name"
             )));
         }
+        // messages 'true': logical messages (pg_logical_emit_message) are the
+        // cutover freeze barrier; without the option pgoutput silently skips
+        // them and the barrier's commit never reaches the consumer.
         let sql = format!(
             "START_REPLICATION SLOT {slot} LOGICAL 0/0 \
-             (proto_version '4', publication_names '\"{publication}\"')"
+             (proto_version '4', publication_names '\"{publication}\"', messages 'true')"
         );
         self.send_query(&sql).await?;
         loop {

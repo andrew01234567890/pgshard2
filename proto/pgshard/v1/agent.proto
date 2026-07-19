@@ -207,6 +207,18 @@ message CheckpointResponse {
 
 message EmitJournalRequest {
   JournalEvent journal = 1;
+  // The shard database the journal message is emitted IN: logical messages
+  // are database-scoped, which is exactly what makes this the cutover freeze
+  // barrier — it reaches every replication slot of that database and no
+  // other. Required.
+  string database = 2;
+  // Pod-identity fence, as elsewhere: ABORTED on mismatch.
+  string target_pod_uid = 3;
+  // Idempotency identity: a retry with the same id, the same database, and
+  // an IDENTICAL payload replays the recorded position instead of emitting
+  // a second journal record; the same id with a different database or
+  // payload is FAILED_PRECONDITION. Required.
+  string id = 4;
 }
 
 message EmitJournalResponse {

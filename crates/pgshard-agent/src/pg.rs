@@ -292,6 +292,30 @@ impl Instance for PgInstance {
         Ok(parse_lsn(&lsn))
     }
 
+    async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
+        let mut client = self.connect_to(database).await?;
+        // TRANSACTIONAL message: it decodes inside a Commit, so it reaches
+        // every slot of this database through the ordinary stream. The
+        // returned barrier is the MESSAGE's OWN WAL position — the same value
+        // the consumer sees in its Message frame and acknowledges as
+        // journal_lsn — never an instance-global flush position, which other
+        // databases' commits (frameless on this slot) can push past the
+        // journal forever. synchronous_commit is forced: 'off' would let
+        // COMMIT return before the record is durable.
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL synchronous_commit = 'local'")
+            .await?;
+        let lsn: String = tx
+            .query_one(
+                "SELECT pg_logical_emit_message(true, 'pgshard', $1::bytea)::text",
+                &[&payload],
+            )
+            .await?
+            .get(0);
+        tx.commit().await?;
+        Ok(parse_lsn(&lsn))
+    }
+
     async fn prepare_source(
         &self,
         database: &str,

@@ -42,6 +42,12 @@ pub struct AgentSvc<I: Instance> {
     /// after an agent restart is out of scope for M1.
     restore_points:
         tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<RestorePoint>>>>>,
+    /// Journals already emitted, by request id — same single-flight shape as
+    /// restore_points: a retried EmitJournal must REPLAY its recorded
+    /// position (a second emit would give CDC consumers two journal records
+    /// for one cutover), and an id reused with a DIFFERENT payload is a
+    /// protocol violation, not a retry.
+    journals: tokio::sync::Mutex<HashMap<String, JournalSlot>>,
     /// Seeding workflows this agent runs (reshard target pull). A `None`
     /// config means the runner is not wired (no replication credentials or
     /// target conninfo) and the workflow RPCs answer Unimplemented.
@@ -62,6 +68,7 @@ impl<I: Instance> AgentSvc<I> {
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
             restore_points: tokio::sync::Mutex::new(HashMap::new()),
+            journals: tokio::sync::Mutex::new(HashMap::new()),
             workflows: Arc::new(WorkflowRegistry::default()),
             workflow_config: None,
         }
@@ -162,6 +169,19 @@ fn check_provenance(value: &str) -> Result<(), Status> {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+/// One journal id's single-flight slot. `lsn: Some` records a successful
+/// emit (the retry must match database AND payload to replay it); `lsn:
+/// None` poisons the id after a timed-out emit whose outcome is UNKNOWN —
+/// re-emitting could write a second journal record for the same cutover, so
+/// every retry fails loudly instead.
+struct JournalRecord {
+    database: String,
+    payload: Vec<u8>,
+    lsn: Option<u64>,
+}
+
+type JournalSlot = Arc<tokio::sync::Mutex<Option<JournalRecord>>>;
 
 #[tonic::async_trait]
 impl<I: Instance> AgentService for AgentSvc<I> {
@@ -513,9 +533,92 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn emit_journal(
         &self,
-        _r: Request<v1::EmitJournalRequest>,
+        request: Request<v1::EmitJournalRequest>,
     ) -> Result<Response<v1::EmitJournalResponse>, Status> {
-        Err(Status::unimplemented("emit_journal"))
+        use prost::Message;
+        let req = request.into_inner();
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        check_ident("database", &req.database, true)?;
+        if req.id.is_empty() {
+            return Err(Status::invalid_argument("id is required"));
+        }
+        let journal = req
+            .journal
+            .ok_or_else(|| Status::invalid_argument("journal event is required"))?;
+        if journal.source_shard.is_empty() {
+            return Err(Status::invalid_argument("journal source_shard is required"));
+        }
+        let payload = journal.encode_to_vec();
+        let slot = {
+            let mut journals = self.journals.lock().await;
+            journals.entry(req.id.clone()).or_default().clone()
+        };
+        // Same shape as create_restore_point: a DETACHED slot-owning task, so
+        // a caller cancelled between the COMMIT and the slot write cannot
+        // leave the slot empty and let a retry emit a SECOND journal record
+        // for the same cutover.
+        let instance = self.instance.clone();
+        let (id, database) = (req.id.clone(), req.database.clone());
+        let lsn = tokio::spawn(async move {
+            let mut recorded = slot.lock().await;
+            if let Some(rec) = recorded.as_ref() {
+                if rec.database != database || rec.payload != payload {
+                    return Ok(Err(format!(
+                        "journal id {id:?} was already emitted with a different database or payload"
+                    )));
+                }
+                return Ok(match rec.lsn {
+                    Some(lsn) => Ok(lsn),
+                    // A previous emit timed out AFTER possibly committing:
+                    // re-emitting could write a SECOND journal record for
+                    // this cutover. Fail loudly; recovery needs a new id.
+                    None => Err(format!(
+                        "journal id {id:?} has an UNKNOWN outcome (a previous emit timed out); it cannot be retried"
+                    )),
+                });
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                instance.emit_journal(&database, &payload),
+            )
+            .await
+            {
+                Ok(Ok(lsn)) => {
+                    *recorded = Some(JournalRecord {
+                        database,
+                        payload,
+                        lsn: Some(lsn),
+                    });
+                    Ok(Ok(lsn))
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => {
+                    *recorded = Some(JournalRecord {
+                        database,
+                        payload,
+                        lsn: None,
+                    });
+                    Err(anyhow::anyhow!(
+                        "journal emit {id:?} timed out; outcome unknown and the id is now poisoned"
+                    ))
+                }
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("journal task failed: {e}")))?
+        .map_err(internal)?
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(v1::EmitJournalResponse {
+            lsn: Some(v1::Lsn { value: lsn }),
+        }))
     }
     type ShardStreamStream = BoxStream<v1::ShardStreamResponse>;
     async fn shard_stream(
@@ -692,6 +795,116 @@ mod tests {
         req.target_pod_uid = "uid-stale".into();
         let err = s.prepare_source(Request::new(req)).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn emit_journal_returns_the_barrier_position() {
+        let s = svc(FakeInstance::primary());
+        s.instance.set(|st| st.write_lsn = 0x77);
+        s.instance.seed_database("shard_src", "", None);
+        let resp = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.lsn.unwrap().value, 0x77);
+        let journals = s.instance.journals();
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].0, "shard_src");
+
+        // An identical retry REPLAYS the recorded position (even after the
+        // WAL moved) without a second emit; a payload change under the same
+        // id is a protocol violation.
+        s.instance.set(|st| st.write_lsn = 0x99);
+        let retry = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retry.lsn.unwrap().value, 0x77);
+        assert_eq!(s.instance.journals().len(), 1, "no second emit");
+        let clash = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "other".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code(), tonic::Code::FailedPrecondition);
+
+        // The same id aimed at a DIFFERENT database must never replay the
+        // recorded position of the original.
+        s.instance.seed_database("shard_other", "", None);
+        let wrong_db = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_other".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_db.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn emit_journal_refuses_another_pods_uid() {
+        let s = AgentSvc::with_pod_uid(
+            Arc::new(FakeInstance::primary()),
+            "pod-0".into(),
+            "uid-live".into(),
+        );
+        let err = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                target_pod_uid: "uid-stale".into(),
+                id: "cutover-1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn emit_journal_requires_the_event() {
+        let s = svc(FakeInstance::primary());
+        let err = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

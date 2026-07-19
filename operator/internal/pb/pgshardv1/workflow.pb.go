@@ -549,14 +549,23 @@ func (x *CopyProgress) GetRowsCopied() uint64 {
 }
 
 type WorkflowStatus struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Phase         WorkflowPhase          `protobuf:"varint,2,opt,name=phase,proto3,enum=pgshard.v1.WorkflowPhase" json:"phase,omitempty"`
-	Copy          *CopyProgress          `protobuf:"bytes,3,opt,name=copy,proto3" json:"copy,omitempty"`
-	AppliedLsn    *Lsn                   `protobuf:"bytes,4,opt,name=applied_lsn,json=appliedLsn,proto3" json:"applied_lsn,omitempty"`
-	LagBytes      uint64                 `protobuf:"varint,5,opt,name=lag_bytes,json=lagBytes,proto3" json:"lag_bytes,omitempty"`
-	LagSeconds    float64                `protobuf:"fixed64,6,opt,name=lag_seconds,json=lagSeconds,proto3" json:"lag_seconds,omitempty"`
-	Error         string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Id         string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Phase      WorkflowPhase          `protobuf:"varint,2,opt,name=phase,proto3,enum=pgshard.v1.WorkflowPhase" json:"phase,omitempty"`
+	Copy       *CopyProgress          `protobuf:"bytes,3,opt,name=copy,proto3" json:"copy,omitempty"`
+	AppliedLsn *Lsn                   `protobuf:"bytes,4,opt,name=applied_lsn,json=appliedLsn,proto3" json:"applied_lsn,omitempty"`
+	LagBytes   uint64                 `protobuf:"varint,5,opt,name=lag_bytes,json=lagBytes,proto3" json:"lag_bytes,omitempty"`
+	LagSeconds float64                `protobuf:"fixed64,6,opt,name=lag_seconds,json=lagSeconds,proto3" json:"lag_seconds,omitempty"`
+	Error      string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
+	// The pgshard journal message most recently DECODED by this workflow (its
+	// own WAL position, as carried in the Message frame). The cutover freeze
+	// compares journal_lsn >= the emitted barrier's LSN — never equality:
+	// journal messages decode in WAL order, so a LATER journal (another
+	// reshard of the same database) can only raise this value, and passing
+	// the barrier's position still proves everything before it was decoded.
+	// An explicit acknowledgement, immune to instance-global WAL positions
+	// moved by other databases (which produce no frames on this slot).
+	JournalLsn    *Lsn `protobuf:"bytes,8,opt,name=journal_lsn,json=journalLsn,proto3" json:"journal_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -640,6 +649,13 @@ func (x *WorkflowStatus) GetError() string {
 	return ""
 }
 
+func (x *WorkflowStatus) GetJournalLsn() *Lsn {
+	if x != nil {
+		return x.JournalLsn
+	}
+	return nil
+}
+
 var File_pgshard_v1_workflow_proto protoreflect.FileDescriptor
 
 const file_pgshard_v1_workflow_proto_rawDesc = "" +
@@ -682,7 +698,7 @@ const file_pgshard_v1_workflow_proto_rawDesc = "" +
 	"\vtables_done\x18\x02 \x01(\rR\n" +
 	"tablesDone\x12\x1f\n" +
 	"\vrows_copied\x18\x03 \x01(\x04R\n" +
-	"rowsCopied\"\x85\x02\n" +
+	"rowsCopied\"\xb7\x02\n" +
 	"\x0eWorkflowStatus\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x19.pgshard.v1.WorkflowPhaseR\x05phase\x12,\n" +
@@ -692,7 +708,9 @@ const file_pgshard_v1_workflow_proto_rawDesc = "" +
 	"\tlag_bytes\x18\x05 \x01(\x04R\blagBytes\x12\x1f\n" +
 	"\vlag_seconds\x18\x06 \x01(\x01R\n" +
 	"lagSeconds\x12\x14\n" +
-	"\x05error\x18\a \x01(\tR\x05error*f\n" +
+	"\x05error\x18\a \x01(\tR\x05error\x120\n" +
+	"\vjournal_lsn\x18\b \x01(\v2\x0f.pgshard.v1.LsnR\n" +
+	"journalLsn*f\n" +
 	"\fWorkflowKind\x12\x1d\n" +
 	"\x19WORKFLOW_KIND_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15WORKFLOW_KIND_RESHARD\x10\x01\x12\x1c\n" +
@@ -750,11 +768,12 @@ var file_pgshard_v1_workflow_proto_depIdxs = []int32{
 	1,  // 11: pgshard.v1.WorkflowStatus.phase:type_name -> pgshard.v1.WorkflowPhase
 	6,  // 12: pgshard.v1.WorkflowStatus.copy:type_name -> pgshard.v1.CopyProgress
 	13, // 13: pgshard.v1.WorkflowStatus.applied_lsn:type_name -> pgshard.v1.Lsn
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	13, // 14: pgshard.v1.WorkflowStatus.journal_lsn:type_name -> pgshard.v1.Lsn
+	15, // [15:15] is the sub-list for method output_type
+	15, // [15:15] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_workflow_proto_init() }
