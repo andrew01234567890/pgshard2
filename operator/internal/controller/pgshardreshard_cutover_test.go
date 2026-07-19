@@ -312,6 +312,8 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"a rollback opens a NEW attempt so the next freeze cannot replay the old barrier")
 		Expect(getShard("croll-src").Spec.Serving).To(BeTrue(),
 			"an uncommitted rollback must leave the source serving")
+		Expect(getShard("croll-src").Annotations).To(HaveKey("pgshard.dev/cutover-claim"),
+			"the claim is kept across a rollback for the retry")
 		routingReconcile()
 		var rt pgshardv1alpha1.PgShardRouting
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "croll", Namespace: ns}, &rt)).To(Succeed())

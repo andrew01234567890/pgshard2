@@ -292,29 +292,47 @@ impl Instance for PgInstance {
         Ok(parse_lsn(&lsn))
     }
 
-    async fn fence_writes(&self, database: &str) -> anyhow::Result<u32> {
+    async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32> {
         let client = self.connect_to(database).await?;
-        // New sessions (including a router's post-termination reconnect)
-        // become read-only. This affects sessions established AFTER the ALTER,
-        // so the in-flight ones are drained next.
+        let setting = if read_only { "on" } else { "off" };
+        // The database default governs every NEW session, including a router's
+        // reconnect after the termination below.
         client
             .batch_execute(&format!(
-                "ALTER DATABASE {} SET default_transaction_read_only = on",
+                "ALTER DATABASE {} SET default_transaction_read_only = {setting}",
                 quote_ident(database)
             ))
             .await?;
-        // Terminate every client backend still inside a transaction on this
-        // database: a terminated write transaction rolls back, so it can
-        // never commit after the barrier. Replication walsenders
-        // (backend_type <> 'client backend') and this session are left alone.
+        if !read_only {
+            // Un-fence: existing sessions still carry the read-only default
+            // they connected with, so drop them too — their reconnect is
+            // read-write. Nothing to count.
+            let _: i64 = client
+                .query_one(
+                    "SELECT count(pg_terminate_backend(pid))
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> pg_backend_pid()
+                       AND backend_type = 'client backend'",
+                    &[],
+                )
+                .await?
+                .get(0);
+            return Ok(0);
+        }
+        // Terminate EVERY client backend on this database — not only the ones
+        // in a transaction: an idle pooled router session that was not in a
+        // transaction at the ALTER keeps its pre-ALTER read-write default and
+        // could still issue a write after the barrier. Its reconnect lands
+        // read-only. Replication walsenders (backend_type <> 'client
+        // backend') and this session are left alone.
         let terminated: i64 = client
             .query_one(
                 "SELECT count(pg_terminate_backend(pid))
                  FROM pg_stat_activity
                  WHERE datname = current_database()
                    AND pid <> pg_backend_pid()
-                   AND backend_type = 'client backend'
-                   AND xact_start IS NOT NULL",
+                   AND backend_type = 'client backend'",
                 &[],
             )
             .await?

@@ -209,6 +209,9 @@ message FenceWritesRequest {
   // The shard database to fence read-only before the cutover freeze.
   string database = 1;
   string target_pod_uid = 2;
+  // true (default) fences the database write-quiescent; false restores it
+  // read-write (a rollback un-fences the source so it can serve again).
+  bool read_only = 3;
 }
 
 message FenceWritesResponse {

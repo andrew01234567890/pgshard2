@@ -132,7 +132,7 @@ pub trait Instance: Send + Sync + 'static {
     /// reconnections land read-only. Returns how many backends were
     /// terminated. Idempotent: a re-fence of an already-quiescent database
     /// terminates nothing.
-    async fn fence_writes(&self, database: &str) -> anyhow::Result<u32>;
+    async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32>;
 
     /// Emit a transactional logical message (prefix `pgshard`, the given
     /// payload) INTO `database` and return the MESSAGE's own WAL position
@@ -405,15 +405,17 @@ pub mod fake {
             Ok(s.write_lsn)
         }
 
-        async fn fence_writes(&self, database: &str) -> anyhow::Result<u32> {
+        async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32> {
             anyhow::ensure!(
                 self.databases.lock().unwrap().contains_key(database),
                 "database {database} does not exist"
             );
-            self.fenced_databases
-                .lock()
-                .unwrap()
-                .insert(database.to_owned());
+            let mut fenced = self.fenced_databases.lock().unwrap();
+            if read_only {
+                fenced.insert(database.to_owned());
+            } else {
+                fenced.remove(database);
+            }
             Ok(0)
         }
 
