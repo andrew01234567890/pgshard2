@@ -99,7 +99,11 @@ func (r *PgShardReshardReconciler) cleanupCutoverClaim(
 			return ctrl.Result{}, err
 		}
 	}
-	if source != nil && reshard.Status.SourceFenced {
+	// Un-fence ONLY a switch that never committed. A committed switch hid the
+	// source and the targets have snapshotted past the freeze barrier; the
+	// source has diverged and is being decommissioned. Re-admitting writes to
+	// it would resurrect a wrong-data source, so it stays fenced for good.
+	if source != nil && reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
 		}

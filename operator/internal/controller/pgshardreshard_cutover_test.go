@@ -323,6 +323,43 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"deletion must release the source claim")
 	})
 
+	It("keeps a committed source fenced when the object is deleted after the switch", func() {
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("dc")
+		name := "rco-dc"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cdc-src"))
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		drive(reconcile, routingReconcile, "the switched-forward phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardSwitchedForward
+		})
+		Expect(get(name).Status.SwitchCommitted).To(BeTrue())
+		Expect(getShard("cdc-src").Spec.Serving).To(BeFalse())
+
+		// Deleting a COMMITTED cutover must NOT un-fence the source: it has been
+		// hidden and the targets have snapshotted past the freeze barrier, so
+		// re-admitting writes would resurrect a diverged, wrong-data source.
+		rs := get(name)
+		Expect(k8sClient.Delete(ctx, &rs)).To(Succeed())
+		drive(reconcile, routingReconcile, "the reshard to be gone", func() bool {
+			var got pgshardv1alpha1.PgShardReshard
+			return apierrors.IsNotFound(
+				k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &got))
+		})
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cdc-src"),
+			"a committed switch must leave the hidden source fenced for good")
+	})
+
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
 		_, _, reconcile, routingReconcile, _ := cutoverSetup("roll")
 		name := "rco-roll"
