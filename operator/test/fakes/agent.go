@@ -486,24 +486,33 @@ func (f *FakeAgent) WatchWorkflows(
 			id    string
 			phase pgshardv1.WorkflowPhase
 			msg   string
-			lsn   uint64
+			lsn   *uint64
 		}
 		var out []entry
 		for id, phase := range f.workflowPhases {
 			if len(req.GetIds()) > 0 && !slices.Contains(req.GetIds(), id) {
 				continue
 			}
-			out = append(out, entry{id, phase, f.workflowErrors[id], f.workflowLsns[id]})
+			var lsn *uint64
+			if v, ok := f.workflowLsns[id]; ok {
+				lsn = &v
+			}
+			out = append(out, entry{id, phase, f.workflowErrors[id], lsn})
 		}
 		f.mu.Unlock()
 		for _, e := range out {
+			wfStatus := &pgshardv1.WorkflowStatus{
+				Id:    e.id,
+				Phase: e.phase,
+				Error: e.msg,
+			}
+			// The real runner has no watermark until the consistent point is
+			// known; absence must reach the operator as absence.
+			if e.lsn != nil {
+				wfStatus.AppliedLsn = &pgshardv1.Lsn{Value: *e.lsn}
+			}
 			if err := stream.Send(&pgshardv1.WatchWorkflowsResponse{
-				Status: &pgshardv1.WorkflowStatus{
-					Id:         e.id,
-					Phase:      e.phase,
-					Error:      e.msg,
-					AppliedLsn: &pgshardv1.Lsn{Value: e.lsn},
-				},
+				Status: wfStatus,
 			}); err != nil {
 				return err
 			}

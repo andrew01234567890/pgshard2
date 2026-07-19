@@ -76,6 +76,8 @@ var _ = Describe("PgShardReshard seeding", func() {
 		sourceAgent, err := fakes.NewFakeAgent()
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(sourceAgent.Stop)
+		// gateCatchup only trusts WAL numbers from a ready unfenced PRIMARY.
+		sourceAgent.SetRole(pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY)
 		targetAgent, err := fakes.NewFakeAgent()
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(targetAgent.Stop)
@@ -292,7 +294,33 @@ var _ = Describe("PgShardReshard seeding", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal("Lagging"))
 
+		// A streaming workflow with NO watermark cannot be measured: hold.
+		targetAgent.ClearWorkflows()
+		targetAgent.SetWorkflowPhase(ids[0], pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING, "")
+		targetAgent.SetWorkflowPhase(ids[1], pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING, "")
+		targetAgent.SetWorkflowLsn(ids[0], 64<<20)
+		res, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		got = getReshard("rsd-lag")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+		cond = apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond.Reason).To(Equal("LagUnmeasurable"))
+
+		// An applied position AHEAD of the source is nonsense even when the
+		// other target's minimum looks fine: hold.
+		targetAgent.SetWorkflowLsn(ids[0], 128<<20)
+		targetAgent.SetWorkflowLsn(ids[1], 63<<20)
+		res, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		got = getReshard("rsd-lag")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+		cond = apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond.Reason).To(Equal("LagUnmeasurable"))
+
 		// Both targets close within the bound: advance.
+		targetAgent.SetWorkflowLsn(ids[0], 64<<20)
 		targetAgent.SetWorkflowLsn(ids[1], (64<<20)-(1<<20))
 		_, err = reconcile()
 		Expect(err).NotTo(HaveOccurred())

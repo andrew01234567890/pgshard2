@@ -72,7 +72,7 @@ async fn copies_only_rows_in_the_target_range() -> anyhow::Result<()> {
         database: "postgres".to_owned(),
     };
     let mut repl = ReplicationClient::connect(&config).await?;
-    let snapshot = repl
+    let (snapshot, _) = repl
         .create_logical_slot_exported("pgshard_copy_slot", true)
         .await?;
 
@@ -188,7 +188,7 @@ async fn rls_fails_the_copy_loudly_instead_of_filtering() -> anyhow::Result<()> 
         database: "postgres".to_owned(),
     };
     let mut repl = ReplicationClient::connect(&config).await?;
-    let snapshot = repl
+    let (snapshot, _) = repl
         .create_logical_slot_exported("pgshard_rls_slot", true)
         .await?;
 

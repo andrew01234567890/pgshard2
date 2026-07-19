@@ -382,7 +382,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 
 	// Start (idempotently) one pull workflow per target and collect phases.
 	streaming := 0
-	minApplied := uint64(0)
+	applied := make([]*uint64, 0, len(reshard.Status.TargetShards))
 	seed := seedInputs{
 		cluster:     &cluster,
 		source:      source,
@@ -392,7 +392,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 		tables:      tables,
 	}
 	for i, targetName := range reshard.Status.TargetShards {
-		isStreaming, applied, held, res, err := r.seedTarget(ctx, reshard, seed, i, targetName)
+		isStreaming, appliedLsn, held, res, err := r.seedTarget(ctx, reshard, seed, i, targetName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -401,9 +401,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 		}
 		if isStreaming {
 			streaming++
-			if streaming == 1 || applied < minApplied {
-				minApplied = applied
-			}
+			applied = append(applied, appliedLsn)
 		}
 	}
 
@@ -418,7 +416,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 		reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
 		return ctrl.Result{Requeue: true}, nil
 	}
-	return r.gateCatchup(ctx, reshard, sourcePod, minApplied)
+	return r.gateCatchup(ctx, reshard, source, sourcePod, applied)
 }
 
 // gateCatchup advances CatchingUp to ReadyToCutover once the slowest workflow
@@ -428,21 +426,58 @@ func (r *PgShardReshardReconciler) runSeedPass(
 func (r *PgShardReshardReconciler) gateCatchup(
 	ctx context.Context,
 	reshard *pgshardv1alpha1.PgShardReshard,
+	source *pgshardv1alpha1.PgShardShard,
 	sourcePod *corev1.Pod,
-	minApplied uint64,
+	applied []*uint64,
 ) (ctrl.Result, error) {
 	status, err := r.sourceStatus(ctx, sourcePod)
 	if err != nil {
 		return r.hold(reshard, "SourceStatusUnavailable", err.Error())
 	}
-	writeLsn := status.GetWalWriteLsn().GetValue()
-	if writeLsn < minApplied {
-		// An applied position AHEAD of the source's write position means the
-		// numbers are not from the same timeline/database — never advance on
-		// nonsense.
-		return r.hold(reshard, "LagUnmeasurable",
-			fmt.Sprintf("applied position %#x is ahead of the source write position %#x", minApplied, writeLsn))
+	// The WAL position is only meaningful from a live, unfenced PRIMARY: a
+	// standby or fenced instance after an intra-pass failover would report a
+	// position from the wrong timeline or a frozen one.
+	if status.GetRole() != pgshardv1.InstanceRole_INSTANCE_ROLE_PRIMARY ||
+		!status.GetReady() || status.GetFenced() {
+		return r.hold(reshard, "SourceStatusUnavailable",
+			fmt.Sprintf("source pod %s is not a ready unfenced primary", sourcePod.Name))
 	}
+	// Re-confirm the pod REMAINED the committed primary across the status
+	// RPC: a failover between resolution and the read would hand us a
+	// deposed instance's numbers.
+	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if confirmPod == nil || confirmPod.UID != sourcePod.UID || !databaseVerified(source, confirmNode, confirmPod) {
+		return r.hold(reshard, "SourceStatusUnavailable",
+			fmt.Sprintf("source pod %s stopped being the verified primary during the status read", sourcePod.Name))
+	}
+	writeLsn := status.GetWalWriteLsn().GetValue()
+	var minApplied uint64
+	for i, a := range applied {
+		if a == nil {
+			// A streaming workflow with no watermark yet cannot be compared;
+			// never advance on an unmeasured target.
+			return r.hold(reshard, "LagUnmeasurable",
+				"a target workflow reports no applied position yet")
+		}
+		if *a > writeLsn {
+			// A position AHEAD of the source's write position means the
+			// numbers are not from the same timeline/database — never
+			// advance on nonsense, even if another target masks it.
+			return r.hold(reshard, "LagUnmeasurable",
+				fmt.Sprintf("applied position %#x is ahead of the source write position %#x", *a, writeLsn))
+		}
+		if i == 0 || *a < minApplied {
+			minApplied = *a
+		}
+	}
+	// NOTE: writeLsn is INSTANCE-wide while each workflow's watermark only
+	// advances on decoded commits of ITS database — heavy traffic in other
+	// databases on a shared node inflates apparent lag. That errs stuck, not
+	// wrong; the cutover slice replaces this with a database-local barrier
+	// acknowledged by every workflow.
 	if lag := writeLsn - minApplied; lag > catchupMaxLagBytes {
 		setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionFalse, "Lagging",
 			fmt.Sprintf("slowest target is %d bytes behind the source (bound %d)", lag, uint64(catchupMaxLagBytes)))
@@ -579,10 +614,10 @@ func (r *PgShardReshardReconciler) seedTarget(
 	seed seedInputs,
 	i int,
 	targetName string,
-) (isStreaming bool, appliedLsn uint64, held bool, res ctrl.Result, err error) {
-	holdOn := func(reason, message string) (bool, uint64, bool, ctrl.Result, error) {
+) (isStreaming bool, appliedLsn *uint64, held bool, res ctrl.Result, err error) {
+	holdOn := func(reason, message string) (bool, *uint64, bool, ctrl.Result, error) {
 		res, _ := r.hold(reshard, reason, message)
-		return false, 0, true, res, nil
+		return false, nil, true, res, nil
 	}
 	var target pgshardv1alpha1.PgShardShard
 	if err := r.Get(ctx,
@@ -591,11 +626,11 @@ func (r *PgShardReshardReconciler) seedTarget(
 			return holdOn("TargetShardMissing",
 				fmt.Sprintf("target shard %q not found", targetName))
 		}
-		return false, 0, false, ctrl.Result{}, err
+		return false, nil, false, ctrl.Result{}, err
 	}
 	if reason, msg := r.foreignTarget(reshard, &target, i); reason != "" {
 		r.fail(reshard, reshardSeededCondition, reason, msg)
-		return false, 0, true, ctrl.Result{}, nil
+		return false, nil, true, ctrl.Result{}, nil
 	}
 	// The workflow TRUNCATES the target database; only the fully verified
 	// placement chain (DatabaseReady on this node incarnation and pod) may
@@ -606,7 +641,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 	}
 	targetPod, targetNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
 	if err != nil {
-		return false, 0, false, ctrl.Result{}, err
+		return false, nil, false, ctrl.Result{}, err
 	}
 	if targetPod == nil || !databaseVerified(&target, targetNode, targetPod) {
 		// A failover or pod replacement since verification: the shard
@@ -629,7 +664,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		// The range was validated at Validating; a malformed one here is
 		// tampering or corruption, never transient.
 		r.fail(reshard, reshardSeededCondition, "InvalidTargetRange", err.Error())
-		return false, 0, true, ctrl.Result{}, nil
+		return false, nil, true, ctrl.Result{}, nil
 	}
 	wireRange := &pgshardv1.KeyRange{Start: targetRange.Start()}
 	if end, closed := targetRange.End(); closed {
@@ -663,7 +698,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 	}
 	targetAgent, err := r.agentClient(targetPod.Status.PodIP, agentPort)
 	if err != nil {
-		return false, 0, false, ctrl.Result{}, err
+		return false, nil, false, ctrl.Result{}, err
 	}
 	if _, err := targetAgent.StartWorkflow(ctx, &pgshardv1.StartWorkflowRequest{
 		Spec:         spec,
@@ -672,7 +707,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		switch grpcstatus.Code(err) {
 		case codes.InvalidArgument:
 			r.fail(reshard, reshardSeededCondition, "WorkflowRejected", err.Error())
-			return false, 0, true, ctrl.Result{}, nil
+			return false, nil, true, ctrl.Result{}, nil
 		case codes.Unimplemented:
 			// The agent has no replication credentials configured — a
 			// deployment gap, not a data error. Surface and wait.
@@ -700,7 +735,12 @@ func (r *PgShardReshardReconciler) seedTarget(
 	}
 	switch status.GetPhase() {
 	case pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING:
-		return true, status.GetAppliedLsn().GetValue(), false, ctrl.Result{}, nil
+		var applied *uint64
+		if lsn := status.GetAppliedLsn(); lsn != nil {
+			v := lsn.GetValue()
+			applied = &v
+		}
+		return true, applied, false, ctrl.Result{}, nil
 	case pgshardv1.WorkflowPhase_WORKFLOW_PHASE_ERROR:
 		// The workflow failed loudly (preflight refusal, publication
 		// drift, boundary crossing, ...). The NEXT reconcile's
@@ -709,7 +749,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		return holdOn("WorkflowFailed",
 			fmt.Sprintf("workflow %s: %s", id, status.GetError()))
 	}
-	return false, 0, false, ctrl.Result{}, nil
+	return false, nil, false, ctrl.Result{}, nil
 }
 
 // workflowStatus reads one workflow's current status: WatchWorkflows streams
