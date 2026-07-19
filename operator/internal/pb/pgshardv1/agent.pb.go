@@ -1922,6 +1922,104 @@ func (x *CheckpointResponse) GetLsn() *Lsn {
 	return nil
 }
 
+type FenceWritesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The shard database to fence read-only before the cutover freeze.
+	Database      string `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
+	TargetPodUid  string `protobuf:"bytes,2,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FenceWritesRequest) Reset() {
+	*x = FenceWritesRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FenceWritesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FenceWritesRequest) ProtoMessage() {}
+
+func (x *FenceWritesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FenceWritesRequest.ProtoReflect.Descriptor instead.
+func (*FenceWritesRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *FenceWritesRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *FenceWritesRequest) GetTargetPodUid() string {
+	if x != nil {
+		return x.TargetPodUid
+	}
+	return ""
+}
+
+type FenceWritesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// How many in-flight client backends were terminated to drain writers.
+	Terminated    uint32 `protobuf:"varint,1,opt,name=terminated,proto3" json:"terminated,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FenceWritesResponse) Reset() {
+	*x = FenceWritesResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FenceWritesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FenceWritesResponse) ProtoMessage() {}
+
+func (x *FenceWritesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FenceWritesResponse.ProtoReflect.Descriptor instead.
+func (*FenceWritesResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *FenceWritesResponse) GetTerminated() uint32 {
+	if x != nil {
+		return x.Terminated
+	}
+	return 0
+}
+
 type EmitJournalRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Journal *JournalEvent          `protobuf:"bytes,1,opt,name=journal,proto3" json:"journal,omitempty"`
@@ -1943,7 +2041,7 @@ type EmitJournalRequest struct {
 
 func (x *EmitJournalRequest) Reset() {
 	*x = EmitJournalRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1955,7 +2053,7 @@ func (x *EmitJournalRequest) String() string {
 func (*EmitJournalRequest) ProtoMessage() {}
 
 func (x *EmitJournalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1968,7 +2066,7 @@ func (x *EmitJournalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EmitJournalRequest.ProtoReflect.Descriptor instead.
 func (*EmitJournalRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{33}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *EmitJournalRequest) GetJournal() *JournalEvent {
@@ -2008,7 +2106,7 @@ type EmitJournalResponse struct {
 
 func (x *EmitJournalResponse) Reset() {
 	*x = EmitJournalResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2020,7 +2118,7 @@ func (x *EmitJournalResponse) String() string {
 func (*EmitJournalResponse) ProtoMessage() {}
 
 func (x *EmitJournalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2033,7 +2131,7 @@ func (x *EmitJournalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EmitJournalResponse.ProtoReflect.Descriptor instead.
 func (*EmitJournalResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{34}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *EmitJournalResponse) GetLsn() *Lsn {
@@ -2058,7 +2156,7 @@ type ShardStreamRequest struct {
 
 func (x *ShardStreamRequest) Reset() {
 	*x = ShardStreamRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2070,7 +2168,7 @@ func (x *ShardStreamRequest) String() string {
 func (*ShardStreamRequest) ProtoMessage() {}
 
 func (x *ShardStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2083,7 +2181,7 @@ func (x *ShardStreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardStreamRequest.ProtoReflect.Descriptor instead.
 func (*ShardStreamRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{35}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ShardStreamRequest) GetSubscriptionId() string {
@@ -2130,7 +2228,7 @@ type ShardStreamResponse struct {
 
 func (x *ShardStreamResponse) Reset() {
 	*x = ShardStreamResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2142,7 +2240,7 @@ func (x *ShardStreamResponse) String() string {
 func (*ShardStreamResponse) ProtoMessage() {}
 
 func (x *ShardStreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2155,7 +2253,7 @@ func (x *ShardStreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardStreamResponse.ProtoReflect.Descriptor instead.
 func (*ShardStreamResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{36}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *ShardStreamResponse) GetEvents() []*VEvent {
@@ -2174,7 +2272,7 @@ type DropSlotRequest struct {
 
 func (x *DropSlotRequest) Reset() {
 	*x = DropSlotRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2186,7 +2284,7 @@ func (x *DropSlotRequest) String() string {
 func (*DropSlotRequest) ProtoMessage() {}
 
 func (x *DropSlotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2199,7 +2297,7 @@ func (x *DropSlotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropSlotRequest.ProtoReflect.Descriptor instead.
 func (*DropSlotRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{37}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *DropSlotRequest) GetSlot() string {
@@ -2217,7 +2315,7 @@ type DropSlotResponse struct {
 
 func (x *DropSlotResponse) Reset() {
 	*x = DropSlotResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2229,7 +2327,7 @@ func (x *DropSlotResponse) String() string {
 func (*DropSlotResponse) ProtoMessage() {}
 
 func (x *DropSlotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2242,7 +2340,7 @@ func (x *DropSlotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropSlotResponse.ProtoReflect.Descriptor instead.
 func (*DropSlotResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{38}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{40}
 }
 
 // Create the Postgres DATABASE that hosts a placed shard on this node.
@@ -2292,7 +2390,7 @@ type CreateDatabaseRequest struct {
 
 func (x *CreateDatabaseRequest) Reset() {
 	*x = CreateDatabaseRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2304,7 +2402,7 @@ func (x *CreateDatabaseRequest) String() string {
 func (*CreateDatabaseRequest) ProtoMessage() {}
 
 func (x *CreateDatabaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2317,7 +2415,7 @@ func (x *CreateDatabaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateDatabaseRequest.ProtoReflect.Descriptor instead.
 func (*CreateDatabaseRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{39}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *CreateDatabaseRequest) GetName() string {
@@ -2371,7 +2469,7 @@ type CreateDatabaseResponse struct {
 
 func (x *CreateDatabaseResponse) Reset() {
 	*x = CreateDatabaseResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2383,7 +2481,7 @@ func (x *CreateDatabaseResponse) String() string {
 func (*CreateDatabaseResponse) ProtoMessage() {}
 
 func (x *CreateDatabaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2396,7 +2494,7 @@ func (x *CreateDatabaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateDatabaseResponse.ProtoReflect.Descriptor instead.
 func (*CreateDatabaseResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{40}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *CreateDatabaseResponse) GetVerifiedProvenance() string {
@@ -2429,7 +2527,7 @@ type DropDatabaseRequest struct {
 
 func (x *DropDatabaseRequest) Reset() {
 	*x = DropDatabaseRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2441,7 +2539,7 @@ func (x *DropDatabaseRequest) String() string {
 func (*DropDatabaseRequest) ProtoMessage() {}
 
 func (x *DropDatabaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2454,7 +2552,7 @@ func (x *DropDatabaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropDatabaseRequest.ProtoReflect.Descriptor instead.
 func (*DropDatabaseRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{41}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *DropDatabaseRequest) GetName() string {
@@ -2472,7 +2570,7 @@ type DropDatabaseResponse struct {
 
 func (x *DropDatabaseResponse) Reset() {
 	*x = DropDatabaseResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2484,7 +2582,7 @@ func (x *DropDatabaseResponse) String() string {
 func (*DropDatabaseResponse) ProtoMessage() {}
 
 func (x *DropDatabaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2497,7 +2595,7 @@ func (x *DropDatabaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropDatabaseResponse.ProtoReflect.Descriptor instead.
 func (*DropDatabaseResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{42}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{44}
 }
 
 type ExecSchemaRequest struct {
@@ -2517,7 +2615,7 @@ type ExecSchemaRequest struct {
 
 func (x *ExecSchemaRequest) Reset() {
 	*x = ExecSchemaRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2529,7 +2627,7 @@ func (x *ExecSchemaRequest) String() string {
 func (*ExecSchemaRequest) ProtoMessage() {}
 
 func (x *ExecSchemaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2542,7 +2640,7 @@ func (x *ExecSchemaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecSchemaRequest.ProtoReflect.Descriptor instead.
 func (*ExecSchemaRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{43}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *ExecSchemaRequest) GetSql() string {
@@ -2567,7 +2665,7 @@ type ExecSchemaResponse struct {
 
 func (x *ExecSchemaResponse) Reset() {
 	*x = ExecSchemaResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2579,7 +2677,7 @@ func (x *ExecSchemaResponse) String() string {
 func (*ExecSchemaResponse) ProtoMessage() {}
 
 func (x *ExecSchemaResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2592,7 +2690,7 @@ func (x *ExecSchemaResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecSchemaResponse.ProtoReflect.Descriptor instead.
 func (*ExecSchemaResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{44}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{46}
 }
 
 type MigrationStepRequest struct {
@@ -2608,7 +2706,7 @@ type MigrationStepRequest struct {
 
 func (x *MigrationStepRequest) Reset() {
 	*x = MigrationStepRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[45]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2620,7 +2718,7 @@ func (x *MigrationStepRequest) String() string {
 func (*MigrationStepRequest) ProtoMessage() {}
 
 func (x *MigrationStepRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[45]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2633,7 +2731,7 @@ func (x *MigrationStepRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrationStepRequest.ProtoReflect.Descriptor instead.
 func (*MigrationStepRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{45}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *MigrationStepRequest) GetMigrationId() string {
@@ -2681,7 +2779,7 @@ type MigrationStepResponse struct {
 
 func (x *MigrationStepResponse) Reset() {
 	*x = MigrationStepResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[46]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2693,7 +2791,7 @@ func (x *MigrationStepResponse) String() string {
 func (*MigrationStepResponse) ProtoMessage() {}
 
 func (x *MigrationStepResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[46]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2706,7 +2804,7 @@ func (x *MigrationStepResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrationStepResponse.ProtoReflect.Descriptor instead.
 func (*MigrationStepResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{46}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *MigrationStepResponse) GetDone() bool {
@@ -2826,7 +2924,14 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\v2\x1a.pgshard.v1.WorkflowStatusR\x06status\"\x13\n" +
 	"\x11CheckpointRequest\"7\n" +
 	"\x12CheckpointResponse\x12!\n" +
-	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"\x9a\x01\n" +
+	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"V\n" +
+	"\x12FenceWritesRequest\x12\x1a\n" +
+	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12$\n" +
+	"\x0etarget_pod_uid\x18\x02 \x01(\tR\ftargetPodUid\"5\n" +
+	"\x13FenceWritesResponse\x12\x1e\n" +
+	"\n" +
+	"terminated\x18\x01 \x01(\rR\n" +
+	"terminated\"\x9a\x01\n" +
 	"\x12EmitJournalRequest\x122\n" +
 	"\ajournal\x18\x01 \x01(\v2\x18.pgshard.v1.JournalEventR\ajournal\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12$\n" +
@@ -2894,7 +2999,7 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	" MIGRATION_STEP_KIND_CREATE_INDEX\x10\x03\x12&\n" +
 	"\"MIGRATION_STEP_KIND_CUTOVER_RENAME\x10\x04\x12%\n" +
 	"!MIGRATION_STEP_KIND_REVERT_RENAME\x10\x05\x12%\n" +
-	"!MIGRATION_STEP_KIND_DROP_ARTIFACT\x10\x062\xd1\x0e\n" +
+	"!MIGRATION_STEP_KIND_DROP_ARTIFACT\x10\x062\xa1\x0f\n" +
 	"\fAgentService\x12H\n" +
 	"\tGetStatus\x12\x1c.pgshard.v1.GetStatusRequest\x1a\x1d.pgshard.v1.GetStatusResponse\x12B\n" +
 	"\aPromote\x12\x1a.pgshard.v1.PromoteRequest\x1a\x1b.pgshard.v1.PromoteResponse\x12Z\n" +
@@ -2914,6 +3019,7 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x0eWatchWorkflows\x12!.pgshard.v1.WatchWorkflowsRequest\x1a\".pgshard.v1.WatchWorkflowsResponse0\x01\x12K\n" +
 	"\n" +
 	"Checkpoint\x12\x1d.pgshard.v1.CheckpointRequest\x1a\x1e.pgshard.v1.CheckpointResponse\x12N\n" +
+	"\vFenceWrites\x12\x1e.pgshard.v1.FenceWritesRequest\x1a\x1f.pgshard.v1.FenceWritesResponse\x12N\n" +
 	"\vEmitJournal\x12\x1e.pgshard.v1.EmitJournalRequest\x1a\x1f.pgshard.v1.EmitJournalResponse\x12P\n" +
 	"\vShardStream\x12\x1e.pgshard.v1.ShardStreamRequest\x1a\x1f.pgshard.v1.ShardStreamResponse0\x01\x12E\n" +
 	"\bDropSlot\x12\x1b.pgshard.v1.DropSlotRequest\x1a\x1c.pgshard.v1.DropSlotResponse\x12K\n" +
@@ -2936,7 +3042,7 @@ func file_pgshard_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 47)
+var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 49)
 var file_pgshard_v1_agent_proto_goTypes = []any{
 	(InstanceRole)(0),                  // 0: pgshard.v1.InstanceRole
 	(SyncState)(0),                     // 1: pgshard.v1.SyncState
@@ -2975,58 +3081,60 @@ var file_pgshard_v1_agent_proto_goTypes = []any{
 	(*WatchWorkflowsResponse)(nil),     // 34: pgshard.v1.WatchWorkflowsResponse
 	(*CheckpointRequest)(nil),          // 35: pgshard.v1.CheckpointRequest
 	(*CheckpointResponse)(nil),         // 36: pgshard.v1.CheckpointResponse
-	(*EmitJournalRequest)(nil),         // 37: pgshard.v1.EmitJournalRequest
-	(*EmitJournalResponse)(nil),        // 38: pgshard.v1.EmitJournalResponse
-	(*ShardStreamRequest)(nil),         // 39: pgshard.v1.ShardStreamRequest
-	(*ShardStreamResponse)(nil),        // 40: pgshard.v1.ShardStreamResponse
-	(*DropSlotRequest)(nil),            // 41: pgshard.v1.DropSlotRequest
-	(*DropSlotResponse)(nil),           // 42: pgshard.v1.DropSlotResponse
-	(*CreateDatabaseRequest)(nil),      // 43: pgshard.v1.CreateDatabaseRequest
-	(*CreateDatabaseResponse)(nil),     // 44: pgshard.v1.CreateDatabaseResponse
-	(*DropDatabaseRequest)(nil),        // 45: pgshard.v1.DropDatabaseRequest
-	(*DropDatabaseResponse)(nil),       // 46: pgshard.v1.DropDatabaseResponse
-	(*ExecSchemaRequest)(nil),          // 47: pgshard.v1.ExecSchemaRequest
-	(*ExecSchemaResponse)(nil),         // 48: pgshard.v1.ExecSchemaResponse
-	(*MigrationStepRequest)(nil),       // 49: pgshard.v1.MigrationStepRequest
-	(*MigrationStepResponse)(nil),      // 50: pgshard.v1.MigrationStepResponse
-	(*Lsn)(nil),                        // 51: pgshard.v1.Lsn
-	(*PgEndpoint)(nil),                 // 52: pgshard.v1.PgEndpoint
-	(*timestamppb.Timestamp)(nil),      // 53: google.protobuf.Timestamp
-	(*TableRef)(nil),                   // 54: pgshard.v1.TableRef
-	(*WorkflowSpec)(nil),               // 55: pgshard.v1.WorkflowSpec
-	(*WorkflowStatus)(nil),             // 56: pgshard.v1.WorkflowStatus
-	(*JournalEvent)(nil),               // 57: pgshard.v1.JournalEvent
-	(SourcePolicy)(0),                  // 58: pgshard.v1.SourcePolicy
-	(*VEvent)(nil),                     // 59: pgshard.v1.VEvent
+	(*FenceWritesRequest)(nil),         // 37: pgshard.v1.FenceWritesRequest
+	(*FenceWritesResponse)(nil),        // 38: pgshard.v1.FenceWritesResponse
+	(*EmitJournalRequest)(nil),         // 39: pgshard.v1.EmitJournalRequest
+	(*EmitJournalResponse)(nil),        // 40: pgshard.v1.EmitJournalResponse
+	(*ShardStreamRequest)(nil),         // 41: pgshard.v1.ShardStreamRequest
+	(*ShardStreamResponse)(nil),        // 42: pgshard.v1.ShardStreamResponse
+	(*DropSlotRequest)(nil),            // 43: pgshard.v1.DropSlotRequest
+	(*DropSlotResponse)(nil),           // 44: pgshard.v1.DropSlotResponse
+	(*CreateDatabaseRequest)(nil),      // 45: pgshard.v1.CreateDatabaseRequest
+	(*CreateDatabaseResponse)(nil),     // 46: pgshard.v1.CreateDatabaseResponse
+	(*DropDatabaseRequest)(nil),        // 47: pgshard.v1.DropDatabaseRequest
+	(*DropDatabaseResponse)(nil),       // 48: pgshard.v1.DropDatabaseResponse
+	(*ExecSchemaRequest)(nil),          // 49: pgshard.v1.ExecSchemaRequest
+	(*ExecSchemaResponse)(nil),         // 50: pgshard.v1.ExecSchemaResponse
+	(*MigrationStepRequest)(nil),       // 51: pgshard.v1.MigrationStepRequest
+	(*MigrationStepResponse)(nil),      // 52: pgshard.v1.MigrationStepResponse
+	(*Lsn)(nil),                        // 53: pgshard.v1.Lsn
+	(*PgEndpoint)(nil),                 // 54: pgshard.v1.PgEndpoint
+	(*timestamppb.Timestamp)(nil),      // 55: google.protobuf.Timestamp
+	(*TableRef)(nil),                   // 56: pgshard.v1.TableRef
+	(*WorkflowSpec)(nil),               // 57: pgshard.v1.WorkflowSpec
+	(*WorkflowStatus)(nil),             // 58: pgshard.v1.WorkflowStatus
+	(*JournalEvent)(nil),               // 59: pgshard.v1.JournalEvent
+	(SourcePolicy)(0),                  // 60: pgshard.v1.SourcePolicy
+	(*VEvent)(nil),                     // 61: pgshard.v1.VEvent
 }
 var file_pgshard_v1_agent_proto_depIdxs = []int32{
 	6,  // 0: pgshard.v1.GetStatusResponse.status:type_name -> pgshard.v1.InstanceStatus
 	0,  // 1: pgshard.v1.InstanceStatus.role:type_name -> pgshard.v1.InstanceRole
-	51, // 2: pgshard.v1.InstanceStatus.wal_write_lsn:type_name -> pgshard.v1.Lsn
-	51, // 3: pgshard.v1.InstanceStatus.wal_receive_lsn:type_name -> pgshard.v1.Lsn
-	51, // 4: pgshard.v1.InstanceStatus.wal_replay_lsn:type_name -> pgshard.v1.Lsn
+	53, // 2: pgshard.v1.InstanceStatus.wal_write_lsn:type_name -> pgshard.v1.Lsn
+	53, // 3: pgshard.v1.InstanceStatus.wal_receive_lsn:type_name -> pgshard.v1.Lsn
+	53, // 4: pgshard.v1.InstanceStatus.wal_replay_lsn:type_name -> pgshard.v1.Lsn
 	1,  // 5: pgshard.v1.InstanceStatus.sync_state:type_name -> pgshard.v1.SyncState
-	51, // 6: pgshard.v1.PromoteResponse.promote_lsn:type_name -> pgshard.v1.Lsn
-	52, // 7: pgshard.v1.RejoinAsStandbyRequest.upstream:type_name -> pgshard.v1.PgEndpoint
-	51, // 8: pgshard.v1.CreateRestorePointResponse.lsn:type_name -> pgshard.v1.Lsn
-	51, // 9: pgshard.v1.SwitchWalResponse.lsn:type_name -> pgshard.v1.Lsn
+	53, // 6: pgshard.v1.PromoteResponse.promote_lsn:type_name -> pgshard.v1.Lsn
+	54, // 7: pgshard.v1.RejoinAsStandbyRequest.upstream:type_name -> pgshard.v1.PgEndpoint
+	53, // 8: pgshard.v1.CreateRestorePointResponse.lsn:type_name -> pgshard.v1.Lsn
+	53, // 9: pgshard.v1.SwitchWalResponse.lsn:type_name -> pgshard.v1.Lsn
 	2,  // 10: pgshard.v1.RunBackupRequest.type:type_name -> pgshard.v1.BackupType
-	51, // 11: pgshard.v1.RunBackupResponse.start_lsn:type_name -> pgshard.v1.Lsn
-	51, // 12: pgshard.v1.RunBackupResponse.stop_lsn:type_name -> pgshard.v1.Lsn
-	53, // 13: pgshard.v1.RunBackupResponse.stop_time:type_name -> google.protobuf.Timestamp
-	51, // 14: pgshard.v1.RunRestoreResponse.reached_lsn:type_name -> pgshard.v1.Lsn
-	54, // 15: pgshard.v1.PrepareSourceRequest.tables:type_name -> pgshard.v1.TableRef
-	55, // 16: pgshard.v1.StartWorkflowRequest.spec:type_name -> pgshard.v1.WorkflowSpec
-	56, // 17: pgshard.v1.WatchWorkflowsResponse.status:type_name -> pgshard.v1.WorkflowStatus
-	51, // 18: pgshard.v1.CheckpointResponse.lsn:type_name -> pgshard.v1.Lsn
-	57, // 19: pgshard.v1.EmitJournalRequest.journal:type_name -> pgshard.v1.JournalEvent
-	51, // 20: pgshard.v1.EmitJournalResponse.lsn:type_name -> pgshard.v1.Lsn
-	51, // 21: pgshard.v1.ShardStreamRequest.from_lsn:type_name -> pgshard.v1.Lsn
-	54, // 22: pgshard.v1.ShardStreamRequest.tables:type_name -> pgshard.v1.TableRef
-	58, // 23: pgshard.v1.ShardStreamRequest.source_policy:type_name -> pgshard.v1.SourcePolicy
-	59, // 24: pgshard.v1.ShardStreamResponse.events:type_name -> pgshard.v1.VEvent
+	53, // 11: pgshard.v1.RunBackupResponse.start_lsn:type_name -> pgshard.v1.Lsn
+	53, // 12: pgshard.v1.RunBackupResponse.stop_lsn:type_name -> pgshard.v1.Lsn
+	55, // 13: pgshard.v1.RunBackupResponse.stop_time:type_name -> google.protobuf.Timestamp
+	53, // 14: pgshard.v1.RunRestoreResponse.reached_lsn:type_name -> pgshard.v1.Lsn
+	56, // 15: pgshard.v1.PrepareSourceRequest.tables:type_name -> pgshard.v1.TableRef
+	57, // 16: pgshard.v1.StartWorkflowRequest.spec:type_name -> pgshard.v1.WorkflowSpec
+	58, // 17: pgshard.v1.WatchWorkflowsResponse.status:type_name -> pgshard.v1.WorkflowStatus
+	53, // 18: pgshard.v1.CheckpointResponse.lsn:type_name -> pgshard.v1.Lsn
+	59, // 19: pgshard.v1.EmitJournalRequest.journal:type_name -> pgshard.v1.JournalEvent
+	53, // 20: pgshard.v1.EmitJournalResponse.lsn:type_name -> pgshard.v1.Lsn
+	53, // 21: pgshard.v1.ShardStreamRequest.from_lsn:type_name -> pgshard.v1.Lsn
+	56, // 22: pgshard.v1.ShardStreamRequest.tables:type_name -> pgshard.v1.TableRef
+	60, // 23: pgshard.v1.ShardStreamRequest.source_policy:type_name -> pgshard.v1.SourcePolicy
+	61, // 24: pgshard.v1.ShardStreamResponse.events:type_name -> pgshard.v1.VEvent
 	3,  // 25: pgshard.v1.MigrationStepRequest.kind:type_name -> pgshard.v1.MigrationStepKind
-	54, // 26: pgshard.v1.MigrationStepRequest.table:type_name -> pgshard.v1.TableRef
+	56, // 26: pgshard.v1.MigrationStepRequest.table:type_name -> pgshard.v1.TableRef
 	4,  // 27: pgshard.v1.AgentService.GetStatus:input_type -> pgshard.v1.GetStatusRequest
 	7,  // 28: pgshard.v1.AgentService.Promote:input_type -> pgshard.v1.PromoteRequest
 	9,  // 29: pgshard.v1.AgentService.RejoinAsStandby:input_type -> pgshard.v1.RejoinAsStandbyRequest
@@ -3043,38 +3151,40 @@ var file_pgshard_v1_agent_proto_depIdxs = []int32{
 	31, // 40: pgshard.v1.AgentService.StopWorkflow:input_type -> pgshard.v1.StopWorkflowRequest
 	33, // 41: pgshard.v1.AgentService.WatchWorkflows:input_type -> pgshard.v1.WatchWorkflowsRequest
 	35, // 42: pgshard.v1.AgentService.Checkpoint:input_type -> pgshard.v1.CheckpointRequest
-	37, // 43: pgshard.v1.AgentService.EmitJournal:input_type -> pgshard.v1.EmitJournalRequest
-	39, // 44: pgshard.v1.AgentService.ShardStream:input_type -> pgshard.v1.ShardStreamRequest
-	41, // 45: pgshard.v1.AgentService.DropSlot:input_type -> pgshard.v1.DropSlotRequest
-	47, // 46: pgshard.v1.AgentService.ExecSchema:input_type -> pgshard.v1.ExecSchemaRequest
-	49, // 47: pgshard.v1.AgentService.MigrationStep:input_type -> pgshard.v1.MigrationStepRequest
-	43, // 48: pgshard.v1.AgentService.CreateDatabase:input_type -> pgshard.v1.CreateDatabaseRequest
-	45, // 49: pgshard.v1.AgentService.DropDatabase:input_type -> pgshard.v1.DropDatabaseRequest
-	5,  // 50: pgshard.v1.AgentService.GetStatus:output_type -> pgshard.v1.GetStatusResponse
-	8,  // 51: pgshard.v1.AgentService.Promote:output_type -> pgshard.v1.PromoteResponse
-	10, // 52: pgshard.v1.AgentService.RejoinAsStandby:output_type -> pgshard.v1.RejoinAsStandbyResponse
-	12, // 53: pgshard.v1.AgentService.Fence:output_type -> pgshard.v1.FenceResponse
-	14, // 54: pgshard.v1.AgentService.ReloadConfig:output_type -> pgshard.v1.ReloadConfigResponse
-	16, // 55: pgshard.v1.AgentService.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
-	18, // 56: pgshard.v1.AgentService.SwitchWal:output_type -> pgshard.v1.SwitchWalResponse
-	20, // 57: pgshard.v1.AgentService.RunBackup:output_type -> pgshard.v1.RunBackupResponse
-	22, // 58: pgshard.v1.AgentService.RunRestore:output_type -> pgshard.v1.RunRestoreResponse
-	24, // 59: pgshard.v1.AgentService.StanzaCreate:output_type -> pgshard.v1.StanzaCreateResponse
-	26, // 60: pgshard.v1.AgentService.StanzaCheck:output_type -> pgshard.v1.StanzaCheckResponse
-	28, // 61: pgshard.v1.AgentService.PrepareSource:output_type -> pgshard.v1.PrepareSourceResponse
-	30, // 62: pgshard.v1.AgentService.StartWorkflow:output_type -> pgshard.v1.StartWorkflowResponse
-	32, // 63: pgshard.v1.AgentService.StopWorkflow:output_type -> pgshard.v1.StopWorkflowResponse
-	34, // 64: pgshard.v1.AgentService.WatchWorkflows:output_type -> pgshard.v1.WatchWorkflowsResponse
-	36, // 65: pgshard.v1.AgentService.Checkpoint:output_type -> pgshard.v1.CheckpointResponse
-	38, // 66: pgshard.v1.AgentService.EmitJournal:output_type -> pgshard.v1.EmitJournalResponse
-	40, // 67: pgshard.v1.AgentService.ShardStream:output_type -> pgshard.v1.ShardStreamResponse
-	42, // 68: pgshard.v1.AgentService.DropSlot:output_type -> pgshard.v1.DropSlotResponse
-	48, // 69: pgshard.v1.AgentService.ExecSchema:output_type -> pgshard.v1.ExecSchemaResponse
-	50, // 70: pgshard.v1.AgentService.MigrationStep:output_type -> pgshard.v1.MigrationStepResponse
-	44, // 71: pgshard.v1.AgentService.CreateDatabase:output_type -> pgshard.v1.CreateDatabaseResponse
-	46, // 72: pgshard.v1.AgentService.DropDatabase:output_type -> pgshard.v1.DropDatabaseResponse
-	50, // [50:73] is the sub-list for method output_type
-	27, // [27:50] is the sub-list for method input_type
+	37, // 43: pgshard.v1.AgentService.FenceWrites:input_type -> pgshard.v1.FenceWritesRequest
+	39, // 44: pgshard.v1.AgentService.EmitJournal:input_type -> pgshard.v1.EmitJournalRequest
+	41, // 45: pgshard.v1.AgentService.ShardStream:input_type -> pgshard.v1.ShardStreamRequest
+	43, // 46: pgshard.v1.AgentService.DropSlot:input_type -> pgshard.v1.DropSlotRequest
+	49, // 47: pgshard.v1.AgentService.ExecSchema:input_type -> pgshard.v1.ExecSchemaRequest
+	51, // 48: pgshard.v1.AgentService.MigrationStep:input_type -> pgshard.v1.MigrationStepRequest
+	45, // 49: pgshard.v1.AgentService.CreateDatabase:input_type -> pgshard.v1.CreateDatabaseRequest
+	47, // 50: pgshard.v1.AgentService.DropDatabase:input_type -> pgshard.v1.DropDatabaseRequest
+	5,  // 51: pgshard.v1.AgentService.GetStatus:output_type -> pgshard.v1.GetStatusResponse
+	8,  // 52: pgshard.v1.AgentService.Promote:output_type -> pgshard.v1.PromoteResponse
+	10, // 53: pgshard.v1.AgentService.RejoinAsStandby:output_type -> pgshard.v1.RejoinAsStandbyResponse
+	12, // 54: pgshard.v1.AgentService.Fence:output_type -> pgshard.v1.FenceResponse
+	14, // 55: pgshard.v1.AgentService.ReloadConfig:output_type -> pgshard.v1.ReloadConfigResponse
+	16, // 56: pgshard.v1.AgentService.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
+	18, // 57: pgshard.v1.AgentService.SwitchWal:output_type -> pgshard.v1.SwitchWalResponse
+	20, // 58: pgshard.v1.AgentService.RunBackup:output_type -> pgshard.v1.RunBackupResponse
+	22, // 59: pgshard.v1.AgentService.RunRestore:output_type -> pgshard.v1.RunRestoreResponse
+	24, // 60: pgshard.v1.AgentService.StanzaCreate:output_type -> pgshard.v1.StanzaCreateResponse
+	26, // 61: pgshard.v1.AgentService.StanzaCheck:output_type -> pgshard.v1.StanzaCheckResponse
+	28, // 62: pgshard.v1.AgentService.PrepareSource:output_type -> pgshard.v1.PrepareSourceResponse
+	30, // 63: pgshard.v1.AgentService.StartWorkflow:output_type -> pgshard.v1.StartWorkflowResponse
+	32, // 64: pgshard.v1.AgentService.StopWorkflow:output_type -> pgshard.v1.StopWorkflowResponse
+	34, // 65: pgshard.v1.AgentService.WatchWorkflows:output_type -> pgshard.v1.WatchWorkflowsResponse
+	36, // 66: pgshard.v1.AgentService.Checkpoint:output_type -> pgshard.v1.CheckpointResponse
+	38, // 67: pgshard.v1.AgentService.FenceWrites:output_type -> pgshard.v1.FenceWritesResponse
+	40, // 68: pgshard.v1.AgentService.EmitJournal:output_type -> pgshard.v1.EmitJournalResponse
+	42, // 69: pgshard.v1.AgentService.ShardStream:output_type -> pgshard.v1.ShardStreamResponse
+	44, // 70: pgshard.v1.AgentService.DropSlot:output_type -> pgshard.v1.DropSlotResponse
+	50, // 71: pgshard.v1.AgentService.ExecSchema:output_type -> pgshard.v1.ExecSchemaResponse
+	52, // 72: pgshard.v1.AgentService.MigrationStep:output_type -> pgshard.v1.MigrationStepResponse
+	46, // 73: pgshard.v1.AgentService.CreateDatabase:output_type -> pgshard.v1.CreateDatabaseResponse
+	48, // 74: pgshard.v1.AgentService.DropDatabase:output_type -> pgshard.v1.DropDatabaseResponse
+	51, // [51:75] is the sub-list for method output_type
+	27, // [27:51] is the sub-list for method input_type
 	27, // [27:27] is the sub-list for extension type_name
 	27, // [27:27] is the sub-list for extension extendee
 	0,  // [0:27] is the sub-list for field type_name
@@ -3095,7 +3205,7 @@ func file_pgshard_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_agent_proto_rawDesc), len(file_pgshard_v1_agent_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   47,
+			NumMessages:   49,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

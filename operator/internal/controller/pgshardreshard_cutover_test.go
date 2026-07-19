@@ -254,6 +254,8 @@ var _ = Describe("PgShardReshard cutover", func() {
 			return get(name).Status.CutoverFrozenLSN != 0
 		})
 		Expect(uint64(get(name).Status.CutoverFrozenLSN)).To(Equal(barrier))
+		// The source database was fenced write-quiescent BEFORE the barrier.
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("chappy-src"))
 		journals := sourceAgent.EmittedJournals()
 		Expect(journals).To(HaveLen(1))
 		Expect(journals[0].GetId()).To(Equal(string(get(name).UID) + "-0"))

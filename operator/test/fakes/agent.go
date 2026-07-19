@@ -86,6 +86,7 @@ type FakeAgent struct {
 	// returned barrier position (default: the instance WAL write position).
 	emittedJournals []*pgshardv1.EmitJournalRequest
 	journalLsn      uint64
+	fencedDatabases map[string]bool
 
 	server   *grpc.Server
 	listener net.Listener
@@ -551,6 +552,33 @@ func (f *FakeAgent) SetWorkflowPhase(id string, phase pgshardv1.WorkflowPhase, e
 	}
 	f.workflowPhases[id] = phase
 	f.workflowErrors[id] = errMsg
+}
+
+// FenceWrites records the fenced database and returns a scriptable count.
+func (f *FakeAgent) FenceWrites(
+	_ context.Context, req *pgshardv1.FenceWritesRequest,
+) (*pgshardv1.FenceWritesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "FenceWrites")
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	if f.fencedDatabases == nil {
+		f.fencedDatabases = map[string]bool{}
+	}
+	f.fencedDatabases[req.GetDatabase()] = true
+	return &pgshardv1.FenceWritesResponse{}, nil
+}
+
+// FencedDatabases reports which databases FenceWrites was called on.
+func (f *FakeAgent) FencedDatabases() map[string]bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]bool, len(f.fencedDatabases))
+	maps.Copy(out, f.fencedDatabases)
+	return out
 }
 
 // EmitJournal mirrors the real agent's freeze barrier: pod-uid fence,

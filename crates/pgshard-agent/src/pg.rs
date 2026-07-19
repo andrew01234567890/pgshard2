@@ -292,6 +292,36 @@ impl Instance for PgInstance {
         Ok(parse_lsn(&lsn))
     }
 
+    async fn fence_writes(&self, database: &str) -> anyhow::Result<u32> {
+        let client = self.connect_to(database).await?;
+        // New sessions (including a router's post-termination reconnect)
+        // become read-only. This affects sessions established AFTER the ALTER,
+        // so the in-flight ones are drained next.
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {} SET default_transaction_read_only = on",
+                quote_ident(database)
+            ))
+            .await?;
+        // Terminate every client backend still inside a transaction on this
+        // database: a terminated write transaction rolls back, so it can
+        // never commit after the barrier. Replication walsenders
+        // (backend_type <> 'client backend') and this session are left alone.
+        let terminated: i64 = client
+            .query_one(
+                "SELECT count(pg_terminate_backend(pid))
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()
+                   AND backend_type = 'client backend'
+                   AND xact_start IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        Ok(terminated.max(0) as u32)
+    }
+
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
         let mut client = self.connect_to(database).await?;
         // TRANSACTIONAL message: it decodes inside a Commit, so it reaches
