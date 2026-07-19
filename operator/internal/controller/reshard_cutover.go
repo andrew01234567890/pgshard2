@@ -144,6 +144,14 @@ func (r *PgShardReshardReconciler) failCutover(
 				return res, err
 			}
 			reshard.Status.SourceFenced = false
+			// Persist SourceFenced=false BEFORE releasing the claim (the
+			// ownership token). Releasing while status still records a fence
+			// would let a crash-retry re-authorize un-fencing a source a
+			// replacement reshard may by then own; unfenceSource's live-claim
+			// check is the backstop, this ordering the first line of defense.
+			if err := r.Status().Update(ctx, reshard); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
 			return ctrl.Result{}, err
@@ -376,9 +384,25 @@ func (r *PgShardReshardReconciler) rollBackCutover(
 // unfenceSource restores the source database read-write after a rollback.
 // ok=false means it could not (hold and retry) — never proceed with a source
 // left read-only.
+//
+// Un-fencing is authorized ONLY by LIVE claim ownership, never by this
+// reshard's (possibly stale) status. If a crash released this reshard's claim
+// after it un-fenced but before its Failed/SourceFenced=false status persisted,
+// a replacement reshard may since have claimed, fenced, and COMMITTED this
+// source; un-fencing it from stale status would reopen writes past that
+// reshard's freeze barrier. So re-read the claim and fail closed: if this
+// reshard no longer holds it, leave the source fenced under its true owner and
+// report success so the caller stops trying to un-fence what is not its own.
 func (r *PgShardReshardReconciler) unfenceSource(
 	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard, source *pgshardv1alpha1.PgShardShard,
 ) (ctrl.Result, bool, error) {
+	var live pgshardv1alpha1.PgShardShard
+	if err := r.Get(ctx, client.ObjectKeyFromObject(source), &live); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if live.Annotations[cutoverClaimAnnotation] != reshard.Name {
+		return ctrl.Result{}, true, nil
+	}
 	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
 	if err != nil {
 		return ctrl.Result{}, false, err

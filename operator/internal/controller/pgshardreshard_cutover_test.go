@@ -27,6 +27,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		tgtIP    = "127.0.0.42"
 		barrier  = uint64(0x5000)
 		leaseSec = int32(1)
+		staleUID = "stale-cluster-uid"
 	)
 
 	get := func(name string) pgshardv1alpha1.PgShardReshard {
@@ -387,7 +388,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		// is already committed. It must fail WITHOUT un-fencing the source.
 		rs := get(name)
 		rs.Status.Phase = pgshardv1alpha1.ReshardCuttingOver
-		rs.Status.ClusterUID = "stale-cluster-uid"
+		rs.Status.ClusterUID = staleUID
 		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
 		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
@@ -438,7 +439,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		// reshard claim the still-serving source and later un-fence it, reopening
 		// writes past this reshard's freeze barrier.
 		rs := get(name)
-		rs.Status.ClusterUID = "stale-cluster-uid"
+		rs.Status.ClusterUID = staleUID
 		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
 		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
@@ -448,6 +449,48 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"a committed terminal failure must leave the source fenced")
 		Expect(getShard("cxo-src").Annotations).To(HaveKeyWithValue(cutoverClaimAnnotation, name),
 			"the claim is retained so no replacement reshard can claim and un-fence the committed source")
+	})
+
+	It("refuses to un-fence a source whose claim a replacement reshard now holds", func() {
+		sourceAgent, _, reconcile, routingReconcile, _ := cutoverSetup("so")
+		name := "rco-so"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		// A reaches an uncommitted, fenced state holding the claim.
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(get(name).Status.SwitchCommitted).To(BeFalse())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cso-src"))
+
+		// Simulate the crash window: A's claim was released and a replacement
+		// reshard B has since claimed the still-fenced source (and, off-screen,
+		// committed its own switch). A's PERSISTED status still says
+		// SourceFenced=true / CuttingOver.
+		src := getShard("cso-src")
+		src.Annotations[cutoverClaimAnnotation] = "rco-replacement-b"
+		Expect(k8sClient.Update(ctx, &src)).To(Succeed())
+
+		// Trip A's terminal path (stale ClusterUID -> ClusterReplaced ->
+		// failCutover, uncommitted). A must NOT un-fence B's source: the live
+		// claim is no longer A's.
+		rs := get(name)
+		rs.Status.ClusterUID = staleUID
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cso-src"),
+			"A must not un-fence a source whose claim a replacement reshard now holds")
+		Expect(getShard("cso-src").Annotations).To(HaveKeyWithValue(cutoverClaimAnnotation, "rco-replacement-b"),
+			"A must not disturb the replacement reshard's claim")
 	})
 
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
