@@ -102,6 +102,8 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileProvisioningTargets(ctx, &reshard)
 	case pgshardv1alpha1.ReshardSeeding:
 		result, err = r.reconcileSeeding(ctx, &reshard)
+	case pgshardv1alpha1.ReshardCatchingUp:
+		result, err = r.reconcileCatchingUp(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}

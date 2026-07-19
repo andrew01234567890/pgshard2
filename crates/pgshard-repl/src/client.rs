@@ -288,11 +288,15 @@ impl ReplicationClient {
     /// snapshot followed by a stream from the slot has no gap or overlap at the
     /// seam. The snapshot stays valid only while this connection is idle, so run
     /// the copy before issuing any further command (including `START_REPLICATION`).
+    /// Returns the exported snapshot name and the slot's CONSISTENT POINT:
+    /// the LSN at which the snapshot and the stream meet — everything at or
+    /// before it is in the snapshot copy, everything after arrives on the
+    /// stream. It is therefore the stream's initial applied watermark.
     pub async fn create_logical_slot_exported(
         &mut self,
         name: &str,
         temporary: bool,
-    ) -> Result<String> {
+    ) -> Result<(String, Lsn)> {
         if !is_safe_ident(name) {
             return Err(ClientError::Malformed(format!(
                 "unsafe replication slot name {name:?}"
@@ -306,18 +310,18 @@ impl ReplicationClient {
             )
         };
         self.send_query(&sql).await?;
-        let mut snapshot = None;
+        let mut row = None;
         loop {
             let (tag, mut body) = self.read_control().await?;
             match tag {
-                b'D' => snapshot = Some(snapshot_name_from_row(&mut body)?),
+                b'D' => row = Some(slot_row(&mut body)?),
                 b'T' | b'C' | b'S' => continue,
                 b'Z' => break,
                 b'E' => return Err(server_error(&body)),
                 other => return Err(ClientError::Unexpected(other)),
             }
         }
-        snapshot.ok_or_else(|| {
+        row.ok_or_else(|| {
             ClientError::Malformed("CREATE_REPLICATION_SLOT returned no snapshot".to_owned())
         })
     }
@@ -502,7 +506,8 @@ fn read_i32(body: &mut BytesMut) -> Result<i32> {
 
 /// Extract the `snapshot_name` (third field) from a CREATE_REPLICATION_SLOT
 /// DataRow: (slot_name, consistent_point, snapshot_name, output_plugin).
-fn snapshot_name_from_row(body: &mut BytesMut) -> Result<String> {
+fn slot_row(body: &mut BytesMut) -> Result<(String, Lsn)> {
+    const CONSISTENT_FIELD: u16 = 1;
     const SNAPSHOT_FIELD: u16 = 2;
     if body.remaining() < 2 {
         return Err(ClientError::Malformed("short slot DataRow".to_owned()));
@@ -513,6 +518,8 @@ fn snapshot_name_from_row(body: &mut BytesMut) -> Result<String> {
             "CREATE_REPLICATION_SLOT row has too few fields".to_owned(),
         ));
     }
+    let mut consistent = None;
+    let mut snapshot = None;
     for i in 0..fields {
         if body.remaining() < 4 {
             return Err(ClientError::Malformed(
@@ -521,8 +528,10 @@ fn snapshot_name_from_row(body: &mut BytesMut) -> Result<String> {
         }
         let len = body.get_i32();
         if len < 0 {
-            if i == SNAPSHOT_FIELD {
-                return Err(ClientError::Malformed("snapshot name is null".to_owned()));
+            if i == CONSISTENT_FIELD || i == SNAPSHOT_FIELD {
+                return Err(ClientError::Malformed(
+                    "null consistent point or snapshot name".to_owned(),
+                ));
             }
             continue;
         }
@@ -532,16 +541,27 @@ fn snapshot_name_from_row(body: &mut BytesMut) -> Result<String> {
                 "truncated slot DataRow value".to_owned(),
             ));
         }
-        if i == SNAPSHOT_FIELD {
+        if i == CONSISTENT_FIELD || i == SNAPSHOT_FIELD {
             let bytes = body.copy_to_bytes(len);
-            return String::from_utf8(bytes.to_vec())
-                .map_err(|_| ClientError::Malformed("snapshot name not UTF-8".to_owned()));
+            let text = String::from_utf8(bytes.to_vec())
+                .map_err(|_| ClientError::Malformed("slot DataRow value not UTF-8".to_owned()))?;
+            if i == CONSISTENT_FIELD {
+                consistent = Some(text.parse::<Lsn>().map_err(|_| {
+                    ClientError::Malformed(format!("unparseable consistent point {text:?}"))
+                })?);
+            } else {
+                snapshot = Some(text);
+            }
+        } else {
+            body.advance(len);
         }
-        body.advance(len);
     }
-    Err(ClientError::Malformed(
-        "no snapshot field in slot DataRow".to_owned(),
-    ))
+    match (snapshot, consistent) {
+        (Some(s), Some(c)) => Ok((s, c)),
+        _ => Err(ClientError::Malformed(
+            "no snapshot or consistent-point field in slot DataRow".to_owned(),
+        )),
+    }
 }
 
 /// The NUL-terminated mechanism names in an `AuthenticationSASL` body.
