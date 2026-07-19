@@ -2275,8 +2275,15 @@ func (x *ShardStreamResponse) GetEvents() []*VEvent {
 }
 
 type DropSlotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Slot          string                 `protobuf:"bytes,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The pgshard_-prefixed logical replication slot to drop on THIS instance.
+	// The drop is refused unless the slot is inactive (no consumer holds it),
+	// uses the pgoutput plugin, and belongs to `database` — so a mis-addressed
+	// request can never drop a physical slot or another workflow's live slot.
+	Slot string `protobuf:"bytes,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	// The database the slot must belong to (a logical slot is database-scoped).
+	Database      string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	TargetPodUid  string `protobuf:"bytes,3,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2314,6 +2321,20 @@ func (*DropSlotRequest) Descriptor() ([]byte, []int) {
 func (x *DropSlotRequest) GetSlot() string {
 	if x != nil {
 		return x.Slot
+	}
+	return ""
+}
+
+func (x *DropSlotRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *DropSlotRequest) GetTargetPodUid() string {
+	if x != nil {
+		return x.TargetPodUid
 	}
 	return ""
 }
@@ -2958,9 +2979,11 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06tables\x18\x04 \x03(\v2\x14.pgshard.v1.TableRefR\x06tables\x12=\n" +
 	"\rsource_policy\x18\x05 \x01(\x0e2\x18.pgshard.v1.SourcePolicyR\fsourcePolicy\"A\n" +
 	"\x13ShardStreamResponse\x12*\n" +
-	"\x06events\x18\x01 \x03(\v2\x12.pgshard.v1.VEventR\x06events\"%\n" +
+	"\x06events\x18\x01 \x03(\v2\x12.pgshard.v1.VEventR\x06events\"g\n" +
 	"\x0fDropSlotRequest\x12\x12\n" +
-	"\x04slot\x18\x01 \x01(\tR\x04slot\"\x12\n" +
+	"\x04slot\x18\x01 \x01(\tR\x04slot\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12$\n" +
+	"\x0etarget_pod_uid\x18\x03 \x01(\tR\ftargetPodUid\"\x12\n" +
 	"\x10DropSlotResponse\"\x9d\x01\n" +
 	"\x15CreateDatabaseRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +

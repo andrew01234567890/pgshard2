@@ -15,7 +15,7 @@ use pgshard_proto::v1;
 use v1::agent_service_server::AgentService;
 
 use crate::epoch::{EpochError, EpochGuard, Outcome};
-use crate::instance::{ForeignDatabase, Instance, RestorePoint};
+use crate::instance::{ForeignDatabase, Instance, RestorePoint, SlotActive};
 use crate::schema::{Claim, SchemaError, SchemaLog};
 use crate::status::to_status;
 use crate::workflow::{WorkflowConfig, WorkflowError, WorkflowRegistry};
@@ -651,9 +651,35 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     }
     async fn drop_slot(
         &self,
-        _r: Request<v1::DropSlotRequest>,
+        request: Request<v1::DropSlotRequest>,
     ) -> Result<Response<v1::DropSlotResponse>, Status> {
-        Err(Status::unimplemented("drop_slot"))
+        let req = request.into_inner();
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        check_ident("database", &req.database, true)?;
+        // The pgshard_ prefix reserves the slot namespace: the drop names a slot
+        // by string, so it must never be able to name an application's slot.
+        if !req.slot.starts_with("pgshard_") {
+            return Err(Status::invalid_argument(
+                "slot must carry the pgshard_ prefix",
+            ));
+        }
+        match self.instance.drop_slot(&req.database, &req.slot).await {
+            Ok(()) => Ok(Response::new(v1::DropSlotResponse {})),
+            Err(e) if e.downcast_ref::<SlotActive>().is_some() => {
+                // The stopped consumer's walsender is not yet reaped; the caller
+                // retries. Never yank a slot a consumer still holds.
+                Err(Status::failed_precondition(e.to_string()))
+            }
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
     }
     /// `req.sql` must be a single statement. The operator parses and guarantees
     /// this; the agent has no parser. Idempotent retry is only safe for a single
@@ -1036,6 +1062,45 @@ mod tests {
         let status = st.into_inner().status.unwrap();
         assert!(status.fenced);
         assert!(!status.ready, "a fenced instance is not ready");
+    }
+
+    #[tokio::test]
+    async fn drop_slot_requires_pgshard_prefix_and_honors_pod_uid() {
+        let s = AgentSvc::new(Arc::new(FakeInstance::primary()), "pod-0".into());
+        // A non-pgshard slot name is refused before it can reach the instance.
+        let err = s
+            .drop_slot(Request::new(v1::DropSlotRequest {
+                slot: "app_slot".into(),
+                database: "shard".into(),
+                target_pod_uid: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // A well-formed request drops the slot.
+        s.drop_slot(Request::new(v1::DropSlotRequest {
+            slot: "pgshard_wf_t0".into(),
+            database: "shard".into(),
+            target_pod_uid: String::new(),
+        }))
+        .await
+        .unwrap();
+
+        // A request naming another pod uid is fenced (ABORTED), never applied.
+        let fenced = AgentSvc::with_pod_uid(
+            Arc::new(FakeInstance::primary()),
+            "pod-0".into(),
+            "uid-a".into(),
+        );
+        let err = fenced
+            .drop_slot(Request::new(v1::DropSlotRequest {
+                slot: "pgshard_wf_t0".into(),
+                database: "shard".into(),
+                target_pod_uid: "uid-b".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
     }
 
     #[tokio::test]

@@ -755,12 +755,19 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(getShard("cfin-src").Spec.Serving).To(BeFalse())
 		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cfin-src"))
 		// Every target's forward workflow was stopped WITHOUT drop_slot (the
-		// source-side slot drop is the source agent's DropSlot RPC, deferred to
-		// the source-decommission slice).
+		// slot lives on the source and is dropped by the source's DropSlot RPC).
 		stopped := targetAgent.StoppedWorkflows()
 		Expect(stopped).NotTo(BeEmpty())
 		for _, s := range stopped {
 			Expect(s.GetDropSlot()).To(BeFalse())
+		}
+		// Each target's forward slot was dropped on the source so no inactive
+		// slot retains WAL on the retained (shared-instance) source.
+		dropped := sourceAgent.DroppedSlots()
+		Expect(dropped).To(HaveLen(len(targets)))
+		for _, d := range dropped {
+			Expect(d.GetDatabase()).To(Equal("cfin-src"))
+			Expect(d.GetSlot()).To(HavePrefix("pgshard_"))
 		}
 		// The cutover cleanup finalizer is released; the source claim is dropped.
 		Expect(get(name).Finalizers).NotTo(ContainElement(cutoverClaimFinalizer))

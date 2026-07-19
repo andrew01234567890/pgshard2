@@ -255,7 +255,14 @@ message ShardStreamResponse {
 }
 
 message DropSlotRequest {
+  // The pgshard_-prefixed logical replication slot to drop on THIS instance.
+  // The drop is refused unless the slot is inactive (no consumer holds it),
+  // uses the pgoutput plugin, and belongs to `database` — so a mis-addressed
+  // request can never drop a physical slot or another workflow's live slot.
   string slot = 1;
+  // The database the slot must belong to (a logical slot is database-scoped).
+  string database = 2;
+  string target_pod_uid = 3;
 }
 
 message DropSlotResponse {}

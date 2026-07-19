@@ -77,6 +77,11 @@ func (r *PgShardReshardReconciler) reparentTargets(
 	reshard *pgshardv1alpha1.PgShardReshard,
 	cluster *pgshardv1alpha1.PgShardCluster,
 ) (ctrl.Result, bool, error) {
+	// Reshard targets follow the CLUSTER's placement (see reshard_targets.go).
+	// Deciding by placement — not by whether a node happens to share the target
+	// name — avoids a coincidental same-named foreign node wedging completion.
+	placement, _ := placementOf(cluster)
+	dedicated := placement != pgshardv1alpha1.PlacementShared
 	changed := false
 	for _, tr := range reshard.Spec.TargetRanges {
 		name := shardName(cluster.Name, tr.Start, tr.End)
@@ -113,15 +118,17 @@ func (r *PgShardReshardReconciler) reparentTargets(
 		// mounts its config map; both must survive GC. A shared-placement target
 		// has no per-target node — its data lives on the cluster's shared node —
 		// so its per-target config map is vestigial.
-		var node pgshardv1alpha1.PgShardNode
-		switch getErr := r.Get(ctx,
-			client.ObjectKey{Namespace: reshard.Namespace, Name: name}, &node); {
-		case apierrors.IsNotFound(getErr):
-			// Shared placement: best-effort re-parent of a vestigial config map.
-			did, res, ok, err = r.reparentConfigMap(ctx, reshard, cluster, name, true)
-		case getErr != nil:
-			return ctrl.Result{}, false, getErr
-		default:
+		if dedicated {
+			var node pgshardv1alpha1.PgShardNode
+			if getErr := r.Get(ctx,
+				client.ObjectKey{Namespace: reshard.Namespace, Name: name}, &node); getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					res, _ := r.holdFinalize(reshard, "TargetNodeMissing",
+						fmt.Sprintf("dedicated node for target %q not found", name))
+					return res, false, nil
+				}
+				return ctrl.Result{}, false, getErr
+			}
 			did, res, ok, err = r.reparentOne(ctx, reshard, cluster, &node, name)
 			if err != nil || !ok {
 				return res, false, err
@@ -129,6 +136,9 @@ func (r *PgShardReshardReconciler) reparentTargets(
 			changed = changed || did
 			// A dedicated node's config map is load-bearing: require it.
 			did, res, ok, err = r.reparentConfigMap(ctx, reshard, cluster, name, false)
+		} else {
+			// Shared placement: best-effort re-parent of a vestigial config map.
+			did, res, ok, err = r.reparentConfigMap(ctx, reshard, cluster, name, true)
 		}
 		if err != nil || !ok {
 			return res, false, err
@@ -213,6 +223,17 @@ func (r *PgShardReshardReconciler) reparentOne(
 func (r *PgShardReshardReconciler) reconcileFinalizing(
 	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
 ) (ctrl.Result, error) {
+	// Resolve the source's verified primary once: the forward replication slots
+	// live on the SOURCE, and the source agent's DropSlot drops them (StopWorkflow
+	// on the target only stops the apply — the design routes slot cleanup to the
+	// source). Dropping them is REQUIRED: on shared placement the fenced source
+	// and the live targets share one PostgreSQL instance, so an inactive source
+	// slot retains the targets' WAL forever.
+	source, sourceAgent, sourceDB, sourcePodUID, res, ok, err := r.finalizeSource(ctx, reshard)
+	if err != nil || !ok {
+		return res, err
+	}
+
 	for i, tr := range reshard.Spec.TargetRanges {
 		name := shardName(reshard.Spec.ClusterRef, tr.Start, tr.End)
 		var target pgshardv1alpha1.PgShardShard
@@ -236,17 +257,27 @@ func (r *PgShardReshardReconciler) reconcileFinalizing(
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		slot := seedWorkflowID(reshard, i)
 		if _, err := agent.StopWorkflow(ctx, &pgshardv1.StopWorkflowRequest{
-			Id: seedWorkflowID(reshard, i),
-		}); err != nil {
-			if grpcstatus.Code(err) == codes.NotFound {
-				continue
-			}
+			Id: slot,
+		}); err != nil && grpcstatus.Code(err) != codes.NotFound {
 			return r.holdFinalize(reshard, "StopWorkflowFailed", err.Error())
+		}
+		// Drop the now-inactive slot on the source. FailedPrecondition means the
+		// stopped consumer's walsender is not yet reaped — hold and retry, never
+		// yanking a live slot.
+		if sourceAgent != nil {
+			if _, err := sourceAgent.DropSlot(ctx, &pgshardv1.DropSlotRequest{
+				Slot:         slot,
+				Database:     sourceDB,
+				TargetPodUid: sourcePodUID,
+			}); err != nil {
+				return r.holdFinalize(reshard, "DropSlotPending", err.Error())
+			}
 		}
 	}
 
-	if source := r.sourceForCleanup(ctx, reshard); source != nil {
+	if source != nil {
 		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -261,6 +292,39 @@ func (r *PgShardReshardReconciler) reconcileFinalizing(
 	setReshardCondition(reshard, reshardFinalizedCondition, metav1.ConditionTrue,
 		"Completed", "targets serve and are owned by the cluster; the source is retained fenced")
 	return ctrl.Result{}, nil
+}
+
+// finalizeSource resolves the retained source shard and its verified primary
+// agent so the forward slots can be dropped on it. A source shard that no
+// longer exists yields a nil agent (nothing to drop); an unverified primary
+// holds (ok=false) so finalization never completes with slots un-dropped while
+// the source is reachable-soon.
+func (r *PgShardReshardReconciler) finalizeSource(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (source *pgshardv1alpha1.PgShardShard, agent pgshardv1.AgentServiceClient,
+	database, podUID string, res ctrl.Result, ok bool, err error) {
+	var src pgshardv1alpha1.PgShardShard
+	switch getErr := r.Get(ctx,
+		client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.SourceShard}, &src); {
+	case apierrors.IsNotFound(getErr):
+		return nil, nil, "", "", ctrl.Result{}, true, nil
+	case getErr != nil:
+		return nil, nil, "", "", ctrl.Result{}, false, getErr
+	}
+	sourcePod, sourceNode, epErr := r.primaryEndpoint(ctx, reshard.Namespace, src.Spec.NodeRef)
+	if epErr != nil {
+		return nil, nil, "", "", ctrl.Result{}, false, epErr
+	}
+	if sourcePod == nil || !databaseVerified(&src, sourceNode, sourcePod) {
+		hold, _ := r.holdFinalize(reshard, "SourceUnverified",
+			"cannot reach the source's verified primary to drop its slots")
+		return nil, nil, "", "", hold, false, nil
+	}
+	cli, cliErr := r.agentClient(sourcePod.Status.PodIP)
+	if cliErr != nil {
+		return nil, nil, "", "", ctrl.Result{}, false, cliErr
+	}
+	return &src, cli, shardDatabaseName(&src), string(sourcePod.UID), ctrl.Result{}, true, nil
 }
 
 func (r *PgShardReshardReconciler) holdFinalize(

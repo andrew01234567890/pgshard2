@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use tokio_postgres::NoTls;
 use tokio_postgres::error::SqlState;
 
-use crate::instance::{ForeignDatabase, Instance, RestorePoint, Snapshot, provenance_marker};
+use crate::instance::{
+    ForeignDatabase, Instance, RestorePoint, SlotActive, Snapshot, provenance_marker,
+};
 
 pub struct PgInstance {
     conn_string: String,
@@ -442,6 +444,38 @@ impl Instance for PgInstance {
             ))
             .await?;
         Ok(terminated)
+    }
+
+    async fn drop_slot(&self, database: &str, slot: &str) -> anyhow::Result<()> {
+        let client = self.connect_to(database).await?;
+        // Only an INACTIVE pgoutput slot on THIS database is ours to drop. An
+        // active slot (a consumer's walsender still attached) is refused with a
+        // distinct error so the caller retries after the walsender is reaped —
+        // never yanking a live slot. A physical slot (NULL plugin/database) or a
+        // slot on another database is never touched. A missing slot is a no-op.
+        let row = client
+            .query_opt(
+                "SELECT active, plugin, database
+                   FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let (active, plugin, slot_db): (bool, Option<String>, Option<String>) =
+            (row.get(0), row.get(1), row.get(2));
+        if active {
+            return Err(SlotActive(slot.to_owned()).into());
+        }
+        anyhow::ensure!(
+            plugin.as_deref() == Some("pgoutput") && slot_db.as_deref() == Some(database),
+            "slot {slot} belongs to plugin {plugin:?} on database {slot_db:?}, not database {database}: refusing to drop it"
+        );
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await?;
+        Ok(())
     }
 
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
