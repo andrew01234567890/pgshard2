@@ -61,7 +61,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		node.Status.Phase = pgshardv1alpha1.NodeReady
 		node.Status.CurrentPrimary = podName
 		node.Status.Instances = []pgshardv1alpha1.InstanceState{
-			{Pod: podName, Ready: true, Role: "primary"},
+			{Pod: podName, Ready: true, Role: roleLabelPrimary},
 		}
 		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
@@ -86,7 +86,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		s.Status.DatabasePodUID = string(pod.UID)
 		apimeta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
 			Type: shardDatabaseReadyCondition, Status: metav1.ConditionTrue,
-			Reason: "Provisioned", Message: "test",
+			Reason: testProvisionedReason, Message: testProvisionedReason,
 		})
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 	}

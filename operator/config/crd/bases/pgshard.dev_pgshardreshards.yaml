@@ -179,6 +179,13 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              cutoverFrozenLSN:
+                description: |-
+                  CutoverFrozenLSN is the freeze barrier: the journal message's WAL
+                  position emitted in the source database after quiescence. Every target
+                  workflow must acknowledge (journal_lsn >=) it before the switch.
+                format: int64
+                type: integer
               cutoverGateDeadline:
                 description: |-
                   CutoverGateDeadline asks the routing compiler to gate the SOURCE
@@ -187,6 +194,13 @@ spec:
                   epoch stop renewing their write lease, so writes quiesce by lease
                   expiry. The cutover machine clears it only after the switched serving
                   set has been observed compiled into routing.
+                format: date-time
+                type: string
+              cutoverGateObservedAt:
+                description: |-
+                  CutoverGateObservedAt records when the controller first OBSERVED its
+                  gate published in PgShardRouting; the quiesce wait (write-lease expiry)
+                  counts from here.
                 format: date-time
                 type: string
               observedGeneration:

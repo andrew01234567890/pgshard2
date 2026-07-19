@@ -55,14 +55,14 @@ type PgShardReshardReconciler struct {
 	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
 }
 
-func (r *PgShardReshardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+func (r *PgShardReshardReconciler) agentClient(host string) (pgshardv1.AgentServiceClient, error) {
 	if r.dialAgent != nil {
-		return r.dialAgent(host, port)
+		return r.dialAgent(host, agentPort)
 	}
 	if r.Agents == nil {
 		return nil, fmt.Errorf("no agent pool configured")
 	}
-	return r.Agents.Get(host, port)
+	return r.Agents.Get(host, agentPort)
 }
 
 // The condition that records whether the requested split is well-formed.
@@ -104,6 +104,10 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileSeeding(ctx, &reshard)
 	case pgshardv1alpha1.ReshardCatchingUp:
 		result, err = r.reconcileCatchingUp(ctx, &reshard)
+	case pgshardv1alpha1.ReshardReadyToCutover:
+		result, err = r.reconcileReadyToCutover(ctx, &reshard)
+	case pgshardv1alpha1.ReshardCuttingOver:
+		result, err = r.reconcileCuttingOver(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}

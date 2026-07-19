@@ -140,6 +140,18 @@ type PgShardReshardStatus struct {
 	// +optional
 	CutoverGateDeadline *metav1.Time `json:"cutoverGateDeadline,omitempty"`
 
+	// CutoverGateObservedAt records when the controller first OBSERVED its
+	// gate published in PgShardRouting; the quiesce wait (write-lease expiry)
+	// counts from here.
+	// +optional
+	CutoverGateObservedAt *metav1.Time `json:"cutoverGateObservedAt,omitempty"`
+
+	// CutoverFrozenLSN is the freeze barrier: the journal message's WAL
+	// position emitted in the source database after quiescence. Every target
+	// workflow must acknowledge (journal_lsn >=) it before the switch.
+	// +optional
+	CutoverFrozenLSN int64 `json:"cutoverFrozenLSN,omitempty"`
+
 	// SwitchCommitted is the cutover's point of no return, persisted BEFORE
 	// the serving flip and BEFORE the gate is withdrawn. The routing
 	// compiler refuses to publish UNGATED routing while a committed switch's

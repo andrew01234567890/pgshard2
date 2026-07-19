@@ -131,7 +131,6 @@ var _ = Describe("API validation", func() {
 	})
 
 	It("validates table config identifiers and required fields", func() {
-		const ordersTable = "orders"
 		tc := func(name string, tables []pgshardv1alpha1.TableEntry) *pgshardv1alpha1.PgShardTableConfig {
 			return &pgshardv1alpha1.PgShardTableConfig{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: valNamespace},
@@ -259,7 +258,7 @@ var _ = Describe("API validation", func() {
 				Primary: &pgshardv1alpha1.RoutingEndpoint{Pod: "p0", Host: "10.0.0.1"},
 			}},
 			Tables: []pgshardv1alpha1.RoutingTable{{
-				Schema: "public", Name: "orders",
+				Schema: "public", Name: ordersTable,
 				Type: pgshardv1alpha1.TableSharded, ShardKeyColumn: customerIDCol,
 			}},
 		})
