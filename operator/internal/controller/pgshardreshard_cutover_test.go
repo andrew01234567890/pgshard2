@@ -256,7 +256,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(uint64(get(name).Status.CutoverFrozenLSN)).To(Equal(barrier))
 		journals := sourceAgent.EmittedJournals()
 		Expect(journals).To(HaveLen(1))
-		Expect(journals[0].GetId()).To(Equal(string(get(name).UID)))
+		Expect(journals[0].GetId()).To(Equal(string(get(name).UID) + "-0"))
 		Expect(journals[0].GetJournal().GetSuccessors()).To(HaveLen(2))
 
 		// The switch must NOT commit before every target acks the barrier.
@@ -306,6 +306,8 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(rs.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
 		Expect(rs.Status.CutoverGateDeadline).To(BeNil())
 		Expect(rs.Status.SwitchCommitted).To(BeFalse())
+		Expect(rs.Status.CutoverAttempt).To(Equal(int64(1)),
+			"a rollback opens a NEW attempt so the next freeze cannot replay the old barrier")
 		Expect(getShard("croll-src").Spec.Serving).To(BeTrue(),
 			"an uncommitted rollback must leave the source serving")
 		routingReconcile()

@@ -179,6 +179,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              cutoverAttempt:
+                description: |-
+                  CutoverAttempt counts cutover attempts; a rollback increments it. The
+                  freeze's journal id embeds it, so a RETRIED cutover can never replay a
+                  previous attempt's barrier — workflows already acknowledged past the
+                  old position, and committing against it would skip proving the NEW
+                  quiesce point was decoded.
+                format: int64
+                type: integer
               cutoverFrozenLSN:
                 description: |-
                   CutoverFrozenLSN is the freeze barrier: the journal message's WAL

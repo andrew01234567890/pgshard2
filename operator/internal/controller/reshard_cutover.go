@@ -100,6 +100,11 @@ func (r *PgShardReshardReconciler) reconcileCuttingOver(
 		reshard.Status.CutoverGateDeadline = nil
 		reshard.Status.CutoverGateObservedAt = nil
 		reshard.Status.CutoverFrozenLSN = 0
+		// A retry is a NEW attempt: its freeze must emit a FRESH barrier.
+		// Replaying this attempt's journal id would hand back a position the
+		// workflows already acknowledged, committing the next cutover
+		// without proving its own quiesce point was decoded.
+		reshard.Status.CutoverAttempt++
 		reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
 		setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
 			"RolledBack", "the cutover gate deadline expired before the switch committed; retrying from CatchingUp")
@@ -219,9 +224,10 @@ func (r *PgShardReshardReconciler) freezeSource(
 			Successors:  successors,
 		},
 		Database: shardDatabaseName(source),
-		// The reshard UID is stable and unique: a retried freeze replays
-		// the recorded barrier; a poisoned or mismatched id fails loudly.
-		Id:           string(reshard.UID),
+		// UID + attempt: a retried freeze WITHIN one attempt replays the
+		// recorded barrier (idempotent), while a new attempt after rollback
+		// emits a fresh one; a poisoned or mismatched id fails loudly.
+		Id:           fmt.Sprintf("%s-%d", reshard.UID, reshard.Status.CutoverAttempt),
 		TargetPodUid: string(sourcePod.UID),
 	})
 	if err != nil {

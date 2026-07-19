@@ -146,6 +146,14 @@ type PgShardReshardStatus struct {
 	// +optional
 	CutoverGateObservedAt *metav1.Time `json:"cutoverGateObservedAt,omitempty"`
 
+	// CutoverAttempt counts cutover attempts; a rollback increments it. The
+	// freeze's journal id embeds it, so a RETRIED cutover can never replay a
+	// previous attempt's barrier — workflows already acknowledged past the
+	// old position, and committing against it would skip proving the NEW
+	// quiesce point was decoded.
+	// +optional
+	CutoverAttempt int64 `json:"cutoverAttempt,omitempty"`
+
 	// CutoverFrozenLSN is the freeze barrier: the journal message's WAL
 	// position emitted in the source database after quiescence. Every target
 	// workflow must acknowledge (journal_lsn >=) it before the switch.
