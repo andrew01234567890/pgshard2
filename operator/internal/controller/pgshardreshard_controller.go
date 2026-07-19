@@ -157,6 +157,27 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 		return ctrl.Result{}, nil
 	}
 
+	// Only a SERVING shard owns authoritative data: a hidden shard (another
+	// reshard's still-seeding target) holds an incomplete copy, and seeding
+	// from it would replicate that incompleteness into the new targets.
+	if !source.Spec.Serving {
+		r.fail(reshard, reshardValidatedCondition, "SourceNotServing",
+			fmt.Sprintf("source shard %q is not serving; its data is not authoritative", source.Name))
+		return ctrl.Result{}, nil
+	}
+
+	var cluster pgshardv1alpha1.PgShardCluster
+	clusterKey := client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}
+	if err := r.Get(ctx, clusterKey, &cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			reshard.Status.Phase = pgshardv1alpha1.ReshardValidating
+			setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionFalse,
+				"ClusterNotFound", fmt.Sprintf("cluster %q not found yet", reshard.Spec.ClusterRef))
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
 	sourceRange, err := toRange(source.Spec.KeyRange)
 	if err != nil {
 		r.fail(reshard, reshardValidatedCondition, "InvalidSourceRange",
@@ -185,9 +206,11 @@ func (r *PgShardReshardReconciler) reconcileValidating(
 	// status only, which does not bump the generation, so the watch's
 	// GenerationChangedPredicate would otherwise drop the self-update event and
 	// the reshard would stall here until the operator restarts.
-	// Pin the exact objects this validation ran against: a same-named
-	// replacement is a different placement whose data was never validated.
+	// Pin the exact objects this validation ran against — ONCE, here: a
+	// same-named replacement of either is a different placement whose data
+	// and configuration were never validated. Later phases only verify.
 	reshard.Status.SourceShardUID = string(source.UID)
+	reshard.Status.ClusterUID = string(cluster.UID)
 	reshard.Status.Phase = pgshardv1alpha1.ReshardProvisioningTargets
 	setReshardCondition(reshard, reshardValidatedCondition, metav1.ConditionTrue, "PartitionValid",
 		"target ranges partition the source shard's key range")

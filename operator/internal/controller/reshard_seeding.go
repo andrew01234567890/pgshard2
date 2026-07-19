@@ -50,8 +50,22 @@ const seedSuffixReserve = len("_t128")
 
 // seedPublication is the publication PrepareSource provisions on the source
 // shard for a reshard; every target workflow consumes it.
+// The reshard UID makes the name collision-resistant: seedIdent is lossy
+// ("a.b" and "a-b" both map to "a_b"), and a collision would let one
+// reshard's conflict path stop ANOTHER reshard's healthy workflows. The name
+// part is truncated so the publication plus the longest slot suffix always
+// fits PostgreSQL's 63-byte identifier limit.
 func seedPublication(reshard *pgshardv1alpha1.PgShardReshard) string {
-	return "pgshard_" + seedIdent(reshard.Name)
+	uid := seedIdent(string(reshard.UID))
+	if len(uid) > 8 {
+		uid = uid[:8]
+	}
+	name := seedIdent(reshard.Name)
+	maxName := maxDatabaseNameBytes - len("pgshard_") - 1 - len(uid) - seedSuffixReserve
+	if len(name) > maxName {
+		name = name[:maxName]
+	}
+	return fmt.Sprintf("pgshard_%s_%s", name, uid)
 }
 
 // seedWorkflowID names the target's workflow AND its replication slot: the
@@ -133,10 +147,16 @@ func (r *PgShardReshardReconciler) shardedTables(
 		}
 	}
 	slices.SortFunc(tables, func(a, b pgshardv1alpha1.TableEntry) int {
-		if a.Schema != b.Schema {
-			return strings.Compare(a.Schema, b.Schema)
+		if c := strings.Compare(a.Schema, b.Schema); c != 0 {
+			return c
 		}
-		return strings.Compare(a.Name, b.Name)
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.ShardKeyColumn, b.ShardKeyColumn); c != 0 {
+			return c
+		}
+		return strings.Compare(string(a.ShardKeyType), string(b.ShardKeyType))
 	})
 	return tables, nil
 }
@@ -231,32 +251,6 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 		return ctrl.Result{}, nil
 	}
 
-	// Pin the sharded-table schema ONCE, then build every workflow spec from
-	// the pinned copy: live PgShardTableConfig edits mid-seed would change
-	// the copied table set or filter identity under running workflows.
-	live, err := r.shardedTables(ctx, reshard.Namespace, cluster.Name)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !reshard.Status.SeedTablesPinned {
-		reshard.Status.SeedTables = pinTables(live)
-		reshard.Status.SeedTablesPinned = true
-	}
-	tables := unpinTables(reshard.Status.SeedTables)
-	if drift := tablesDiffer(reshard.Status.SeedTables, live); drift != "" {
-		// The workflows keep streaming the PINNED schema; advancing while
-		// the desired schema moved would cut over an incomplete seed. A
-		// mid-reshard schema change needs the reshard restarted.
-		return r.hold(reshard, "SchemaDrift", drift)
-	}
-	if len(tables) == 0 {
-		// Nothing to copy or stream; the targets are trivially caught up.
-		setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionTrue,
-			"NothingToSeed", "the cluster has no sharded tables")
-		reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	// Resolve the SOURCE: shard -> node -> verified primary pod.
 	var source pgshardv1alpha1.PgShardShard
 	sourceKey := client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.SourceShard}
@@ -275,6 +269,51 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 			fmt.Sprintf("source shard %q is not the object this reshard was validated against", source.Name))
 		return ctrl.Result{}, nil
 	}
+	// The target list is DERIVED from the immutable spec, never trusted from
+	// mutable status: a tampered status.targetShards entry would aim a
+	// truncating workflow at a foreign database. Status must agree exactly.
+	expected := make([]string, 0, len(reshard.Spec.TargetRanges))
+	for _, tr := range reshard.Spec.TargetRanges {
+		expected = append(expected, shardName(cluster.Name, tr.Start, tr.End))
+	}
+	if !slices.Equal(reshard.Status.TargetShards, expected) {
+		r.fail(reshard, reshardSeededCondition, "TargetListMismatch",
+			fmt.Sprintf("status.targetShards %v does not match the spec-derived targets %v",
+				reshard.Status.TargetShards, expected))
+		return ctrl.Result{}, nil
+	}
+
+	// Pin the sharded-table schema ONCE — and PERSIST the pin (requeue)
+	// before any RPC side effect, so a crash between the pin and the status
+	// write can never let a later reconcile re-pin edited configs after
+	// workflows already started under the old schema. Specs build only from
+	// the pinned copy.
+	live, err := r.shardedTables(ctx, reshard.Namespace, cluster.Name)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !reshard.Status.SeedTablesPinned {
+		reshard.Status.SeedTables = pinTables(live)
+		reshard.Status.SeedTablesPinned = true
+		setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionFalse,
+			"SchemaPinned", fmt.Sprintf("pinned %d sharded tables; starting workflows", len(live)))
+		return ctrl.Result{Requeue: true}, nil
+	}
+	tables := unpinTables(reshard.Status.SeedTables)
+	if drift := tablesDiffer(reshard.Status.SeedTables, live); drift != "" {
+		// The workflows keep streaming the PINNED schema; advancing while
+		// the desired schema moved would cut over an incomplete seed. A
+		// mid-reshard schema change needs the reshard restarted.
+		return r.hold(reshard, "SchemaDrift", drift)
+	}
+	if len(tables) == 0 {
+		// Nothing to copy or stream; the targets are trivially caught up.
+		setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionTrue,
+			"NothingToSeed", "the cluster has no sharded tables")
+		reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -315,20 +354,6 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 			// hold and re-resolve.
 			return r.hold(reshard, "PrepareSourceFailed", err.Error())
 		}
-	}
-
-	// The target list is DERIVED from the immutable spec, never trusted from
-	// mutable status: a tampered status.targetShards entry would aim a
-	// truncating workflow at a foreign database. Status must agree exactly.
-	expected := make([]string, 0, len(reshard.Spec.TargetRanges))
-	for _, tr := range reshard.Spec.TargetRanges {
-		expected = append(expected, shardName(cluster.Name, tr.Start, tr.End))
-	}
-	if !slices.Equal(reshard.Status.TargetShards, expected) {
-		r.fail(reshard, reshardSeededCondition, "TargetListMismatch",
-			fmt.Sprintf("status.targetShards %v does not match the spec-derived targets %v",
-				reshard.Status.TargetShards, expected))
-		return ctrl.Result{}, nil
 	}
 
 	// Start (idempotently) one pull workflow per target and collect phases.

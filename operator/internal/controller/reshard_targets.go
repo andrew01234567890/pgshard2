@@ -72,7 +72,14 @@ func (r *PgShardReshardReconciler) reconcileProvisioningTargets(
 		return ctrl.Result{}, err
 	}
 
-	reshard.Status.ClusterUID = string(cluster.UID)
+	// The cluster was pinned at Validating; a replacement under the same
+	// name would combine the validated source with an unvalidated cluster's
+	// hash function and configuration.
+	if reshard.Status.ClusterUID != string(cluster.UID) {
+		r.fail(reshard, reshardTargetsProvisionedCondition, "ClusterReplaced",
+			fmt.Sprintf("cluster %q is not the object this reshard was validated against", cluster.Name))
+		return ctrl.Result{}, nil
+	}
 	rendered, err := pgconfig.Render(clusterRenderInputs(&cluster))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("rendering configuration: %w", err)

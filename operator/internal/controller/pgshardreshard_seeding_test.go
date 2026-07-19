@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -162,6 +163,12 @@ var _ = Describe("PgShardReshard seeding", func() {
 		_, err = reconcile()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getReshard(reshardName).Status.Phase).To(Equal(pgshardv1alpha1.ReshardSeeding))
+		// The first Seeding reconcile PERSISTS the schema pin before any RPC.
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		pinned := getReshard(reshardName)
+		Expect(pinned.Status.SeedTablesPinned).To(BeTrue())
+		Expect(pinned.Status.Phase).To(Equal(pgshardv1alpha1.ReshardSeeding))
 
 		// Shared placement points targets at the cluster's shared node; make
 		// it ready with a primary the fake target agent answers for.
@@ -196,7 +203,7 @@ var _ = Describe("PgShardReshard seeding", func() {
 
 		prepared := sourceAgent.PreparedSources()
 		Expect(prepared).To(HaveLen(1))
-		Expect(prepared[0].GetPublication()).To(Equal("pgshard_rsd_seed"))
+		Expect(prepared[0].GetPublication()).To(HavePrefix("pgshard_rsd_seed_"))
 		Expect(prepared[0].GetDatabase()).To(Equal("cseed-src"))
 		// Sorted (schema, name); the global table is NOT seeded.
 		Expect(prepared[0].GetTables()).To(HaveLen(2))
@@ -210,7 +217,7 @@ var _ = Describe("PgShardReshard seeding", func() {
 		for i, req := range started {
 			spec := req.GetSpec()
 			Expect(spec.GetKind()).To(Equal(pgshardv1.WorkflowKind_WORKFLOW_KIND_RESHARD))
-			Expect(spec.GetPublication()).To(Equal("pgshard_rsd_seed"))
+			Expect(spec.GetPublication()).To(HavePrefix("pgshard_rsd_seed_"))
 			Expect(spec.GetSlot()).To(Equal(spec.GetId()))
 			Expect(spec.GetSourcePrimary().GetHost()).To(Equal(sourceIP))
 			Expect(spec.GetSourcePrimary().GetDatabase()).To(Equal("cseed-src"))
@@ -245,14 +252,16 @@ var _ = Describe("PgShardReshard seeding", func() {
 
 	It("surfaces a failed workflow and keeps seeding", func() {
 		_, targetAgent, reconcile, _ := seedSetup("rsd-wferr", true)
-		targetAgent.SetWorkflowPhase("pgshard_rsd_wferr_t0",
+		got := getReshard("rsd-wferr")
+		uid := strings.ReplaceAll(string(got.UID), "-", "")[:8]
+		targetAgent.SetWorkflowPhase("pgshard_rsd_wferr_"+uid+"_t0",
 			pgshardv1.WorkflowPhase_WORKFLOW_PHASE_ERROR, "preflight refused: provenance mismatch")
 
 		res, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 
-		got := getReshard("rsd-wferr")
+		got = getReshard("rsd-wferr")
 		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardSeeding))
 		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
 		Expect(cond).NotTo(BeNil())
