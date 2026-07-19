@@ -269,13 +269,17 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 			fmt.Sprintf("source shard %q is not the object this reshard was validated against", source.Name))
 		return ctrl.Result{}, nil
 	}
-	// Serving is mutable: the shard validated as serving can have been
-	// hidden or begun decommissioning since. Its data is no longer
-	// authoritative, so re-check on EVERY seeding reconcile, before any pin
-	// or RPC.
+	// Serving and Role are mutable: the shard validated as a serving data
+	// shard can have been hidden, begun decommissioning, or been relabeled
+	// since. Re-check on EVERY seeding reconcile, before any pin or RPC.
 	if !source.Spec.Serving {
 		r.fail(reshard, reshardSeededCondition, "SourceNotServing",
 			fmt.Sprintf("source shard %q is no longer serving; its data is not authoritative", source.Name))
+		return ctrl.Result{}, nil
+	}
+	if source.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
+		r.fail(reshard, reshardSeededCondition, "SourceNotReshardable",
+			fmt.Sprintf("source shard %q became the system shard", source.Name))
 		return ctrl.Result{}, nil
 	}
 	// The target list is DERIVED from the immutable spec, never trusted from
@@ -316,11 +320,7 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 		return r.hold(reshard, "SchemaDrift", drift)
 	}
 	if len(tables) == 0 {
-		// Nothing to copy or stream; the targets are trivially caught up.
-		setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionTrue,
-			"NothingToSeed", "the cluster has no sharded tables")
-		reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
-		return ctrl.Result{Requeue: true}, nil
+		return r.advanceNothingToSeed(ctx, reshard)
 	}
 
 	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
@@ -399,6 +399,51 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+// advanceNothingToSeed advances an empty-schema reshard to CatchingUp — but
+// only once the phase invariant (every target exists, is ours, hidden, and
+// range-correct) holds, exactly as the workflow path enforces per target.
+func (r *PgShardReshardReconciler) advanceNothingToSeed(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (ctrl.Result, error) {
+	for i, targetName := range reshard.Status.TargetShards {
+		var target pgshardv1alpha1.PgShardShard
+		if err := r.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: targetName}, &target); err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.hold(reshard, "TargetShardMissing",
+					fmt.Sprintf("target shard %q not found", targetName))
+			}
+			return ctrl.Result{}, err
+		}
+		if reason, msg := r.foreignTarget(reshard, &target, i); reason != "" {
+			r.fail(reshard, reshardSeededCondition, reason, msg)
+			return ctrl.Result{}, nil
+		}
+	}
+	setReshardCondition(reshard, reshardSeededCondition, metav1.ConditionTrue,
+		"NothingToSeed", "the cluster has no sharded tables")
+	reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// foreignTarget reports (reason, message) when a shard is NOT the hidden
+// data-role target this reshard provisioned — only such a target may be
+// truncated and seeded. Serving and Role are mutable, so both paths re-check
+// on every reconcile.
+func (r *PgShardReshardReconciler) foreignTarget(
+	reshard *pgshardv1alpha1.PgShardReshard, target *pgshardv1alpha1.PgShardShard, i int,
+) (string, string) {
+	if !metav1.IsControlledBy(target, reshard) ||
+		target.Spec.ClusterRef != reshard.Spec.ClusterRef ||
+		target.Spec.KeyRange != reshard.Spec.TargetRanges[i] ||
+		target.Spec.Serving ||
+		target.Spec.Role == pgshardv1alpha1.ShardRoleSystem {
+		return "TargetForeign",
+			fmt.Sprintf("target shard %q is not the hidden data target this reshard provisioned", target.Name)
+	}
+	return "", ""
+}
+
 // seedInputs carries the resolved, reshard-wide seeding context.
 type seedInputs struct {
 	cluster     *pgshardv1alpha1.PgShardCluster
@@ -431,14 +476,8 @@ func (r *PgShardReshardReconciler) seedTarget(
 		}
 		return false, false, ctrl.Result{}, err
 	}
-	// Only a target THIS reshard created, with the spec-declared range, in
-	// this cluster, and still hidden may be truncated and seeded.
-	if !metav1.IsControlledBy(&target, reshard) ||
-		target.Spec.ClusterRef != reshard.Spec.ClusterRef ||
-		target.Spec.KeyRange != reshard.Spec.TargetRanges[i] ||
-		target.Spec.Serving {
-		r.fail(reshard, reshardSeededCondition, "TargetForeign",
-			fmt.Sprintf("target shard %q is not the hidden target this reshard provisioned", targetName))
+	if reason, msg := r.foreignTarget(reshard, &target, i); reason != "" {
+		r.fail(reshard, reshardSeededCondition, reason, msg)
 		return false, true, ctrl.Result{}, nil
 	}
 	// The workflow TRUNCATES the target database; only the fully verified
