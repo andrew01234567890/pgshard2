@@ -479,6 +479,13 @@ func (f *FakeAgent) StopWorkflow(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, "StopWorkflow")
+	// Mirror the real agent: slot cleanup is the source's DropSlot RPC, so
+	// StopWorkflow(drop_slot=true) is rejected. Guessing at a source slot name
+	// here would let a caller false-green an unimplemented path.
+	if req.GetDropSlot() {
+		return nil, status.Error(codes.Unimplemented,
+			"drop_slot is handled by the source agent's DropSlot")
+	}
 	f.stoppedWorkflows = append(f.stoppedWorkflows, req)
 	if f.workflowPhases == nil {
 		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
