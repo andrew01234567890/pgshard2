@@ -1932,10 +1932,10 @@ type EmitJournalRequest struct {
 	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
 	// Pod-identity fence, as elsewhere: ABORTED on mismatch.
 	TargetPodUid string `protobuf:"bytes,3,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
-	// Idempotency identity: a retry with the same id and an IDENTICAL payload
-	// replays the recorded position instead of emitting a second journal
-	// record; the same id with a different payload is FAILED_PRECONDITION.
-	// Required.
+	// Idempotency identity: a retry with the same id, the same database, and
+	// an IDENTICAL payload replays the recorded position instead of emitting
+	// a second journal record; the same id with a different database or
+	// payload is FAILED_PRECONDITION. Required.
 	Id            string `protobuf:"bytes,4,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

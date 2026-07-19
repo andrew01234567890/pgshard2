@@ -170,9 +170,18 @@ fn check_provenance(value: &str) -> Result<(), Status> {
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-/// One journal id's single-flight slot: recorded (database, exact payload,
-/// lsn) — the retry must match ALL of what was emitted, not just the bytes.
-type JournalSlot = Arc<tokio::sync::Mutex<Option<(String, Vec<u8>, u64)>>>;
+/// One journal id's single-flight slot. `lsn: Some` records a successful
+/// emit (the retry must match database AND payload to replay it); `lsn:
+/// None` poisons the id after a timed-out emit whose outcome is UNKNOWN —
+/// re-emitting could write a second journal record for the same cutover, so
+/// every retry fails loudly instead.
+struct JournalRecord {
+    database: String,
+    payload: Vec<u8>,
+    lsn: Option<u64>,
+}
+
+type JournalSlot = Arc<tokio::sync::Mutex<Option<JournalRecord>>>;
 
 #[tonic::async_trait]
 impl<I: Instance> AgentService for AgentSvc<I> {
@@ -560,22 +569,48 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         let (id, database) = (req.id.clone(), req.database.clone());
         let lsn = tokio::spawn(async move {
             let mut recorded = slot.lock().await;
-            if let Some((db, prior, lsn)) = recorded.as_ref() {
-                if *db != database || *prior != payload {
+            if let Some(rec) = recorded.as_ref() {
+                if rec.database != database || rec.payload != payload {
                     return Ok(Err(format!(
                         "journal id {id:?} was already emitted with a different database or payload"
                     )));
                 }
-                return Ok(Ok(*lsn));
+                return Ok(match rec.lsn {
+                    Some(lsn) => Ok(lsn),
+                    // A previous emit timed out AFTER possibly committing:
+                    // re-emitting could write a SECOND journal record for
+                    // this cutover. Fail loudly; recovery needs a new id.
+                    None => Err(format!(
+                        "journal id {id:?} has an UNKNOWN outcome (a previous emit timed out); it cannot be retried"
+                    )),
+                });
             }
-            let lsn = tokio::time::timeout(
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 instance.emit_journal(&database, &payload),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("journal emit {id:?} timed out; outcome unknown"))??;
-            *recorded = Some((database, payload, lsn));
-            Ok::<Result<u64, String>, anyhow::Error>(Ok(lsn))
+            {
+                Ok(Ok(lsn)) => {
+                    *recorded = Some(JournalRecord {
+                        database,
+                        payload,
+                        lsn: Some(lsn),
+                    });
+                    Ok(Ok(lsn))
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => {
+                    *recorded = Some(JournalRecord {
+                        database,
+                        payload,
+                        lsn: None,
+                    });
+                    Err(anyhow::anyhow!(
+                        "journal emit {id:?} timed out; outcome unknown and the id is now poisoned"
+                    ))
+                }
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("journal task failed: {e}")))?
@@ -817,6 +852,23 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(clash.code(), tonic::Code::FailedPrecondition);
+
+        // The same id aimed at a DIFFERENT database must never replay the
+        // recorded position of the original.
+        s.instance.seed_database("shard_other", "", None);
+        let wrong_db = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_other".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_db.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

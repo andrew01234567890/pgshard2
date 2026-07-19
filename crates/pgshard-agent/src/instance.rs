@@ -126,11 +126,13 @@ pub trait Instance: Send + Sync + 'static {
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
 
     /// Emit a transactional logical message (prefix `pgshard`, the given
-    /// payload) INTO `database` and return the WAL flush position after its
-    /// commit. Logical messages are database-scoped: every replication slot
-    /// of that database decodes the message's commit, which makes the
-    /// returned LSN a database-local barrier — a consumer whose applied
-    /// position reaches it has decoded everything before it.
+    /// payload) INTO `database` and return the MESSAGE's own WAL position
+    /// (`pg_logical_emit_message`'s return — the exact value the consumer's
+    /// Message frame carries and acknowledges as journal_lsn). Logical
+    /// messages are database-scoped: every replication slot of that database
+    /// decodes the message's commit, which makes the returned LSN a
+    /// database-local barrier — a consumer whose journal acknowledgement
+    /// reaches it has decoded everything before it.
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64>;
 
     /// Ensure `publication` exists in `database` publishing EXACTLY `tables`
