@@ -155,6 +155,11 @@ func platformFixed(replicas, headroom int32) map[string]string {
 		"max_replication_slots":  fmt.Sprintf("%d", slots),
 		"max_wal_senders":        fmt.Sprintf("%d", slots),
 		"wal_log_hints":          "on", // pg_rewind without checksums assumption
+		// The reshard cutover freeze proves write-quiescence by making the
+		// source read-only and draining writers; a 2PC prepared write is
+		// invisible to that drain and COMMIT PREPARED is allowed read-only, so
+		// it could commit after the barrier. Disable 2PC on shard databases.
+		"max_prepared_transactions": "0",
 	}
 }
 

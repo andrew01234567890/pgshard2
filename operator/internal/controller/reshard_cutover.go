@@ -380,7 +380,7 @@ func (r *PgShardReshardReconciler) unfenceSource(
 	if _, err := agent.FenceWrites(ctx, &pgshardv1.FenceWritesRequest{
 		Database:     shardDatabaseName(source),
 		TargetPodUid: string(sourcePod.UID),
-		ReadOnly:     false,
+		Unfence:      true,
 	}); err != nil {
 		res, _ := r.holdCutover(reshard, "UnfenceFailed", err.Error())
 		return res, false, nil
@@ -449,7 +449,6 @@ func (r *PgShardReshardReconciler) freezeSource(
 	if _, err := agent.FenceWrites(ctx, &pgshardv1.FenceWritesRequest{
 		Database:     shardDatabaseName(source),
 		TargetPodUid: string(sourcePod.UID),
-		ReadOnly:     true,
 	}); err != nil {
 		switch grpcstatus.Code(err) {
 		case codes.InvalidArgument:

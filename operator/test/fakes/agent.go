@@ -568,10 +568,10 @@ func (f *FakeAgent) FenceWrites(
 	if f.fencedDatabases == nil {
 		f.fencedDatabases = map[string]bool{}
 	}
-	if req.GetReadOnly() {
-		f.fencedDatabases[req.GetDatabase()] = true
-	} else {
+	if req.GetUnfence() {
 		delete(f.fencedDatabases, req.GetDatabase())
+	} else {
+		f.fencedDatabases[req.GetDatabase()] = true
 	}
 	return &pgshardv1.FenceWritesResponse{}, nil
 }

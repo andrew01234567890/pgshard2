@@ -30,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
@@ -254,9 +255,25 @@ func setReshardCondition(
 	})
 }
 
+// deletionPredicate passes any event whose object carries a deletion
+// timestamp, so a finalizer-holding object still reconciles its own delete.
+func deletionPredicate() predicate.Predicate {
+	has := func(o client.Object) bool { return !o.GetDeletionTimestamp().IsZero() }
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return has(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool { return has(e.ObjectNew) },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+	}
+}
+
 func (r *PgShardReshardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// GenerationChangedPredicate alone would drop the deletionTimestamp-only
+		// update (metadata, no generation bump), so a reshard holding the
+		// cutover-cleanup finalizer would never reconcile its own deletion.
+		// OR in a deletion predicate.
+		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(
+			predicate.Or(predicate.GenerationChangedPredicate{}, deletionPredicate()))).
 		// The reshard reads no shard/node status, so watch only structural
 		// (generation) changes: a target's status heartbeat must not re-enqueue it.
 		Owns(&pgshardv1alpha1.PgShardShard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

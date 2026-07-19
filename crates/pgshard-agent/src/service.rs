@@ -548,7 +548,7 @@ impl<I: Instance> AgentService for AgentSvc<I> {
         check_ident("database", &req.database, true)?;
         let terminated = self
             .instance
-            .fence_writes(&req.database, req.read_only)
+            .fence_writes(&req.database, !req.unfence)
             .await
             .map_err(internal)?;
         Ok(Response::new(v1::FenceWritesResponse { terminated }))

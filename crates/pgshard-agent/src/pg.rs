@@ -29,6 +29,53 @@ impl PgInstance {
         Ok(client)
     }
 
+    /// Terminate every WRITER client backend on `database` and confirm they
+    /// exit within an aggregate 10s deadline. SPARED: replication walsenders
+    /// (backend_type <> 'client backend'), the caller's maintenance session,
+    /// and the reshard's OWN reader sessions (application_name prefix
+    /// pgshard_ — killing the workflow's source catalog connection would make
+    /// it error and refuse the cutover). A zero-timeout pg_terminate_backend
+    /// only signals, so we poll for actual disappearance.
+    async fn drain_writers(
+        &self,
+        client: &tokio_postgres::Client,
+        database: &str,
+    ) -> anyhow::Result<u32> {
+        const SELECT_WRITERS: &str = "SELECT pid FROM pg_stat_activity
+             WHERE datname = $1
+               AND pid <> pg_backend_pid()
+               AND backend_type = 'client backend'
+               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut terminated = 0u32;
+        loop {
+            let pids: Vec<i32> = client
+                .query(SELECT_WRITERS, &[&database])
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect();
+            if pids.is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "writer backends on {database} did not exit within the fence deadline"
+            );
+            let exited: i64 = client
+                .query_one(
+                    "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid))
+                     FROM unnest($1::int[]) AS pid",
+                    &[&pids],
+                )
+                .await?
+                .get(0);
+            terminated = terminated.saturating_add(exited.max(0) as u32);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(terminated)
+    }
+
     /// Connect into a specific database on this instance (a node hosts one
     /// shard per DATABASE; publication DDL is database-scoped).
     async fn connect_to(&self, database: &str) -> anyhow::Result<tokio_postgres::Client> {
@@ -293,78 +340,66 @@ impl Instance for PgInstance {
     }
 
     async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32> {
-        // Run the DDL from a MAINTENANCE connection, never from the target
-        // database: once it is read-only, a session connected INTO it runs in
-        // a read-only transaction and PostgreSQL refuses ALTER — so a re-fence
-        // or an un-fence would stall. The maintenance database is never
-        // fenced, so its ALTER always succeeds.
+        // Run all DDL from a MAINTENANCE connection ('postgres'), never the
+        // target: a session connected INTO a read-only database runs in a
+        // read-only transaction and PostgreSQL refuses ALTER, so re-fence and
+        // un-fence would stall. DEPLOYMENT: the agent role must own the shard
+        // database (or be superuser) for ALTER DATABASE, and have
+        // pg_signal_backend for the drain; the maintenance database must exist
+        // and permit CONNECT.
         let client = self.connect_to("postgres").await?;
-        let setting = if read_only { "on" } else { "off" };
+        let ident = quote_ident(database);
+
+        if !read_only {
+            // Un-fence: clear the read-only default and drop the sessions that
+            // still carry it (their reconnect is read-write). Reopen
+            // admissions in case a prior fence left them closed.
+            client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS true;
+                     ALTER DATABASE {ident} SET default_transaction_read_only = off"
+                ))
+                .await?;
+            self.drain_writers(&client, database).await?;
+            return Ok(0);
+        }
+
+        // FENCE via an ADMISSION BARRIER, so soundness never rests on a
+        // wall-clock cutoff (a backward clock adjustment could otherwise let
+        // an old-default backend escape a backend_start comparison):
+        //   1. ALLOW_CONNECTIONS false — no NEW session can connect at all;
+        //   2. drain every existing writer backend (spare the reshard's own
+        //      pgshard_ readers) and refuse to proceed while any PREPARED
+        //      transaction exists (a 2PC write is absent from
+        //      pg_stat_activity and COMMIT PREPARED is allowed read-only);
+        //   3. set the read-only default;
+        //   4. ALLOW_CONNECTIONS true — every reconnect is now read-only.
         client
             .batch_execute(&format!(
-                "ALTER DATABASE {} SET default_transaction_read_only = {setting}",
-                quote_ident(database)
+                "ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS false"
             ))
             .await?;
-        // Capture the cutoff AFTER the ALTER has committed: any backend whose
-        // backend_start is later than this necessarily read the (now
-        // committed) new default during its own startup, so it is already
-        // read-only and must NOT be counted as a writer to drain — otherwise
-        // a reconnecting router would keep the loop alive forever. A backend
-        // at or before the cutoff may still hold the OLD default and is
-        // drained. (backend_start and clock_timestamp() share the instance's
-        // wall clock, so the comparison is meaningful within one server.)
-        let cutoff: std::time::SystemTime = client
-            .query_one("SELECT clock_timestamp()", &[])
+        let prepared: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_prepared_xacts WHERE database = $1",
+                &[&database],
+            )
             .await?
             .get(0);
-
-        // Terminate every WRITER client backend on the TARGET database that
-        // predates the cutoff. SPARED: replication walsenders (backend_type
-        // <> 'client backend'), this maintenance session, and the reshard's
-        // OWN reader sessions (application_name prefix pgshard_ — the
-        // workflow's source catalog connection; killing it would make the
-        // workflow error and refuse the cutover). On an UN-fence we drop those
-        // pre-cutoff sessions too so their reconnect is read-write.
-        //
-        // Aggregate 10s deadline (not per-backend): SIGTERM all matching pids
-        // in one statement, then poll until none remain — a zero-timeout
-        // pg_terminate_backend only signals, so a backend mid-COMMIT could
-        // finish after the RPC; we confirm actual disappearance.
-        let select_pids = "SELECT pid FROM pg_stat_activity
-             WHERE datname = $1
-               AND backend_type = 'client backend'
-               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'
-               AND backend_start <= $2";
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut signalled = 0u32;
-        loop {
-            let pids: Vec<i32> = client
-                .query(select_pids, &[&database, &cutoff])
-                .await?
-                .into_iter()
-                .map(|r| r.get(0))
-                .collect();
-            if pids.is_empty() {
-                break;
-            }
-            anyhow::ensure!(
-                tokio::time::Instant::now() < deadline,
-                "writer backends on {database} did not exit within the fence deadline"
-            );
-            // Fire SIGTERM at all of them at once, then re-poll.
-            let hit: i64 = client
-                .query_one(
-                    "SELECT count(pg_terminate_backend(pid)) FROM unnest($1::int[]) AS pid",
-                    &[&pids],
-                )
-                .await?
-                .get(0);
-            signalled = signalled.max(hit.max(0) as u32);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        Ok(signalled)
+        anyhow::ensure!(
+            prepared == 0,
+            "database {database} has {prepared} prepared transaction(s); a 2PC write could              commit after the barrier. Disable prepared transactions on shard databases."
+        );
+        let terminated = self.drain_writers(&client, database).await?;
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {ident} SET default_transaction_read_only = on;
+                 ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS true"
+            ))
+            .await?;
+        Ok(terminated)
     }
+
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {
         let mut client = self.connect_to(database).await?;
         // TRANSACTIONAL message: it decodes inside a Commit, so it reaches

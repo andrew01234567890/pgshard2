@@ -41,6 +41,7 @@ io_workers=3
 maintenance_work_mem=256MB
 max_connections=100
 max_parallel_workers=1
+max_prepared_transactions=0
 max_replication_slots=18
 max_wal_senders=18
 max_wal_size=2GB
@@ -65,6 +66,7 @@ io_workers=8
 maintenance_work_mem=2048MB
 max_connections=400
 max_parallel_workers=16
+max_prepared_transactions=0
 max_replication_slots=21
 max_wal_senders=21
 max_wal_size=32GB
@@ -175,10 +177,10 @@ func TestClassifyDiffUnknownParamDefaultsToRestart(t *testing.T) {
 	// A postmaster-context GUC a user injects must be treated as restart-only,
 	// or the change silently never applies.
 	reload, restart := ClassifyDiff(
-		map[string]string{"max_prepared_transactions": "0"},
-		map[string]string{"max_prepared_transactions": "100"},
+		map[string]string{"max_locks_per_transaction": "64"},
+		map[string]string{"max_locks_per_transaction": "128"},
 	)
-	if len(reload) != 0 || fmt.Sprint(restart) != "[max_prepared_transactions]" {
+	if len(reload) != 0 || fmt.Sprint(restart) != "[max_locks_per_transaction]" {
 		t.Errorf("unknown param must default to restart: reload=%v restart=%v", reload, restart)
 	}
 }

@@ -1927,9 +1927,10 @@ type FenceWritesRequest struct {
 	// The shard database to fence read-only before the cutover freeze.
 	Database     string `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
 	TargetPodUid string `protobuf:"bytes,2,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
-	// true (default) fences the database write-quiescent; false restores it
-	// read-write (a rollback un-fences the source so it can serve again).
-	ReadOnly      bool `protobuf:"varint,3,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	// false (the proto3 DEFAULT) fences the database write-quiescent — the
+	// SAFE default, since an omitted field must never accidentally un-fence.
+	// true restores it read-write (a rollback un-fences the source).
+	Unfence       bool `protobuf:"varint,3,opt,name=unfence,proto3" json:"unfence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1978,9 +1979,9 @@ func (x *FenceWritesRequest) GetTargetPodUid() string {
 	return ""
 }
 
-func (x *FenceWritesRequest) GetReadOnly() bool {
+func (x *FenceWritesRequest) GetUnfence() bool {
 	if x != nil {
-		return x.ReadOnly
+		return x.Unfence
 	}
 	return false
 }
@@ -2934,11 +2935,11 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\v2\x1a.pgshard.v1.WorkflowStatusR\x06status\"\x13\n" +
 	"\x11CheckpointRequest\"7\n" +
 	"\x12CheckpointResponse\x12!\n" +
-	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"s\n" +
+	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"p\n" +
 	"\x12FenceWritesRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12$\n" +
-	"\x0etarget_pod_uid\x18\x02 \x01(\tR\ftargetPodUid\x12\x1b\n" +
-	"\tread_only\x18\x03 \x01(\bR\breadOnly\"5\n" +
+	"\x0etarget_pod_uid\x18\x02 \x01(\tR\ftargetPodUid\x12\x18\n" +
+	"\aunfence\x18\x03 \x01(\bR\aunfence\"5\n" +
 	"\x13FenceWritesResponse\x12\x1e\n" +
 	"\n" +
 	"terminated\x18\x01 \x01(\rR\n" +
