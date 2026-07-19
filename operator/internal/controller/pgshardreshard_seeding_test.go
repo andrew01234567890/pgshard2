@@ -253,7 +253,7 @@ var _ = Describe("PgShardReshard seeding", func() {
 	It("surfaces a failed workflow and keeps seeding", func() {
 		_, targetAgent, reconcile, _ := seedSetup("rsd-wferr", true)
 		got := getReshard("rsd-wferr")
-		uid := strings.ReplaceAll(string(got.UID), "-", "")[:8]
+		uid := strings.ReplaceAll(string(got.UID), "-", "_")
 		targetAgent.SetWorkflowPhase("pgshard_rsd_wferr_"+uid+"_t0",
 			pgshardv1.WorkflowPhase_WORKFLOW_PHASE_ERROR, "preflight refused: provenance mismatch")
 
@@ -317,6 +317,26 @@ var _ = Describe("PgShardReshard seeding", func() {
 		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal("SchemaDrift"))
+	})
+
+	It("stops seeding with zero RPCs when the source stops serving", func() {
+		sourceAgent, targetAgent, reconcile, _ := seedSetup("rsd-hide", true)
+		var src pgshardv1alpha1.PgShardShard
+		Expect(k8sClient.Get(ctx,
+			types.NamespacedName{Name: "chide-src", Namespace: ns}, &src)).To(Succeed())
+		src.Spec.Serving = false
+		Expect(k8sClient.Update(ctx, &src)).To(Succeed())
+
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		got := getReshard("rsd-hide")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("SourceNotServing"))
+		Expect(sourceAgent.PreparedSources()).To(BeEmpty())
+		Expect(targetAgent.StartedWorkflows()).To(BeEmpty())
 	})
 
 	It("holds while the source has no verified primary", func() {

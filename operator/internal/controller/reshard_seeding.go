@@ -56,10 +56,10 @@ const seedSuffixReserve = len("_t128")
 // part is truncated so the publication plus the longest slot suffix always
 // fits PostgreSQL's 63-byte identifier limit.
 func seedPublication(reshard *pgshardv1alpha1.PgShardReshard) string {
+	// The FULL sanitized UID (a truncated one is only collision-resistant,
+	// and a collision would let the conflict path stop another reshard's
+	// workflow); only the human-readable name part truncates.
 	uid := seedIdent(string(reshard.UID))
-	if len(uid) > 8 {
-		uid = uid[:8]
-	}
 	name := seedIdent(reshard.Name)
 	maxName := maxDatabaseNameBytes - len("pgshard_") - 1 - len(uid) - seedSuffixReserve
 	if len(name) > maxName {
@@ -267,6 +267,15 @@ func (r *PgShardReshardReconciler) reconcileSeeding(
 	if reshard.Status.SourceShardUID == "" || reshard.Status.SourceShardUID != string(source.UID) {
 		r.fail(reshard, reshardSeededCondition, "SourceReplaced",
 			fmt.Sprintf("source shard %q is not the object this reshard was validated against", source.Name))
+		return ctrl.Result{}, nil
+	}
+	// Serving is mutable: the shard validated as serving can have been
+	// hidden or begun decommissioning since. Its data is no longer
+	// authoritative, so re-check on EVERY seeding reconcile, before any pin
+	// or RPC.
+	if !source.Spec.Serving {
+		r.fail(reshard, reshardSeededCondition, "SourceNotServing",
+			fmt.Sprintf("source shard %q is no longer serving; its data is not authoritative", source.Name))
 		return ctrl.Result{}, nil
 	}
 	// The target list is DERIVED from the immutable spec, never trusted from
