@@ -140,6 +140,34 @@ type PgShardReshardStatus struct {
 	// +optional
 	CutoverGateDeadline *metav1.Time `json:"cutoverGateDeadline,omitempty"`
 
+	// CutoverGateObservedAt records when the controller first OBSERVED its
+	// gate published in PgShardRouting; the quiesce wait (write-lease expiry)
+	// counts from here.
+	// +optional
+	CutoverGateObservedAt *metav1.Time `json:"cutoverGateObservedAt,omitempty"`
+
+	// SourceFenced records that the source database was set write-quiescent
+	// (read-only) by a freeze — INDEPENDENT of the barrier LSN, since the
+	// fence lands BEFORE the emit. Every terminal/rollback path un-fences
+	// while this is true, so a failed emit or crash can never strand the
+	// source read-only.
+	// +optional
+	SourceFenced bool `json:"sourceFenced,omitempty"`
+
+	// CutoverAttempt counts cutover attempts; a rollback increments it. The
+	// freeze's journal id embeds it, so a RETRIED cutover can never replay a
+	// previous attempt's barrier — workflows already acknowledged past the
+	// old position, and committing against it would skip proving the NEW
+	// quiesce point was decoded.
+	// +optional
+	CutoverAttempt int64 `json:"cutoverAttempt,omitempty"`
+
+	// CutoverFrozenLSN is the freeze barrier: the journal message's WAL
+	// position emitted in the source database after quiescence. Every target
+	// workflow must acknowledge (journal_lsn >=) it before the switch.
+	// +optional
+	CutoverFrozenLSN int64 `json:"cutoverFrozenLSN,omitempty"`
+
 	// SwitchCommitted is the cutover's point of no return, persisted BEFORE
 	// the serving flip and BEFORE the gate is withdrawn. The routing
 	// compiler refuses to publish UNGATED routing while a committed switch's

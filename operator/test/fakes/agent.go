@@ -78,7 +78,15 @@ type FakeAgent struct {
 	workflowPhases   map[string]pgshardv1.WorkflowPhase
 	workflowErrors   map[string]string
 	workflowLsns     map[string]uint64
+	workflowJournals map[string]uint64
 	startWorkflowErr error
+	emitJournalErr   error
+
+	// emittedJournals records EmitJournal calls; journalLsn scripts the
+	// returned barrier position (default: the instance WAL write position).
+	emittedJournals []*pgshardv1.EmitJournalRequest
+	journalLsn      uint64
+	fencedDatabases map[string]bool
 
 	server   *grpc.Server
 	listener net.Listener
@@ -483,21 +491,25 @@ func (f *FakeAgent) WatchWorkflows(
 	for {
 		f.mu.Lock()
 		type entry struct {
-			id    string
-			phase pgshardv1.WorkflowPhase
-			msg   string
-			lsn   *uint64
+			id      string
+			phase   pgshardv1.WorkflowPhase
+			msg     string
+			lsn     *uint64
+			journal *uint64
 		}
 		var out []entry
 		for id, phase := range f.workflowPhases {
 			if len(req.GetIds()) > 0 && !slices.Contains(req.GetIds(), id) {
 				continue
 			}
-			var lsn *uint64
+			var lsn, journal *uint64
 			if v, ok := f.workflowLsns[id]; ok {
 				lsn = &v
 			}
-			out = append(out, entry{id, phase, f.workflowErrors[id], lsn})
+			if v, ok := f.workflowJournals[id]; ok {
+				journal = &v
+			}
+			out = append(out, entry{id, phase, f.workflowErrors[id], lsn, journal})
 		}
 		f.mu.Unlock()
 		for _, e := range out {
@@ -510,6 +522,9 @@ func (f *FakeAgent) WatchWorkflows(
 			// known; absence must reach the operator as absence.
 			if e.lsn != nil {
 				wfStatus.AppliedLsn = &pgshardv1.Lsn{Value: *e.lsn}
+			}
+			if e.journal != nil {
+				wfStatus.JournalLsn = &pgshardv1.Lsn{Value: *e.journal}
 			}
 			if err := stream.Send(&pgshardv1.WatchWorkflowsResponse{
 				Status: wfStatus,
@@ -539,6 +554,97 @@ func (f *FakeAgent) SetWorkflowPhase(id string, phase pgshardv1.WorkflowPhase, e
 	f.workflowErrors[id] = errMsg
 }
 
+// FenceWrites records the fenced database and returns a scriptable count.
+func (f *FakeAgent) FenceWrites(
+	_ context.Context, req *pgshardv1.FenceWritesRequest,
+) (*pgshardv1.FenceWritesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "FenceWrites")
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	if f.fencedDatabases == nil {
+		f.fencedDatabases = map[string]bool{}
+	}
+	if req.GetUnfence() {
+		delete(f.fencedDatabases, req.GetDatabase())
+	} else {
+		f.fencedDatabases[req.GetDatabase()] = true
+	}
+	return &pgshardv1.FenceWritesResponse{}, nil
+}
+
+// FencedDatabases reports which databases FenceWrites was called on.
+func (f *FakeAgent) FencedDatabases() map[string]bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]bool, len(f.fencedDatabases))
+	maps.Copy(out, f.fencedDatabases)
+	return out
+}
+
+// EmitJournal mirrors the real agent's freeze barrier: pod-uid fence,
+// required id/database/event, recorded request, scripted (or WAL) position.
+func (f *FakeAgent) EmitJournal(
+	_ context.Context, req *pgshardv1.EmitJournalRequest,
+) (*pgshardv1.EmitJournalResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, "EmitJournal")
+	if f.emitJournalErr != nil {
+		return nil, f.emitJournalErr
+	}
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	if req.GetId() == "" || req.GetDatabase() == "" || req.GetJournal() == nil {
+		return nil, status.Error(codes.InvalidArgument, "id, database and journal are required")
+	}
+	f.emittedJournals = append(f.emittedJournals,
+		proto.Clone(req).(*pgshardv1.EmitJournalRequest))
+	lsn := f.journalLsn
+	if lsn == 0 {
+		lsn = f.Status.GetWalWriteLsn().GetValue()
+	}
+	return &pgshardv1.EmitJournalResponse{Lsn: &pgshardv1.Lsn{Value: lsn}}, nil
+}
+
+// SetJournalLsn scripts the barrier position EmitJournal returns.
+func (f *FakeAgent) SetJournalLsn(lsn uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.journalLsn = lsn
+}
+
+// SetEmitJournalError scripts EmitJournal to fail (nil clears).
+func (f *FakeAgent) SetEmitJournalError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.emitJournalErr = err
+}
+
+// EmittedJournals returns recorded EmitJournal requests.
+func (f *FakeAgent) EmittedJournals() []*pgshardv1.EmitJournalRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.EmitJournalRequest, len(f.emittedJournals))
+	copy(out, f.emittedJournals)
+	return out
+}
+
+// SetWorkflowJournalLsn scripts the journal acknowledgement a workflow reports.
+func (f *FakeAgent) SetWorkflowJournalLsn(id string, lsn uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.workflowJournals == nil {
+		f.workflowJournals = map[string]uint64{}
+	}
+	f.workflowJournals[id] = lsn
+}
+
 // SetWorkflowLsn scripts the applied LSN WatchWorkflows reports for a workflow.
 func (f *FakeAgent) SetWorkflowLsn(id string, lsn uint64) {
 	f.mu.Lock()
@@ -564,6 +670,7 @@ func (f *FakeAgent) ClearWorkflows() {
 	f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
 	f.workflowErrors = map[string]string{}
 	f.workflowLsns = map[string]uint64{}
+	f.workflowJournals = map[string]uint64{}
 }
 
 // SetStartWorkflowError scripts StartWorkflow to fail with err (nil clears).

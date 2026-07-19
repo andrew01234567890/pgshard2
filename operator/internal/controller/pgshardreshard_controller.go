@@ -30,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
@@ -48,6 +49,12 @@ import (
 type PgShardReshardReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader is an UNCACHED reader (mgr.GetAPIReader). The cutover claim on
+	// the source shard is the cross-object un-fence authorization token; a
+	// lagging informer could still show a stale holder, so that one check reads
+	// straight from the API server. Nil in tests (k8sClient is already
+	// uncached), so callers fall back to the cached client.
+	APIReader client.Reader
 	// Agents dials seeding RPCs on source and target agents. Nil until the
 	// Seeding phase needs it (tests inject dialAgent instead).
 	Agents *agentclient.Pool
@@ -55,14 +62,14 @@ type PgShardReshardReconciler struct {
 	dialAgent func(host string, port int32) (pgshardv1.AgentServiceClient, error)
 }
 
-func (r *PgShardReshardReconciler) agentClient(host string, port int32) (pgshardv1.AgentServiceClient, error) {
+func (r *PgShardReshardReconciler) agentClient(host string) (pgshardv1.AgentServiceClient, error) {
 	if r.dialAgent != nil {
-		return r.dialAgent(host, port)
+		return r.dialAgent(host, agentPort)
 	}
 	if r.Agents == nil {
 		return nil, fmt.Errorf("no agent pool configured")
 	}
-	return r.Agents.Get(host, port)
+	return r.Agents.Get(host, agentPort)
 }
 
 // The condition that records whether the requested split is well-formed.
@@ -71,7 +78,9 @@ const reshardValidatedCondition = "Validated"
 // The condition that records whether the target shards have been created.
 const reshardTargetsProvisionedCondition = "TargetsProvisioned"
 
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardroutings,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch;create;update;patch;delete
@@ -84,6 +93,10 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	var reshard pgshardv1alpha1.PgShardReshard
 	if err := r.Get(ctx, req.NamespacedName, &reshard); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !reshard.DeletionTimestamp.IsZero() {
+		return r.cleanupCutoverClaim(ctx, &reshard)
 	}
 
 	before := reshard.Status.DeepCopy()
@@ -104,6 +117,10 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileSeeding(ctx, &reshard)
 	case pgshardv1alpha1.ReshardCatchingUp:
 		result, err = r.reconcileCatchingUp(ctx, &reshard)
+	case pgshardv1alpha1.ReshardReadyToCutover:
+		result, err = r.reconcileReadyToCutover(ctx, &reshard)
+	case pgshardv1alpha1.ReshardCuttingOver:
+		result, err = r.reconcileCuttingOver(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -244,9 +261,25 @@ func setReshardCondition(
 	})
 }
 
+// deletionPredicate passes any event whose object carries a deletion
+// timestamp, so a finalizer-holding object still reconciles its own delete.
+func deletionPredicate() predicate.Predicate {
+	has := func(o client.Object) bool { return !o.GetDeletionTimestamp().IsZero() }
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return has(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool { return has(e.ObjectNew) },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+	}
+}
+
 func (r *PgShardReshardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// GenerationChangedPredicate alone would drop the deletionTimestamp-only
+		// update (metadata, no generation bump), so a reshard holding the
+		// cutover-cleanup finalizer would never reconcile its own deletion.
+		// OR in a deletion predicate.
+		For(&pgshardv1alpha1.PgShardReshard{}, builder.WithPredicates(
+			predicate.Or(predicate.GenerationChangedPredicate{}, deletionPredicate()))).
 		// The reshard reads no shard/node status, so watch only structural
 		// (generation) changes: a target's status heartbeat must not re-enqueue it.
 		Owns(&pgshardv1alpha1.PgShardShard{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

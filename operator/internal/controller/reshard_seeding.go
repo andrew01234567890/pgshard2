@@ -358,7 +358,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 	for _, t := range tables {
 		tableRefs = append(tableRefs, &pgshardv1.TableRef{Schema: t.Schema, Name: t.Name})
 	}
-	sourceAgent, err := r.agentClient(sourcePod.Status.PodIP, agentPort)
+	sourceAgent, err := r.agentClient(sourcePod.Status.PodIP)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -392,7 +392,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 		tables:      tables,
 	}
 	for i, targetName := range reshard.Status.TargetShards {
-		isStreaming, appliedLsn, held, res, err := r.seedTarget(ctx, reshard, seed, i, targetName)
+		isStreaming, ack, held, res, err := r.seedTarget(ctx, reshard, seed, i, targetName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -401,7 +401,7 @@ func (r *PgShardReshardReconciler) runSeedPass(
 		}
 		if isStreaming {
 			streaming++
-			applied = append(applied, appliedLsn)
+			applied = append(applied, ack.applied)
 		}
 	}
 
@@ -536,7 +536,7 @@ func (r *PgShardReshardReconciler) resolveSource(
 func (r *PgShardReshardReconciler) sourceStatus(
 	ctx context.Context, sourcePod *corev1.Pod,
 ) (*pgshardv1.InstanceStatus, error) {
-	agent, err := r.agentClient(sourcePod.Status.PodIP, agentPort)
+	agent, err := r.agentClient(sourcePod.Status.PodIP)
 	if err != nil {
 		return nil, err
 	}
@@ -599,6 +599,12 @@ func (r *PgShardReshardReconciler) foreignTarget(
 	return "", ""
 }
 
+// seedAck is one streaming workflow's acknowledged positions.
+type seedAck struct {
+	applied *uint64
+	journal *uint64
+}
+
 // seedInputs carries the resolved, reshard-wide seeding context.
 type seedInputs struct {
 	cluster     *pgshardv1alpha1.PgShardCluster
@@ -617,10 +623,10 @@ func (r *PgShardReshardReconciler) seedTarget(
 	seed seedInputs,
 	i int,
 	targetName string,
-) (isStreaming bool, appliedLsn *uint64, held bool, res ctrl.Result, err error) {
-	holdOn := func(reason, message string) (bool, *uint64, bool, ctrl.Result, error) {
+) (isStreaming bool, applied seedAck, held bool, res ctrl.Result, err error) {
+	holdOn := func(reason, message string) (bool, seedAck, bool, ctrl.Result, error) {
 		res, _ := r.hold(reshard, reason, message)
-		return false, nil, true, res, nil
+		return false, seedAck{}, true, res, nil
 	}
 	var target pgshardv1alpha1.PgShardShard
 	if err := r.Get(ctx,
@@ -629,11 +635,11 @@ func (r *PgShardReshardReconciler) seedTarget(
 			return holdOn("TargetShardMissing",
 				fmt.Sprintf("target shard %q not found", targetName))
 		}
-		return false, nil, false, ctrl.Result{}, err
+		return false, seedAck{}, false, ctrl.Result{}, err
 	}
 	if reason, msg := r.foreignTarget(reshard, &target, i); reason != "" {
 		r.fail(reshard, reshardSeededCondition, reason, msg)
-		return false, nil, true, ctrl.Result{}, nil
+		return false, seedAck{}, true, ctrl.Result{}, nil
 	}
 	// The workflow TRUNCATES the target database; only the fully verified
 	// placement chain (DatabaseReady on this node incarnation and pod) may
@@ -644,7 +650,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 	}
 	targetPod, targetNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
 	if err != nil {
-		return false, nil, false, ctrl.Result{}, err
+		return false, seedAck{}, false, ctrl.Result{}, err
 	}
 	if targetPod == nil || !databaseVerified(&target, targetNode, targetPod) {
 		// A failover or pod replacement since verification: the shard
@@ -667,7 +673,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		// The range was validated at Validating; a malformed one here is
 		// tampering or corruption, never transient.
 		r.fail(reshard, reshardSeededCondition, "InvalidTargetRange", err.Error())
-		return false, nil, true, ctrl.Result{}, nil
+		return false, seedAck{}, true, ctrl.Result{}, nil
 	}
 	wireRange := &pgshardv1.KeyRange{Start: targetRange.Start()}
 	if end, closed := targetRange.End(); closed {
@@ -699,9 +705,9 @@ func (r *PgShardReshardReconciler) seedTarget(
 		// runner refuses to truncate — a misdirected spec fails closed.
 		ExpectProvenance: string(target.UID),
 	}
-	targetAgent, err := r.agentClient(targetPod.Status.PodIP, agentPort)
+	targetAgent, err := r.agentClient(targetPod.Status.PodIP)
 	if err != nil {
-		return false, nil, false, ctrl.Result{}, err
+		return false, seedAck{}, false, ctrl.Result{}, err
 	}
 	if _, err := targetAgent.StartWorkflow(ctx, &pgshardv1.StartWorkflowRequest{
 		Spec:         spec,
@@ -710,7 +716,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		switch grpcstatus.Code(err) {
 		case codes.InvalidArgument:
 			r.fail(reshard, reshardSeededCondition, "WorkflowRejected", err.Error())
-			return false, nil, true, ctrl.Result{}, nil
+			return false, seedAck{}, true, ctrl.Result{}, nil
 		case codes.Unimplemented:
 			// The agent has no replication credentials configured — a
 			// deployment gap, not a data error. Surface and wait.
@@ -741,7 +747,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 	// read would otherwise let a deposed instance's watermark gate cutover.
 	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
 	if err != nil {
-		return false, nil, false, ctrl.Result{}, err
+		return false, seedAck{}, false, ctrl.Result{}, err
 	}
 	if confirmPod == nil || confirmPod.UID != targetPod.UID ||
 		!databaseVerified(&target, confirmNode, confirmPod) {
@@ -750,12 +756,16 @@ func (r *PgShardReshardReconciler) seedTarget(
 	}
 	switch status.GetPhase() {
 	case pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING:
-		var applied *uint64
+		var ack seedAck
 		if lsn := status.GetAppliedLsn(); lsn != nil {
 			v := lsn.GetValue()
-			applied = &v
+			ack.applied = &v
 		}
-		return true, applied, false, ctrl.Result{}, nil
+		if lsn := status.GetJournalLsn(); lsn != nil {
+			v := lsn.GetValue()
+			ack.journal = &v
+		}
+		return true, ack, false, ctrl.Result{}, nil
 	case pgshardv1.WorkflowPhase_WORKFLOW_PHASE_ERROR:
 		// The workflow failed loudly (preflight refusal, publication
 		// drift, boundary crossing, ...). The NEXT reconcile's
@@ -764,7 +774,7 @@ func (r *PgShardReshardReconciler) seedTarget(
 		return holdOn("WorkflowFailed",
 			fmt.Sprintf("workflow %s: %s", id, status.GetError()))
 	}
-	return false, nil, false, ctrl.Result{}, nil
+	return false, seedAck{}, false, ctrl.Result{}, nil
 }
 
 // workflowStatus reads one workflow's current status: WatchWorkflows streams

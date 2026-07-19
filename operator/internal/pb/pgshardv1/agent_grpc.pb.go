@@ -35,6 +35,7 @@ const (
 	AgentService_StopWorkflow_FullMethodName       = "/pgshard.v1.AgentService/StopWorkflow"
 	AgentService_WatchWorkflows_FullMethodName     = "/pgshard.v1.AgentService/WatchWorkflows"
 	AgentService_Checkpoint_FullMethodName         = "/pgshard.v1.AgentService/Checkpoint"
+	AgentService_FenceWrites_FullMethodName        = "/pgshard.v1.AgentService/FenceWrites"
 	AgentService_EmitJournal_FullMethodName        = "/pgshard.v1.AgentService/EmitJournal"
 	AgentService_ShardStream_FullMethodName        = "/pgshard.v1.AgentService/ShardStream"
 	AgentService_DropSlot_FullMethodName           = "/pgshard.v1.AgentService/DropSlot"
@@ -66,6 +67,7 @@ type AgentServiceClient interface {
 	StopWorkflow(ctx context.Context, in *StopWorkflowRequest, opts ...grpc.CallOption) (*StopWorkflowResponse, error)
 	WatchWorkflows(ctx context.Context, in *WatchWorkflowsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchWorkflowsResponse], error)
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
+	FenceWrites(ctx context.Context, in *FenceWritesRequest, opts ...grpc.CallOption) (*FenceWritesResponse, error)
 	EmitJournal(ctx context.Context, in *EmitJournalRequest, opts ...grpc.CallOption) (*EmitJournalResponse, error)
 	ShardStream(ctx context.Context, in *ShardStreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ShardStreamResponse], error)
 	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
@@ -252,6 +254,16 @@ func (c *agentServiceClient) Checkpoint(ctx context.Context, in *CheckpointReque
 	return out, nil
 }
 
+func (c *agentServiceClient) FenceWrites(ctx context.Context, in *FenceWritesRequest, opts ...grpc.CallOption) (*FenceWritesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceWritesResponse)
+	err := c.cc.Invoke(ctx, AgentService_FenceWrites_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentServiceClient) EmitJournal(ctx context.Context, in *EmitJournalRequest, opts ...grpc.CallOption) (*EmitJournalResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EmitJournalResponse)
@@ -353,6 +365,7 @@ type AgentServiceServer interface {
 	StopWorkflow(context.Context, *StopWorkflowRequest) (*StopWorkflowResponse, error)
 	WatchWorkflows(*WatchWorkflowsRequest, grpc.ServerStreamingServer[WatchWorkflowsResponse]) error
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
+	FenceWrites(context.Context, *FenceWritesRequest) (*FenceWritesResponse, error)
 	EmitJournal(context.Context, *EmitJournalRequest) (*EmitJournalResponse, error)
 	ShardStream(*ShardStreamRequest, grpc.ServerStreamingServer[ShardStreamResponse]) error
 	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
@@ -417,6 +430,9 @@ func (UnimplementedAgentServiceServer) WatchWorkflows(*WatchWorkflowsRequest, gr
 }
 func (UnimplementedAgentServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedAgentServiceServer) FenceWrites(context.Context, *FenceWritesRequest) (*FenceWritesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FenceWrites not implemented")
 }
 func (UnimplementedAgentServiceServer) EmitJournal(context.Context, *EmitJournalRequest) (*EmitJournalResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EmitJournal not implemented")
@@ -741,6 +757,24 @@ func _AgentService_Checkpoint_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_FenceWrites_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FenceWritesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).FenceWrites(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_FenceWrites_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).FenceWrites(ctx, req.(*FenceWritesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _AgentService_EmitJournal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(EmitJournalRequest)
 	if err := dec(in); err != nil {
@@ -926,6 +960,10 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Checkpoint",
 			Handler:    _AgentService_Checkpoint_Handler,
+		},
+		{
+			MethodName: "FenceWrites",
+			Handler:    _AgentService_FenceWrites_Handler,
 		},
 		{
 			MethodName: "EmitJournal",

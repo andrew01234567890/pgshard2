@@ -531,6 +531,28 @@ impl<I: Instance> AgentService for AgentSvc<I> {
     ) -> Result<Response<v1::CheckpointResponse>, Status> {
         Err(Status::unimplemented("checkpoint"))
     }
+    async fn fence_writes(
+        &self,
+        request: Request<v1::FenceWritesRequest>,
+    ) -> Result<Response<v1::FenceWritesResponse>, Status> {
+        let req = request.into_inner();
+        if !req.target_pod_uid.is_empty()
+            && !self.pod_uid.is_empty()
+            && req.target_pod_uid != self.pod_uid
+        {
+            return Err(Status::aborted(format!(
+                "request targets pod uid {}, but this agent serves {}",
+                req.target_pod_uid, self.pod_uid
+            )));
+        }
+        check_ident("database", &req.database, true)?;
+        let terminated = self
+            .instance
+            .fence_writes(&req.database, !req.unfence)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v1::FenceWritesResponse { terminated }))
+    }
     async fn emit_journal(
         &self,
         request: Request<v1::EmitJournalRequest>,

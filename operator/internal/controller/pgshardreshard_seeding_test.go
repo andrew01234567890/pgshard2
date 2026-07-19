@@ -19,6 +19,12 @@ import (
 	"github.com/andrew01234567890/pgshard2/operator/test/fakes"
 )
 
+// Shared fixture vocabulary for the reshard/routing specs.
+const (
+	testProvisionedReason = "Provisioned"
+	ordersTable           = "orders"
+)
+
 var _ = Describe("PgShardReshard seeding", func() {
 	const (
 		ns       = "default"
@@ -67,7 +73,7 @@ var _ = Describe("PgShardReshard seeding", func() {
 		shard.Status.DatabasePodUID = string(pod.UID)
 		apimeta.SetStatusCondition(&shard.Status.Conditions, metav1.Condition{
 			Type: shardDatabaseReadyCondition, Status: metav1.ConditionTrue,
-			Reason: "Provisioned", Message: "test",
+			Reason: testProvisionedReason, Message: testProvisionedReason,
 		})
 		Expect(k8sClient.Status().Update(ctx, &shard)).To(Succeed())
 	}
@@ -120,7 +126,7 @@ var _ = Describe("PgShardReshard seeding", func() {
 			Spec: pgshardv1alpha1.PgShardTableConfigSpec{
 				ClusterRef: clusterName,
 				Tables: []pgshardv1alpha1.TableEntry{
-					{Name: "orders", Type: pgshardv1alpha1.TableSharded,
+					{Name: ordersTable, Type: pgshardv1alpha1.TableSharded,
 						ShardKeyColumn: customerIDCol, ShardKeyType: pgshardv1alpha1.ShardKeyInt},
 					{Name: "audit", Type: pgshardv1alpha1.TableGlobal},
 					{Schema: "app", Name: "items", Type: pgshardv1alpha1.TableSharded,

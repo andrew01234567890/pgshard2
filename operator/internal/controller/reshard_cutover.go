@@ -1,0 +1,724 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
+	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
+)
+
+const reshardCutoverCondition = "CutOver"
+
+// cutoverGateWindow is how long the gate may stand before an uncommitted
+// cutover rolls back to CatchingUp — the bound on the write-refusal window.
+const cutoverGateWindow = 120 * time.Second
+
+// quiesceMargin pads the write-lease wait: clocks and status propagation are
+// not instant, and freezing before every router's lease has truly expired
+// would let a straggler write land after the barrier.
+const quiesceMargin = 5 * time.Second
+
+// reconcileReadyToCutover re-validates every identity and opens the cutover:
+// persist the gate deadline (the RoutingController compiles the gate and
+// pins this reshard with a finalizer), then enter CuttingOver.
+func (r *PgShardReshardReconciler) reconcileReadyToCutover(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (ctrl.Result, error) {
+	source, held, res, err := r.resolveSource(ctx, reshard)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		return res, nil
+	}
+	// Exclusive per-source claim: two differently-partitioned reshards of the
+	// same source could otherwise both quiesce, freeze, and commit before
+	// either flips, and their overlapping target sets would then never
+	// compile. The claim annotation on the SOURCE shard is the lock; a claim
+	// held by another reshard blocks this one until it clears.
+	if res, ok, err := r.claimSource(ctx, reshard, source); err != nil || !ok {
+		return res, err
+	}
+	deadline := metav1.NewTime(time.Now().Add(cutoverGateWindow))
+	reshard.Status.CutoverGateDeadline = &deadline
+	reshard.Status.Phase = pgshardv1alpha1.ReshardCuttingOver
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
+		"Gating", "cutover gate requested; waiting for routers to quiesce")
+	return ctrl.Result{Requeue: true}, nil
+}
+
+const (
+	cutoverClaimAnnotation = "pgshard.dev/cutover-claim"
+	// cutoverClaimFinalizer keeps a reshard around while it holds a source
+	// claim (or a fence), so a delete-to-change-course cannot strand the
+	// source's claim annotation or leave it read-only.
+	cutoverClaimFinalizer = "pgshard.dev/cutover-cleanup"
+)
+
+// cleanupCutoverClaim runs on a reshard being deleted: un-fence the source if
+// fenced, release the claim, then drop the finalizer. Idempotent.
+func (r *PgShardReshardReconciler) cleanupCutoverClaim(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(reshard, cutoverClaimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	source := r.sourceForCleanup(ctx, reshard)
+
+	// A committed switch is the point of no return: it must COMPLETE (source
+	// hidden, targets serving) before the object may go, or clearing the gate
+	// while the source still serves would re-admit writes the targets have
+	// snapshotted past. Finish the switch, then this cleanup proceeds.
+	if reshard.Status.SwitchCommitted && source != nil && source.Spec.Serving {
+		var cluster pgshardv1alpha1.PgShardCluster
+		if err := r.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}, &cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.completeSwitch(ctx, reshard, &cluster, source)
+	}
+
+	// Pre-commit (or already switched): clear the gate request so the
+	// RoutingController withdraws its gate and removes its own finalizer —
+	// otherwise the object can never delete.
+	if reshard.Status.CutoverGateDeadline != nil {
+		reshard.Status.CutoverGateDeadline = nil
+		if err := r.Status().Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	// Un-fence ONLY a switch that never committed. A committed switch hid the
+	// source and the targets have snapshotted past the freeze barrier; the
+	// source has diverged and is being decommissioned. Re-admitting writes to
+	// it would resurrect a wrong-data source, so it stays fenced for good.
+	if source != nil && reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
+		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
+			return res, err
+		}
+		reshard.Status.SourceFenced = false
+		if err := r.Status().Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if source != nil {
+		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	controllerutil.RemoveFinalizer(reshard, cutoverClaimFinalizer)
+	return ctrl.Result{}, r.Update(ctx, reshard)
+}
+
+// failCutover marks the reshard Failed. On an UNCOMMITTED failure it un-fences
+// the source and releases the claim so a replacement reshard is not blocked.
+// On a COMMITTED failure (a validation like ClusterReplaced can trip after the
+// switch commits but before completeSwitch flips the serving set) it does
+// NEITHER: the committed source stays fenced, and its claim is RETAINED. The
+// committed fence is recorded only in THIS reshard's status, so releasing the
+// claim would let a replacement reshard claim the still-serving source, fence
+// it under its own uncommitted state, and later un-fence — reopening writes
+// past this reshard's freeze barrier. Holding the claim blocks that until this
+// reshard is deleted, whose cleanup completes the switch (hiding the source)
+// before releasing the claim.
+func (r *PgShardReshardReconciler) failCutover(
+	ctx context.Context,
+	reshard *pgshardv1alpha1.PgShardReshard,
+	source *pgshardv1alpha1.PgShardShard,
+	reason, message string,
+) (ctrl.Result, error) {
+	if source != nil && !reshard.Status.SwitchCommitted {
+		if reshard.Status.SourceFenced {
+			if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
+				return res, err
+			}
+			reshard.Status.SourceFenced = false
+			// Persist SourceFenced=false BEFORE releasing the claim (the
+			// ownership token). Releasing while status still records a fence
+			// would let a crash-retry re-authorize un-fencing a source a
+			// replacement reshard may by then own; unfenceSource's live-claim
+			// check is the backstop, this ordering the first line of defense.
+			if err := r.Status().Update(ctx, reshard); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	r.fail(reshard, reshardCutoverCondition, reason, message)
+	return ctrl.Result{}, nil
+}
+
+// claimSource takes (or confirms) this reshard's exclusive cutover claim on
+// the source shard. ok=false with a hold result means another reshard holds
+// it.
+func (r *PgShardReshardReconciler) claimSource(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard, source *pgshardv1alpha1.PgShardShard,
+) (ctrl.Result, bool, error) {
+	holder := source.Annotations[cutoverClaimAnnotation]
+	if holder == reshard.Name {
+		return ctrl.Result{}, true, nil
+	}
+	if holder != "" {
+		res, _ := r.holdCutover(reshard, "SourceClaimed",
+			fmt.Sprintf("source shard %q is being cut over by reshard %q", source.Name, holder))
+		return res, false, nil
+	}
+	if !controllerutil.ContainsFinalizer(reshard, cutoverClaimFinalizer) {
+		controllerutil.AddFinalizer(reshard, cutoverClaimFinalizer)
+		if err := r.Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
+	}
+	if source.Annotations == nil {
+		source.Annotations = map[string]string{}
+	}
+	source.Annotations[cutoverClaimAnnotation] = reshard.Name
+	if err := r.Update(ctx, source); err != nil {
+		if apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, false, nil
+		}
+		return ctrl.Result{}, false, err
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// releaseSourceClaim drops this reshard's cutover claim on the source.
+func (r *PgShardReshardReconciler) releaseSourceClaim(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard, source *pgshardv1alpha1.PgShardShard,
+) error {
+	if source.Annotations[cutoverClaimAnnotation] != reshard.Name {
+		return nil
+	}
+	delete(source.Annotations, cutoverClaimAnnotation)
+	return r.Update(ctx, source)
+}
+
+// reconcileCuttingOver drives gate → quiesce → freeze → barrier → switch,
+// each step gated on PERSISTED status so any crash resumes exactly where it
+// left off, and the deadline rolls an uncommitted cutover back.
+func (r *PgShardReshardReconciler) reconcileCuttingOver(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) (ctrl.Result, error) {
+	var cluster pgshardv1alpha1.PgShardCluster
+	clusterKey := client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}
+	if err := r.Get(ctx, clusterKey, &cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.holdCutover(reshard, "ClusterNotFound",
+				fmt.Sprintf("cluster %q not found", reshard.Spec.ClusterRef))
+		}
+		return ctrl.Result{}, err
+	}
+	if reshard.Status.ClusterUID != string(cluster.UID) {
+		src := r.sourceForCleanup(ctx, reshard)
+		return r.failCutover(ctx, reshard, src, "ClusterReplaced",
+			fmt.Sprintf("cluster %q is not the object this reshard was validated against", cluster.Name))
+	}
+
+	var source pgshardv1alpha1.PgShardShard
+	sourceKey := client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.SourceShard}
+	if err := r.Get(ctx, sourceKey, &source); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.holdCutover(reshard, "SourceShardMissing",
+				fmt.Sprintf("source shard %q not found", reshard.Spec.SourceShard))
+		}
+		return ctrl.Result{}, err
+	}
+	if reshard.Status.SourceShardUID != string(source.UID) {
+		if err := r.releaseSourceClaim(ctx, reshard, &source); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.fail(reshard, reshardCutoverCondition, "SourceReplaced",
+			fmt.Sprintf("source shard %q is not the object this reshard was validated against", source.Name))
+		return ctrl.Result{}, nil
+	}
+
+	// A target-list/spec mismatch must fail BEFORE any fence or freeze.
+	if len(reshard.Status.TargetShards) != len(reshard.Spec.TargetRanges) {
+		return r.failCutover(ctx, reshard, &source, "TargetListMismatch",
+			"status.targetShards does not match the spec target ranges")
+	}
+
+	if reshard.Status.SwitchCommitted {
+		return r.completeSwitch(ctx, reshard, &cluster, &source)
+	}
+
+	// Pre-commit: the deadline bounds the write-refusal window. Expiry rolls
+	// back to CatchingUp — clearing the gate field withdraws the gate
+	// (SwitchCommitted is false, so the RoutingController allows it) and the
+	// old topology resumes.
+	if reshard.Status.CutoverGateDeadline != nil &&
+		time.Now().After(reshard.Status.CutoverGateDeadline.Time) {
+		return r.rollBackCutover(ctx, reshard, &source,
+			"the cutover gate deadline expired before the switch committed; retrying from CatchingUp")
+	}
+
+	// Step 1: observe OUR gate published in routing.
+	var routing pgshardv1alpha1.PgShardRouting
+	if err := r.Get(ctx, clusterKey, &routing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.holdCutover(reshard, "RoutingMissing", "no compiled routing exists yet")
+		}
+		return ctrl.Result{}, err
+	}
+	gateID := "reshard-" + reshard.Name
+	if !slices.ContainsFunc(routing.Spec.Gates, func(g pgshardv1alpha1.RoutingGate) bool {
+		return g.ID == gateID
+	}) {
+		return r.holdCutover(reshard, "GateUnpublished",
+			"waiting for the routing compiler to publish the cutover gate")
+	}
+	if reshard.Status.CutoverGateObservedAt == nil {
+		now := metav1.Now()
+		reshard.Status.CutoverGateObservedAt = &now
+		setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
+			"Quiescing", "gate published; waiting for router write leases to expire")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Step 2: quiesce by lease expiry. Routers refuse the gated epoch and
+	// stop renewing their write leases (the #94/#96 fail-safe); after
+	// writeLeaseSeconds plus margin no router accepts writes.
+	quiesceAt := reshard.Status.CutoverGateObservedAt.Add(
+		time.Duration(routing.Spec.WriteLeaseSeconds)*time.Second + quiesceMargin)
+	if now := time.Now(); now.Before(quiesceAt) {
+		setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
+			"Quiescing", fmt.Sprintf("router write leases expire at %s", quiesceAt.Format(time.RFC3339)))
+		return ctrl.Result{RequeueAfter: quiesceAt.Sub(now) + time.Second}, nil
+	}
+
+	// Record "fence cleanup owed" DURABLY before the external fence side
+	// effect: a crash or failed status write after FenceWrites but before a
+	// later persist would otherwise leave the source read-only with
+	// SourceFenced=false, and cleanup would skip un-fencing.
+	if reshard.Status.CutoverFrozenLSN == 0 && !reshard.Status.SourceFenced {
+		reshard.Status.SourceFenced = true
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Step 3: freeze. First make the source provably write-quiescent — a
+	// timing margin alone cannot prove a write admitted just before lease
+	// expiry has committed, so the source database is set read-only and its
+	// in-flight writers are terminated; then emit the barrier, which is now
+	// provably AFTER the last committed write. Both steps are idempotent and
+	// keyed on the persisted FrozenLSN.
+	if reshard.Status.CutoverFrozenLSN == 0 {
+		return r.freezeSource(ctx, reshard, &source)
+	}
+
+	// Step 4: every target workflow must acknowledge the barrier — but the
+	// per-target RPCs take time, and the gate must not expire mid-loop and
+	// still commit. Re-check the deadline immediately before committing.
+	acked, held, res, err := r.barrierAcknowledged(ctx, reshard, &source)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		return res, nil
+	}
+	if !acked {
+		return r.holdCutover(reshard, "AwaitingBarrier",
+			fmt.Sprintf("waiting for every target workflow to acknowledge the barrier %#x",
+				uint64(reshard.Status.CutoverFrozenLSN)))
+	}
+	if reshard.Status.CutoverGateDeadline != nil &&
+		time.Now().After(reshard.Status.CutoverGateDeadline.Time) {
+		return r.rollBackCutover(ctx, reshard, &source,
+			"the cutover gate deadline expired before the switch could commit")
+	}
+
+	// Step 5: the point of no return, PERSISTED before any flip. The
+	// RoutingController refuses ungated routing from here until the source
+	// stops serving, so no crash ordering can re-admit source writes.
+	reshard.Status.SwitchCommitted = true
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
+		"SwitchCommitted", "barrier acknowledged by every target; committing the switch")
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// rollBackCutover returns an uncommitted cutover to CatchingUp and opens a
+// fresh attempt so the next freeze cannot replay this attempt's barrier. If a
+// freeze had fenced the source read-only, it is restored read-write so it can
+// serve again.
+func (r *PgShardReshardReconciler) rollBackCutover(
+	ctx context.Context,
+	reshard *pgshardv1alpha1.PgShardReshard,
+	source *pgshardv1alpha1.PgShardShard,
+	message string,
+) (ctrl.Result, error) {
+	// A rollback is only ever for an UNCOMMITTED cutover; guard the un-fence on
+	// !SwitchCommitted defensively so a committed source can never be reopened
+	// even if a future caller reaches here in that state.
+	if reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
+		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
+			return res, err
+		}
+		reshard.Status.SourceFenced = false
+	}
+	// The claim is intentionally KEPT across a rollback: the reshard still
+	// owns this source and will retry from CatchingUp. It is released only
+	// when the reshard leaves the cutover for good (SwitchedForward, or a
+	// terminal Failed).
+	reshard.Status.CutoverGateDeadline = nil
+	reshard.Status.CutoverGateObservedAt = nil
+	reshard.Status.CutoverFrozenLSN = 0
+	reshard.Status.CutoverAttempt++
+	reshard.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse, "RolledBack", message)
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// unfenceSource restores the source database read-write after a rollback.
+// ok=false means it could not (hold and retry) — never proceed with a source
+// left read-only.
+//
+// Un-fencing is authorized ONLY by LIVE claim ownership, never by this
+// reshard's (possibly stale) status. If a crash released this reshard's claim
+// after it un-fenced but before its Failed/SourceFenced=false status persisted,
+// a replacement reshard may since have claimed, fenced, and COMMITTED this
+// source; un-fencing it from stale status would reopen writes past that
+// reshard's freeze barrier. So re-read the claim and fail closed: if this
+// reshard no longer holds it, leave the source fenced under its true owner and
+// report success so the caller stops trying to un-fence what is not its own.
+func (r *PgShardReshardReconciler) unfenceSource(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard, source *pgshardv1alpha1.PgShardShard,
+) (ctrl.Result, bool, error) {
+	// Read the claim straight from the API server, not the informer cache: a
+	// lagging cache could still show this reshard as holder after the object
+	// records a replacement, which would wrongly authorize this un-fence.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	var live pgshardv1alpha1.PgShardShard
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(source), &live); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if live.Annotations[cutoverClaimAnnotation] != reshard.Name {
+		return ctrl.Result{}, true, nil
+	}
+	// Guard against this reshard's OWN just-committed switch, and against a
+	// same-name replacement. Controller-runtime persists status without
+	// refreshing the informer cache, so a reconcile that requeued immediately
+	// after SwitchCommitted was written can still read the pre-commit status and
+	// enter rollback/failure (e.g. the gate deadline crosses in that window)
+	// even though the switch has committed and the claim is legitimately still
+	// ours. The claim annotation stores only the reusable NAME, so a stale
+	// reconcile for a deleted reshard could also match a same-name replacement
+	// that now holds the claim. Re-read the reshard from the API server and
+	// authorize un-fence ONLY when it is the SAME object (UID) and NOT yet
+	// committed; otherwise requeue and let the cache catch up.
+	var liveReshard pgshardv1alpha1.PgShardReshard
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(reshard), &liveReshard); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if liveReshard.UID != reshard.UID || liveReshard.Status.SwitchCommitted {
+		return ctrl.Result{RequeueAfter: time.Second}, false, nil
+	}
+	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if sourcePod == nil || !databaseVerified(source, sourceNode, sourcePod) {
+		res, _ := r.holdCutover(reshard, "SourceUnverified",
+			"cannot un-fence the source: no verified primary")
+		return res, false, nil
+	}
+	agent, err := r.agentClient(sourcePod.Status.PodIP)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if _, err := agent.FenceWrites(ctx, &pgshardv1.FenceWritesRequest{
+		Database:     shardDatabaseName(source),
+		TargetPodUid: string(sourcePod.UID),
+		Unfence:      true,
+	}); err != nil {
+		res, _ := r.holdCutover(reshard, "UnfenceFailed", err.Error())
+		return res, false, nil
+	}
+	// Re-confirm the primary held across the un-fence: a promotion mid-RPC
+	// would mean we cleared the read-only default on a DEPOSED instance while
+	// the live one stays fenced. Hold (SourceFenced stays true) and retry.
+	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if confirmPod == nil || confirmPod.UID != sourcePod.UID ||
+		!databaseVerified(source, confirmNode, confirmPod) {
+		res, _ := r.holdCutover(reshard, "SourceUnverified",
+			"the source primary changed during the un-fence; retrying")
+		return res, false, nil
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// sourceForCleanup best-effort fetches the source shard for a cleanup path
+// (identity already failed), returning nil if it cannot be read.
+func (r *PgShardReshardReconciler) sourceForCleanup(
+	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard,
+) *pgshardv1alpha1.PgShardShard {
+	var source pgshardv1alpha1.PgShardShard
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.SourceShard}, &source); err != nil {
+		return nil
+	}
+	if reshard.Status.SourceShardUID != "" && reshard.Status.SourceShardUID != string(source.UID) {
+		// A replaced source is a different database; never un-fence it.
+		return nil
+	}
+	return &source
+}
+
+func (r *PgShardReshardReconciler) holdCutover(
+	reshard *pgshardv1alpha1.PgShardReshard, reason, message string,
+) (ctrl.Result, error) {
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse, reason, message)
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// freezeSource emits the journal barrier (the #104 EmitJournal contract) on
+// the source's verified primary and persists the returned position.
+func (r *PgShardReshardReconciler) freezeSource(
+	ctx context.Context,
+	reshard *pgshardv1alpha1.PgShardReshard,
+	source *pgshardv1alpha1.PgShardShard,
+) (ctrl.Result, error) {
+	sourcePod, sourceNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if sourcePod == nil || !databaseVerified(source, sourceNode, sourcePod) {
+		return r.holdCutover(reshard, "SourceUnverified",
+			fmt.Sprintf("source shard %q has no verified primary to freeze", source.Name))
+	}
+	agent, err := r.agentClient(sourcePod.Status.PodIP)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Make the source provably write-quiescent BEFORE the barrier: read-only
+	// plus terminated in-flight writers means no write can commit after it.
+	if _, err := agent.FenceWrites(ctx, &pgshardv1.FenceWritesRequest{
+		Database:     shardDatabaseName(source),
+		TargetPodUid: string(sourcePod.UID),
+	}); err != nil {
+		switch grpcstatus.Code(err) {
+		case codes.InvalidArgument:
+			return r.failCutover(ctx, reshard, source, "FenceRejected", err.Error())
+		default:
+			return r.holdCutover(reshard, "FenceFailed", err.Error())
+		}
+	}
+	successors := make([]*pgshardv1.JournalSuccessor, 0, len(reshard.Status.TargetShards))
+	for i, name := range reshard.Status.TargetShards {
+		tr := reshard.Spec.TargetRanges[i]
+		targetRange, err := toRange(tr)
+		if err != nil {
+			return r.failCutover(ctx, reshard, source, "InvalidTargetRange", err.Error())
+		}
+		wire := &pgshardv1.KeyRange{Start: targetRange.Start()}
+		if end, closed := targetRange.End(); closed {
+			wire.End = &end
+		}
+		successors = append(successors, &pgshardv1.JournalSuccessor{
+			Shard:    name,
+			KeyRange: wire,
+		})
+	}
+	resp, err := agent.EmitJournal(ctx, &pgshardv1.EmitJournalRequest{
+		Journal: &pgshardv1.JournalEvent{
+			SourceShard: source.Name,
+			Successors:  successors,
+		},
+		Database: shardDatabaseName(source),
+		// UID + attempt: a retried freeze WITHIN one attempt replays the
+		// recorded barrier (idempotent), while a new attempt after rollback
+		// emits a fresh one; a poisoned or mismatched id fails loudly.
+		Id:           fmt.Sprintf("%s-%d", reshard.UID, reshard.Status.CutoverAttempt),
+		TargetPodUid: string(sourcePod.UID),
+	})
+	if err != nil {
+		switch grpcstatus.Code(err) {
+		case codes.InvalidArgument, codes.FailedPrecondition:
+			// A poisoned journal id or a payload mismatch cannot converge.
+			return r.failCutover(ctx, reshard, source, "FreezeRejected", err.Error())
+		default:
+			return r.holdCutover(reshard, "FreezeFailed", err.Error())
+		}
+	}
+	lsn := resp.GetLsn().GetValue()
+	if lsn == 0 {
+		return r.holdCutover(reshard, "FreezeFailed", "the agent returned no barrier position")
+	}
+	// Re-confirm the source primary did not change across the fence+emit: a
+	// failover mid-freeze would have fenced/emitted on a deposed instance.
+	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, source.Spec.NodeRef)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if confirmPod == nil || confirmPod.UID != sourcePod.UID ||
+		!databaseVerified(source, confirmNode, confirmPod) {
+		return r.holdCutover(reshard, "SourceUnverified",
+			"the source primary changed during the freeze; retrying")
+	}
+	reshard.Status.CutoverFrozenLSN = int64(lsn)
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionFalse,
+		"Frozen", fmt.Sprintf("barrier emitted at %#x; awaiting target acknowledgements", lsn))
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// barrierAcknowledged checks every target workflow decoded the barrier:
+// journal_lsn >= the frozen position, read through the same verified
+// placement chain as seeding.
+func (r *PgShardReshardReconciler) barrierAcknowledged(
+	ctx context.Context,
+	reshard *pgshardv1alpha1.PgShardReshard,
+	source *pgshardv1alpha1.PgShardShard,
+) (acked, held bool, res ctrl.Result, err error) {
+	frozen := uint64(reshard.Status.CutoverFrozenLSN)
+	for i, targetName := range reshard.Status.TargetShards {
+		var target pgshardv1alpha1.PgShardShard
+		if err := r.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: targetName}, &target); err != nil {
+			if apierrors.IsNotFound(err) {
+				res, _ := r.holdCutover(reshard, "TargetShardMissing",
+					fmt.Sprintf("target shard %q not found", targetName))
+				return false, true, res, nil
+			}
+			return false, false, ctrl.Result{}, err
+		}
+		// The same target invariants seeding enforces: only THIS reshard's
+		// hidden data target may be frozen against and switched.
+		if reason, msg := r.foreignTarget(reshard, &target, i); reason != "" {
+			res, err := r.failCutover(ctx, reshard, source, reason, msg)
+			return false, true, res, err
+		}
+		targetPod, targetNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
+		if err != nil {
+			return false, false, ctrl.Result{}, err
+		}
+		if targetPod == nil || !databaseVerified(&target, targetNode, targetPod) {
+			res, _ := r.holdCutover(reshard, "TargetUnready",
+				fmt.Sprintf("target shard %q has no verified primary", targetName))
+			return false, true, res, nil
+		}
+		agent, err := r.agentClient(targetPod.Status.PodIP)
+		if err != nil {
+			return false, false, ctrl.Result{}, err
+		}
+		id := seedWorkflowID(reshard, i)
+		status, err := r.workflowStatus(ctx, agent, id)
+		if err != nil {
+			res, _ := r.holdCutover(reshard, "WorkflowStatusUnavailable", err.Error())
+			return false, true, res, nil
+		}
+		// Re-confirm the target primary held across the status RPC.
+		confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
+		if err != nil {
+			return false, false, ctrl.Result{}, err
+		}
+		if confirmPod == nil || confirmPod.UID != targetPod.UID ||
+			!databaseVerified(&target, confirmNode, confirmPod) {
+			res, _ := r.holdCutover(reshard, "TargetUnready",
+				fmt.Sprintf("target shard %q primary changed during the status read", targetName))
+			return false, true, res, nil
+		}
+		if status.GetPhase() != pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING {
+			res, _ := r.holdCutover(reshard, "WorkflowNotStreaming",
+				fmt.Sprintf("workflow %s is not streaming; the barrier cannot converge", id))
+			return false, true, res, nil
+		}
+		if status.GetJournalLsn().GetValue() < frozen {
+			return false, false, ctrl.Result{}, nil
+		}
+	}
+	return true, false, ctrl.Result{}, nil
+}
+
+// completeSwitch runs AFTER the persisted point of no return: flip the
+// serving set, observe it compiled, then withdraw the gate and land in
+// SwitchedForward. Every step is idempotent; the RoutingController's
+// SwitchCommitted fence keeps writes off the old source throughout.
+func (r *PgShardReshardReconciler) completeSwitch(
+	ctx context.Context,
+	reshard *pgshardv1alpha1.PgShardReshard,
+	cluster *pgshardv1alpha1.PgShardCluster,
+	source *pgshardv1alpha1.PgShardShard,
+) (ctrl.Result, error) {
+	// Flip the targets serving first, then hide the source: the compiler
+	// refuses every intermediate (non-partitioning) set, so routing holds
+	// the last good GATED view until the full flip lands.
+	for _, targetName := range reshard.Status.TargetShards {
+		var target pgshardv1alpha1.PgShardShard
+		if err := r.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: targetName}, &target); err != nil {
+			return ctrl.Result{}, err
+		}
+		if !target.Spec.Serving {
+			target.Spec.Serving = true
+			if err := r.Update(ctx, &target); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	if source.Spec.Serving {
+		source.Spec.Serving = false
+		if err := r.Update(ctx, source); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Observe the switched serving set actually compiled before withdrawing
+	// the gate: the withdrawal must never race the compiler into publishing
+	// the pre-switch topology ungated.
+	var routing pgshardv1alpha1.PgShardRouting
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: reshard.Namespace, Name: cluster.Name}, &routing); err != nil {
+		return ctrl.Result{}, err
+	}
+	if !switchedSetCompiled(&routing, source.Name, reshard.Status.TargetShards) {
+		return r.holdCutover(reshard, "AwaitingSwitchedRouting",
+			"waiting for the routing compiler to publish the switched serving set")
+	}
+
+	if err := r.releaseSourceClaim(ctx, reshard, source); err != nil {
+		return ctrl.Result{}, err
+	}
+	reshard.Status.CutoverGateDeadline = nil
+	reshard.Status.Phase = pgshardv1alpha1.ReshardSwitchedForward
+	setReshardCondition(reshard, reshardCutoverCondition, metav1.ConditionTrue,
+		"SwitchedForward", "targets serve the key range; the source is hidden")
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// switchedSetCompiled reports whether routing shows every target serving and
+// the source hidden.
+func switchedSetCompiled(
+	routing *pgshardv1alpha1.PgShardRouting, sourceName string, targets []string,
+) bool {
+	state := map[string]pgshardv1alpha1.RoutingShardState{}
+	for _, sh := range routing.Spec.Shards {
+		state[sh.Name] = sh.State
+	}
+	if state[sourceName] != pgshardv1alpha1.RoutingHidden {
+		return false
+	}
+	for _, t := range targets {
+		if state[t] != pgshardv1alpha1.RoutingServing {
+			return false
+		}
+	}
+	return true
+}

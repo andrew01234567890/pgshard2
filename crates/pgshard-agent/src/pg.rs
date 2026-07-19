@@ -29,6 +29,96 @@ impl PgInstance {
         Ok(client)
     }
 
+    /// Terminate every WRITER client backend on `database` and confirm they
+    /// exit within an aggregate 10s deadline. SPARED: replication walsenders
+    /// (backend_type <> 'client backend'), the caller's maintenance session,
+    /// and the reshard's OWN reader sessions (application_name prefix
+    /// pgshard_ — killing the workflow's source catalog connection would make
+    /// it error and refuse the cutover). A zero-timeout pg_terminate_backend
+    /// only signals, so we poll for actual disappearance.
+    ///
+    /// With `include_starting`, ALSO terminate client backends still in startup
+    /// (datname IS NULL). Under the fence's closed admissions this closes the
+    /// stale-default race: PG18 publishes a backend to pg_stat_activity
+    /// (pgstat_bestart_initial) BEFORE the datallowconn admission check, so a
+    /// backend that passed the OLD read-write default is continuously visible as
+    /// NULL then D — never invisible. Both populations MUST be tested in ONE
+    /// query (a NULL->D transition between two queries could hide a backend).
+    /// A starting backend cannot yet have run any statement, so terminating it
+    /// loses no committed work; its application_name may not be published yet,
+    /// so a pgshard_ session caught mid-startup here is dropped and reconnects.
+    async fn drain_writers(
+        &self,
+        client: &tokio_postgres::Client,
+        database: &str,
+        include_starting: bool,
+    ) -> anyhow::Result<u32> {
+        let select_writers = format!(
+            "SELECT pid FROM pg_stat_activity
+             WHERE pid <> pg_backend_pid()
+               AND backend_type = 'client backend'
+               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'
+               AND (datname = $1{})",
+            if include_starting {
+                " OR datname IS NULL"
+            } else {
+                ""
+            }
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut terminated = 0u32;
+        loop {
+            let pids: Vec<i32> = client
+                .query(&select_writers, &[&database])
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect();
+            if pids.is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "writer backends on {database} did not exit within the fence deadline"
+            );
+            let exited: i64 = client
+                .query_one(
+                    "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid))
+                     FROM unnest($1::int[]) AS pid",
+                    &[&pids],
+                )
+                .await?
+                .get(0);
+            terminated = terminated.saturating_add(exited.max(0) as u32);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(terminated)
+    }
+
+    /// Refuse to fence while any PREPARED (2PC) transaction targets `database`:
+    /// a prepared write is absent from pg_stat_activity (so the drain misses it)
+    /// and PostgreSQL permits COMMIT PREPARED in a read-only transaction, so it
+    /// could commit after the barrier. `max_prepared_transactions=0` on shard
+    /// databases makes this unreachable; the check catches a mis-provisioned
+    /// instance and fails the cutover closed.
+    async fn ensure_no_prepared(
+        client: &tokio_postgres::Client,
+        database: &str,
+    ) -> anyhow::Result<()> {
+        let prepared: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_prepared_xacts WHERE database = $1",
+                &[&database],
+            )
+            .await?
+            .get(0);
+        anyhow::ensure!(
+            prepared == 0,
+            "database {database} has {prepared} prepared transaction(s); a 2PC write could commit after the barrier. Disable prepared transactions on shard databases."
+        );
+        Ok(())
+    }
+
     /// Connect into a specific database on this instance (a node hosts one
     /// shard per DATABASE; publication DDL is database-scoped).
     async fn connect_to(&self, database: &str) -> anyhow::Result<tokio_postgres::Client> {
@@ -290,6 +380,68 @@ impl Instance for PgInstance {
             .await?
             .get(0);
         Ok(parse_lsn(&lsn))
+    }
+
+    async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32> {
+        // Run all DDL from a MAINTENANCE connection ('postgres'), never the
+        // target: a session connected INTO a read-only database runs in a
+        // read-only transaction and PostgreSQL refuses ALTER, so re-fence and
+        // un-fence would stall. DEPLOYMENT: the agent role must own the shard
+        // database (or be superuser) for ALTER DATABASE, and have
+        // pg_signal_backend for the drain; the maintenance database must exist
+        // and permit CONNECT.
+        let client = self.connect_to("postgres").await?;
+        let ident = quote_ident(database);
+
+        if !read_only {
+            // Un-fence: clear the read-only default and drop the sessions that
+            // still carry it (their reconnect is read-write). Reopen
+            // admissions in case a prior fence left them closed.
+            client
+                .batch_execute(&format!(
+                    "ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS true;
+                     ALTER DATABASE {ident} SET default_transaction_read_only = off"
+                ))
+                .await?;
+            self.drain_writers(&client, database, false).await?;
+            return Ok(0);
+        }
+
+        // FENCE via an ADMISSION BARRIER, so soundness never rests on a
+        // wall-clock cutoff (a backward clock adjustment could otherwise let
+        // an old-default backend escape a backend_start comparison):
+        //   1. ALLOW_CONNECTIONS false — no NEW session can connect at all;
+        //   2. drain every existing writer AND every still-starting client
+        //      backend (a backend admitted under the old read-write default is
+        //      visible as NULL-then-D, never invisible), sparing the reshard's
+        //      own pgshard_ readers, and refuse to proceed while any PREPARED
+        //      transaction exists — before AND after the drain — since a 2PC
+        //      write is absent from pg_stat_activity and COMMIT PREPARED is
+        //      allowed read-only;
+        //   3. set the read-only default;
+        //   4. ALLOW_CONNECTIONS true — every reconnect is now read-only.
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS false"
+            ))
+            .await?;
+        // Refuse a mis-provisioned instance early: any prepared write here can
+        // COMMIT PREPARED after the barrier.
+        Self::ensure_no_prepared(&client, database).await?;
+        let terminated = self.drain_writers(&client, database, true).await?;
+        // Re-check AFTER the drain, still with admissions closed: a writer could
+        // have PREPAREd between the first check and the drain — the drain kills
+        // its backend, but the prepared transaction survives and stays
+        // committable. With ALLOW_CONNECTIONS false no session can be admitted to
+        // PREPARE a new one, so this second observation of zero is stable.
+        Self::ensure_no_prepared(&client, database).await?;
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {ident} SET default_transaction_read_only = on;
+                 ALTER DATABASE {ident} WITH ALLOW_CONNECTIONS true"
+            ))
+            .await?;
+        Ok(terminated)
     }
 
     async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {

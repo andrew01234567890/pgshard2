@@ -125,6 +125,21 @@ pub trait Instance: Send + Sync + 'static {
     /// the point is immediately restorable. Only valid on a primary.
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
 
+    /// Make `database` provably write-quiescent for the cutover freeze: set
+    /// (TRUST ASSUMPTION: `default_transaction_read_only` is a DEFAULT a
+    /// session may override, and the `pgshard_` application_name spare is
+    /// client-asserted — so "write-quiescent" holds only because the shard
+    /// database's write credentials belong solely to trusted pgshard
+    /// components, which never spoof the prefix nor request a read-write
+    /// transaction. Untrusted direct write access is out of M1 scope.)
+    /// it `default_transaction_read_only` so every NEW session refuses writes,
+    /// then terminate the in-flight client backends still inside a
+    /// transaction so no write can commit AFTER the subsequent barrier. Their
+    /// reconnections land read-only. Returns how many backends were
+    /// terminated. Idempotent: a re-fence of an already-quiescent database
+    /// terminates nothing.
+    async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32>;
+
     /// Emit a transactional logical message (prefix `pgshard`, the given
     /// payload) INTO `database` and return the MESSAGE's own WAL position
     /// (`pg_logical_emit_message`'s return — the exact value the consumer's
@@ -187,6 +202,7 @@ pub mod fake {
         wal_switches: std::sync::atomic::AtomicU32,
         publications: Mutex<Publications>,
         journals: Mutex<Vec<(String, Vec<u8>)>>,
+        fenced_databases: Mutex<std::collections::BTreeSet<String>>,
     }
 
     impl FakeInstance {
@@ -262,6 +278,10 @@ pub mod fake {
 
         pub fn journals(&self) -> Vec<(String, Vec<u8>)> {
             self.journals.lock().unwrap().clone()
+        }
+
+        pub fn fenced_databases(&self) -> std::collections::BTreeSet<String> {
+            self.fenced_databases.lock().unwrap().clone()
         }
 
         pub fn restore_points(&self) -> Vec<String> {
@@ -389,6 +409,20 @@ pub mod fake {
             self.wal_switches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(s.write_lsn)
+        }
+
+        async fn fence_writes(&self, database: &str, read_only: bool) -> anyhow::Result<u32> {
+            anyhow::ensure!(
+                self.databases.lock().unwrap().contains_key(database),
+                "database {database} does not exist"
+            );
+            let mut fenced = self.fenced_databases.lock().unwrap();
+            if read_only {
+                fenced.insert(database.to_owned());
+            } else {
+                fenced.remove(database);
+            }
+            Ok(0)
         }
 
         async fn emit_journal(&self, database: &str, payload: &[u8]) -> anyhow::Result<u64> {

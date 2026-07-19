@@ -205,6 +205,21 @@ message CheckpointResponse {
   Lsn lsn = 1;
 }
 
+message FenceWritesRequest {
+  // The shard database to fence read-only before the cutover freeze.
+  string database = 1;
+  string target_pod_uid = 2;
+  // false (the proto3 DEFAULT) fences the database write-quiescent — the
+  // SAFE default, since an omitted field must never accidentally un-fence.
+  // true restores it read-write (a rollback un-fences the source).
+  bool unfence = 3;
+}
+
+message FenceWritesResponse {
+  // How many in-flight client backends were terminated to drain writers.
+  uint32 terminated = 1;
+}
+
 message EmitJournalRequest {
   JournalEvent journal = 1;
   // The shard database the journal message is emitted IN: logical messages
@@ -366,6 +381,7 @@ service AgentService {
   rpc StopWorkflow(StopWorkflowRequest) returns (StopWorkflowResponse);
   rpc WatchWorkflows(WatchWorkflowsRequest) returns (stream WatchWorkflowsResponse);
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc FenceWrites(FenceWritesRequest) returns (FenceWritesResponse);
   rpc EmitJournal(EmitJournalRequest) returns (EmitJournalResponse);
   rpc ShardStream(ShardStreamRequest) returns (stream ShardStreamResponse);
   rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
