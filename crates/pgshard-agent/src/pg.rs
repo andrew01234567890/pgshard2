@@ -296,7 +296,15 @@ impl Instance for PgInstance {
         let client = self.connect_to(database).await?;
         let setting = if read_only { "on" } else { "off" };
         // The database default governs every NEW session, including a router's
-        // reconnect after the termination below.
+        // reconnect after the termination below. Capture the moment it takes
+        // effect: sessions started AFTER it inherit the new default, so on a
+        // fence only the PRE-EXISTING (still read-write) writers need draining
+        // — a reconnect is already read-only and must NOT keep the drain loop
+        // alive forever.
+        let fence_time: std::time::SystemTime = client
+            .query_one("SELECT clock_timestamp()", &[])
+            .await?
+            .get(0);
         client
             .batch_execute(&format!(
                 "ALTER DATABASE {} SET default_transaction_read_only = {setting}",
@@ -331,16 +339,20 @@ impl Instance for PgInstance {
         // zero-timeout pg_terminate_backend only SIGTERMs, so a backend mid
         // COMMIT could finish after the RPC; wait up to 5s for actual exit
         // and confirm none remain before returning.
+        // Only backends that PREDATE the ALTER can still be read-write; a
+        // reconnect afterwards is read-only, so excluding it (backend_start >
+        // fence_time) lets the loop actually drain.
         const SELECT_WRITERS: &str = "SELECT pid FROM pg_stat_activity
              WHERE datname = current_database()
                AND pid <> pg_backend_pid()
                AND backend_type = 'client backend'
-               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'";
+               AND left(coalesce(application_name, ''), 8) <> 'pgshard_'
+               AND backend_start <= $1";
         let mut terminated = 0u32;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let pids: Vec<i32> = client
-                .query(SELECT_WRITERS, &[])
+                .query(SELECT_WRITERS, &[&fence_time])
                 .await?
                 .into_iter()
                 .map(|r| r.get(0))
