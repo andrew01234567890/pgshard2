@@ -18,6 +18,7 @@ import (
 
 var _ = Describe("PgShardRouting compilation", func() {
 	const ns = "default"
+	const rc3Split = "rc3-split"
 
 	reconcile := func(cluster string) {
 		r := &PgShardRoutingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -150,7 +151,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		reconcile("rc3")
 
 		rs := &pgshardv1alpha1.PgShardReshard{
-			ObjectMeta: metav1.ObjectMeta{Name: "rc3-split", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: rc3Split, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardReshardSpec{
 				ClusterRef:  "rc3",
 				SourceShard: "rc3-a",
@@ -177,7 +178,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		// A phase transition alone must NOT withdraw the gate: a reordered
 		// status event could otherwise publish a fresh ungated epoch still
 		// carrying the pre-switch topology and re-admit writes.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc3-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc3Split, Namespace: ns}, rs)).To(Succeed())
 		rs.Status.Phase = pgshardv1alpha1.ReshardSwitchedForward
 		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
 		reconcile("rc3")
@@ -186,7 +187,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 		// Clearing the FIELD (the cutover machine does this only after
 		// observing the switched serving set) withdraws the gate.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc3-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc3Split, Namespace: ns}, rs)).To(Succeed())
 		rs.Status.CutoverGateDeadline = nil
 		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
 		reconcile("rc3")
