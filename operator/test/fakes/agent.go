@@ -77,6 +77,7 @@ type FakeAgent struct {
 	startedWorkflows []*pgshardv1.StartWorkflowRequest
 	workflowPhases   map[string]pgshardv1.WorkflowPhase
 	workflowErrors   map[string]string
+	workflowLsns     map[string]uint64
 	startWorkflowErr error
 
 	server   *grpc.Server
@@ -485,21 +486,23 @@ func (f *FakeAgent) WatchWorkflows(
 			id    string
 			phase pgshardv1.WorkflowPhase
 			msg   string
+			lsn   uint64
 		}
 		var out []entry
 		for id, phase := range f.workflowPhases {
 			if len(req.GetIds()) > 0 && !slices.Contains(req.GetIds(), id) {
 				continue
 			}
-			out = append(out, entry{id, phase, f.workflowErrors[id]})
+			out = append(out, entry{id, phase, f.workflowErrors[id], f.workflowLsns[id]})
 		}
 		f.mu.Unlock()
 		for _, e := range out {
 			if err := stream.Send(&pgshardv1.WatchWorkflowsResponse{
 				Status: &pgshardv1.WorkflowStatus{
-					Id:    e.id,
-					Phase: e.phase,
-					Error: e.msg,
+					Id:         e.id,
+					Phase:      e.phase,
+					Error:      e.msg,
+					AppliedLsn: &pgshardv1.Lsn{Value: e.lsn},
 				},
 			}); err != nil {
 				return err
@@ -525,6 +528,33 @@ func (f *FakeAgent) SetWorkflowPhase(id string, phase pgshardv1.WorkflowPhase, e
 	}
 	f.workflowPhases[id] = phase
 	f.workflowErrors[id] = errMsg
+}
+
+// SetWorkflowLsn scripts the applied LSN WatchWorkflows reports for a workflow.
+func (f *FakeAgent) SetWorkflowLsn(id string, lsn uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.workflowLsns == nil {
+		f.workflowLsns = map[string]uint64{}
+	}
+	f.workflowLsns[id] = lsn
+}
+
+// SetWalWriteLsn scripts the instance's WAL write position (GetStatus).
+func (f *FakeAgent) SetWalWriteLsn(lsn uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Status.WalWriteLsn = &pgshardv1.Lsn{Value: lsn}
+}
+
+// ClearWorkflows drops all workflow state, modeling an agent restart (the
+// real registry is in-memory).
+func (f *FakeAgent) ClearWorkflows() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
+	f.workflowErrors = map[string]string{}
+	f.workflowLsns = map[string]uint64{}
 }
 
 // SetStartWorkflowError scripts StartWorkflow to fail with err (nil clears).

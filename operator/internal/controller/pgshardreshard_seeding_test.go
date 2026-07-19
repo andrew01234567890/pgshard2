@@ -269,6 +269,59 @@ var _ = Describe("PgShardReshard seeding", func() {
 		Expect(cond.Message).To(ContainSubstring("provenance mismatch"))
 	})
 
+	It("gates CatchingUp on replication lag and advances to ReadyToCutover", func() {
+		sourceAgent, targetAgent, reconcile, _ := seedSetup("rsd-lag", true)
+		// Reach CatchingUp (workflows stream by fake default).
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getReshard("rsd-lag").Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+
+		got := getReshard("rsd-lag")
+		uid := strings.ReplaceAll(string(got.UID), "-", "_")
+		ids := []string{"pgshard_rsd_lag_" + uid + "_t0", "pgshard_rsd_lag_" + uid + "_t1"}
+		// The slowest target is 32MiB behind: hold.
+		sourceAgent.SetWalWriteLsn(64 << 20)
+		targetAgent.SetWorkflowLsn(ids[0], 64<<20)
+		targetAgent.SetWorkflowLsn(ids[1], 32<<20)
+		res, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		got = getReshard("rsd-lag")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "Seeded")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("Lagging"))
+
+		// Both targets close within the bound: advance.
+		targetAgent.SetWorkflowLsn(ids[1], (64<<20)-(1<<20))
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		got = getReshard("rsd-lag")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardReadyToCutover))
+		Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, "Seeded")).To(BeTrue())
+	})
+
+	It("re-acks workflows lost to an agent restart during CatchingUp", func() {
+		sourceAgent, targetAgent, reconcile, _ := seedSetup("rsd-rest", true)
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getReshard("rsd-rest").Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+		started := len(targetAgent.StartedWorkflows())
+
+		// The registry is in-memory; a restarted agent knows nothing. The
+		// CatchingUp pass must re-ack (recreate) rather than trust history.
+		targetAgent.ClearWorkflows()
+		// The re-acked workflows report applied=0; a 64MiB source position
+		// keeps the pass in CatchingUp (Lagging) after the re-ack.
+		sourceAgent.SetWalWriteLsn(64 << 20)
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(targetAgent.StartedWorkflows())).To(BeNumerically(">", started),
+			"the lost workflows must be re-acked")
+		got := getReshard("rsd-rest")
+		Expect(got.Status.Phase).To(Equal(pgshardv1alpha1.ReshardCatchingUp))
+	})
+
 	It("fails closed when status.targetShards diverges from the spec-derived targets", func() {
 		_, targetAgent, reconcile, _ := seedSetup("rsd-tamper", true)
 		got := getReshard("rsd-tamper")
