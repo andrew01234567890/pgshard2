@@ -75,6 +75,7 @@ type FakeAgent struct {
 	// started). workflowErrors scripts a per-id error message reported with
 	// WORKFLOW_PHASE_ERROR. startWorkflowErr, when set, fails StartWorkflow.
 	startedWorkflows []*pgshardv1.StartWorkflowRequest
+	stoppedWorkflows []*pgshardv1.StopWorkflowRequest
 	workflowPhases   map[string]pgshardv1.WorkflowPhase
 	workflowErrors   map[string]string
 	workflowLsns     map[string]uint64
@@ -478,11 +479,21 @@ func (f *FakeAgent) StopWorkflow(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, "StopWorkflow")
+	f.stoppedWorkflows = append(f.stoppedWorkflows, req)
 	if f.workflowPhases == nil {
 		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
 	}
 	f.workflowPhases[req.GetId()] = pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STOPPED
 	return &pgshardv1.StopWorkflowResponse{}, nil
+}
+
+// StoppedWorkflows returns recorded StopWorkflow requests.
+func (f *FakeAgent) StoppedWorkflows() []*pgshardv1.StopWorkflowRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.StopWorkflowRequest, len(f.stoppedWorkflows))
+	copy(out, f.stoppedWorkflows)
+	return out
 }
 
 func (f *FakeAgent) WatchWorkflows(

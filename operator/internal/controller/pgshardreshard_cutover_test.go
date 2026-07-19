@@ -705,4 +705,64 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "croll", Namespace: ns}, &rt)).To(Succeed())
 		Expect(rt.Spec.Gates).To(BeEmpty())
 	})
+
+	It("re-parents the serving targets to the cluster and completes, retaining the fenced source", func() {
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("fin")
+		name := "rco-fin"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		drive(reconcile, routingReconcile, "the switched-forward phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardSwitchedForward
+		})
+
+		targets := get(name).Status.TargetShards
+		Expect(targets).NotTo(BeEmpty())
+		// Before finalize the targets are reshard-owned (for mid-seed rollback GC).
+		rsObj := get(name)
+		for _, t := range targets {
+			sh := getShard(t)
+			Expect(metav1.IsControlledBy(&sh, &rsObj)).To(BeTrue())
+		}
+
+		drive(reconcile, routingReconcile, "the completed phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardCompleted
+		})
+
+		var cl pgshardv1alpha1.PgShardCluster
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cfin", Namespace: ns}, &cl)).To(Succeed())
+		rsNow := get(name)
+		for _, t := range targets {
+			sh := getShard(t)
+			Expect(sh.Spec.Serving).To(BeTrue())
+			Expect(metav1.IsControlledBy(&sh, &cl)).To(BeTrue(),
+				"a serving target must be re-parented to the cluster")
+			Expect(metav1.IsControlledBy(&sh, &rsNow)).To(BeFalse(),
+				"the reshard must no longer own a serving target, or completing it would destroy live shards")
+		}
+		// The source is RETAINED: hidden and still fenced (a committed switch is
+		// never un-fenced).
+		Expect(getShard("cfin-src").Spec.Serving).To(BeFalse())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cfin-src"))
+		// Every target's forward workflow was stopped with its slot dropped so no
+		// slot leaks WAL on the retained source.
+		stopped := targetAgent.StoppedWorkflows()
+		Expect(stopped).NotTo(BeEmpty())
+		for _, s := range stopped {
+			Expect(s.GetDropSlot()).To(BeTrue())
+		}
+		// The cutover cleanup finalizer is released; the source claim is dropped.
+		Expect(get(name).Finalizers).NotTo(ContainElement(cutoverClaimFinalizer))
+		Expect(getShard("cfin-src").Annotations).NotTo(HaveKey("pgshard.dev/cutover-claim"))
+	})
 })
