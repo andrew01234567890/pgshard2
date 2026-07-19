@@ -360,6 +360,43 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"a committed switch must leave the hidden source fenced for good")
 	})
 
+	It("keeps a committed source fenced when a terminal validation fails the cutover", func() {
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("fc")
+		name := "rco-fc"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		drive(reconcile, routingReconcile, "the switched-forward phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardSwitchedForward
+		})
+		Expect(get(name).Status.SwitchCommitted).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cfc-src"))
+
+		// Re-enter CuttingOver with a stale ClusterUID so the next reconcile
+		// takes the ClusterReplaced terminal path (failCutover) while the switch
+		// is already committed. It must fail WITHOUT un-fencing the source.
+		rs := get(name)
+		rs.Status.Phase = pgshardv1alpha1.ReshardCuttingOver
+		rs.Status.ClusterUID = "stale-cluster-uid"
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cfc-src"),
+			"a terminal failure after commit must never re-admit writes to the diverged source")
+	})
+
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
 		_, _, reconcile, routingReconcile, _ := cutoverSetup("roll")
 		name := "rco-roll"

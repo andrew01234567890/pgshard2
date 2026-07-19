@@ -123,14 +123,18 @@ func (r *PgShardReshardReconciler) cleanupCutoverClaim(
 
 // failCutover marks the reshard Failed AND releases its source claim so a
 // replacement reshard is not blocked forever, and un-fences the source if a
-// freeze had fenced it.
+// freeze had fenced it — but NEVER a committed switch: once the source is
+// hidden and the targets have snapshotted past the barrier, re-admitting
+// writes would resurrect a diverged source, so it stays fenced even on a
+// terminal failure (a validation like ClusterReplaced can reach here after
+// the commit).
 func (r *PgShardReshardReconciler) failCutover(
 	ctx context.Context,
 	reshard *pgshardv1alpha1.PgShardReshard,
 	source *pgshardv1alpha1.PgShardShard,
 	reason, message string,
 ) (ctrl.Result, error) {
-	if source != nil && reshard.Status.SourceFenced {
+	if source != nil && reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
 		}
@@ -343,7 +347,10 @@ func (r *PgShardReshardReconciler) rollBackCutover(
 	source *pgshardv1alpha1.PgShardShard,
 	message string,
 ) (ctrl.Result, error) {
-	if reshard.Status.SourceFenced {
+	// A rollback is only ever for an UNCOMMITTED cutover; guard the un-fence on
+	// !SwitchCommitted defensively so a committed source can never be reopened
+	// even if a future caller reaches here in that state.
+	if reshard.Status.SourceFenced && !reshard.Status.SwitchCommitted {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
 		}
