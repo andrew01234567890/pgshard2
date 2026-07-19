@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -13,12 +14,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 	pgshardv1 "github.com/andrew01234567890/pgshard2/operator/internal/pb/pgshardv1"
 	"github.com/andrew01234567890/pgshard2/operator/test/fakes"
 )
+
+// foreignClaimReader is an uncached reader stub: it reports one named shard's
+// cutover claim as held by a foreign reshard, simulating an API-server truth
+// that a lagging informer cache has not yet caught up to. Every other read
+// delegates to the wrapped client.
+type foreignClaimReader struct {
+	client.Reader
+	shardName string
+	holder    string
+}
+
+func (f foreignClaimReader) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if err := f.Reader.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	if s, ok := obj.(*pgshardv1alpha1.PgShardShard); ok && s.Name == f.shardName {
+		if s.Annotations == nil {
+			s.Annotations = map[string]string{}
+		}
+		s.Annotations[cutoverClaimAnnotation] = f.holder
+	}
+	return nil
+}
 
 var _ = Describe("PgShardReshard cutover", func() {
 	const (
@@ -44,7 +71,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	// cutoverSetup drives a reshard to ReadyToCutover on a shared-placement
 	// cluster with a 1s write lease, returning the fakes and both reconcilers.
 	cutoverSetup := func(base string) (*fakes.FakeAgent, *fakes.FakeAgent,
-		func() (ctrl.Result, error), func(), []string) {
+		func() (ctrl.Result, error), func(), []string, *PgShardReshardReconciler) {
 		clusterName := "c" + base
 		reshardName := "rco-" + base
 
@@ -213,7 +240,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 		_, err = reconcile()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(get(reshardName).Status.Phase).To(Equal(pgshardv1alpha1.ReshardReadyToCutover))
-		return sourceAgent, targetAgent, reconcile, routingReconcile, ids
+		return sourceAgent, targetAgent, reconcile, routingReconcile, ids, rr
 	}
 
 	// drive reconciles both controllers until the predicate holds or times out.
@@ -235,7 +262,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	}
 
 	It("gates, quiesces, freezes, commits, and switches the serving set", func() {
-		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("happy")
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("happy")
 		name := "rco-happy"
 
 		// ReadyToCutover -> (finalizer) -> (claim) -> CuttingOver persists the
@@ -294,7 +321,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	})
 
 	It("cleanly deletes a pre-commit cutover, withdrawing gate and un-fencing", func() {
-		sourceAgent, _, reconcile, routingReconcile, _ := cutoverSetup("del")
+		sourceAgent, _, reconcile, routingReconcile, _, _ := cutoverSetup("del")
 		name := "rco-del"
 		for range 3 {
 			_, err := reconcile()
@@ -325,7 +352,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	})
 
 	It("keeps a committed source fenced when the object is deleted after the switch", func() {
-		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("dc")
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("dc")
 		name := "rco-dc"
 		for range 3 {
 			_, err := reconcile()
@@ -362,7 +389,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	})
 
 	It("keeps a committed source fenced when a terminal validation fails the cutover", func() {
-		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("fc")
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("fc")
 		name := "rco-fc"
 		for range 3 {
 			_, err := reconcile()
@@ -399,7 +426,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	})
 
 	It("retains the claim on a committed-but-unflipped source when a terminal validation fails", func() {
-		sourceAgent, targetAgent, reconcile, routingReconcile, ids := cutoverSetup("xo")
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("xo")
 		name := "rco-xo"
 		for range 3 {
 			_, err := reconcile()
@@ -452,7 +479,7 @@ var _ = Describe("PgShardReshard cutover", func() {
 	})
 
 	It("refuses to un-fence a source whose claim a replacement reshard now holds", func() {
-		sourceAgent, _, reconcile, routingReconcile, _ := cutoverSetup("so")
+		sourceAgent, _, reconcile, routingReconcile, _, _ := cutoverSetup("so")
 		name := "rco-so"
 		for range 3 {
 			_, err := reconcile()
@@ -493,8 +520,41 @@ var _ = Describe("PgShardReshard cutover", func() {
 			"A must not disturb the replacement reshard's claim")
 	})
 
+	It("authorizes un-fence from the uncached API reader, not the informer cache", func() {
+		sourceAgent, _, reconcile, routingReconcile, _, rr := cutoverSetup("ar")
+		name := "rco-ar"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(get(name).Status.SourceFenced).To(BeTrue())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("car-src"))
+
+		// The cached client (rr.Client) still shows A as the claim holder — a
+		// lagging informer. The uncached API reader reports the true, updated
+		// holder: a replacement reshard. unfenceSource must trust the API
+		// reader and refuse; if it read the cache it would un-fence a source a
+		// replacement now owns.
+		rr.APIReader = foreignClaimReader{Reader: k8sClient, shardName: "car-src", holder: "rco-replacement-b"}
+		rs := get(name)
+		rs.Status.ClusterUID = staleUID
+		Expect(k8sClient.Status().Update(ctx, &rs)).To(Succeed())
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(get(name).Status.Phase).To(Equal(pgshardv1alpha1.ReshardFailed))
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("car-src"),
+			"the uncached API reader showed a foreign holder, so A must not un-fence")
+	})
+
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {
-		_, _, reconcile, routingReconcile, _ := cutoverSetup("roll")
+		_, _, reconcile, routingReconcile, _, _ := cutoverSetup("roll")
 		name := "rco-roll"
 
 		for range 3 {

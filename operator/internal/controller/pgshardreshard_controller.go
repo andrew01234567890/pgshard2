@@ -49,6 +49,12 @@ import (
 type PgShardReshardReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader is an UNCACHED reader (mgr.GetAPIReader). The cutover claim on
+	// the source shard is the cross-object un-fence authorization token; a
+	// lagging informer could still show a stale holder, so that one check reads
+	// straight from the API server. Nil in tests (k8sClient is already
+	// uncached), so callers fall back to the cached client.
+	APIReader client.Reader
 	// Agents dials seeding RPCs on source and target agents. Nil until the
 	// Seeding phase needs it (tests inject dialAgent instead).
 	Agents *agentclient.Pool

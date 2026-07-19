@@ -396,8 +396,15 @@ func (r *PgShardReshardReconciler) rollBackCutover(
 func (r *PgShardReshardReconciler) unfenceSource(
 	ctx context.Context, reshard *pgshardv1alpha1.PgShardReshard, source *pgshardv1alpha1.PgShardShard,
 ) (ctrl.Result, bool, error) {
+	// Read the claim straight from the API server, not the informer cache: a
+	// lagging cache could still show this reshard as holder after the object
+	// records a replacement, which would wrongly authorize this un-fence.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
 	var live pgshardv1alpha1.PgShardShard
-	if err := r.Get(ctx, client.ObjectKeyFromObject(source), &live); err != nil {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(source), &live); err != nil {
 		return ctrl.Result{}, false, err
 	}
 	if live.Annotations[cutoverClaimAnnotation] != reshard.Name {
