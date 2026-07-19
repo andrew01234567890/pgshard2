@@ -53,6 +53,11 @@ func (r *PgShardRoutingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	result, err := r.compileAndWrite(ctx, &cluster)
 	if !apiequality.Semantic.DeepEqual(before.Conditions, cluster.Status.Conditions) {
 		if updateErr := r.Status().Update(ctx, &cluster); updateErr != nil {
+			// Surface it: a lost condition update would leave a stale
+			// RoutingCompiled verdict standing with no retry.
+			if err == nil {
+				return result, updateErr
+			}
 			log.Error(updateErr, "updating cluster routing condition")
 		}
 	}
@@ -62,7 +67,7 @@ func (r *PgShardRoutingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 func (r *PgShardRoutingReconciler) compileAndWrite(
 	ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster,
 ) (ctrl.Result, error) {
-	shards, err := r.clusterShards(ctx, cluster)
+	shards, nodes, err := r.clusterShards(ctx, cluster)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -76,7 +81,7 @@ func (r *PgShardRoutingReconciler) compileAndWrite(
 			tableConfigs = append(tableConfigs, cfg)
 		}
 	}
-	endpoints, err := r.resolveEndpoints(ctx, cluster.Namespace, shards)
+	endpoints, err := r.resolveEndpoints(ctx, cluster.Namespace, shards, nodes)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -106,14 +111,15 @@ func (r *PgShardRoutingReconciler) compileAndWrite(
 	}
 
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
-	epoch, changed, err := routing.Write(ctx, r.Client, key, desired)
+	epoch, _, err := routing.Write(ctx, r.Client, key, desired)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if changed {
-		if err := r.ensureRoutingOwned(ctx, key, cluster); err != nil {
-			return ctrl.Result{}, err
-		}
+	// Converge ownership EVERY reconcile: Write creates the object bare, and
+	// an ownership update lost to a crash or conflict must not stay lost
+	// behind an unchanged-spec short-circuit.
+	if err := r.ensureRoutingOwned(ctx, key, cluster); err != nil {
+		return ctrl.Result{}, err
 	}
 	apimeta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 		Type: routingCompiledCondition, Status: metav1.ConditionTrue,
@@ -123,33 +129,71 @@ func (r *PgShardRoutingReconciler) compileAndWrite(
 	return ctrl.Result{}, nil
 }
 
-// clusterShards lists the cluster's shards in name order (Compile re-sorts
-// canonically; a stable input order just keeps logs readable).
+// clusterShards lists the cluster's shards and OVERLAYS each placed shard's
+// instance view from its node — the authoritative source (the shard mirror
+// carries only phase and CurrentPrimary). The overlay is in-memory input for
+// the compiler, never written back.
 func (r *PgShardRoutingReconciler) clusterShards(
 	ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster,
-) ([]pgshardv1alpha1.PgShardShard, error) {
+) ([]pgshardv1alpha1.PgShardShard, map[string]*pgshardv1alpha1.PgShardNode, error) {
 	var list pgshardv1alpha1.PgShardShardList
 	if err := r.List(ctx, &list, client.InNamespace(cluster.Namespace)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	nodes := map[string]*pgshardv1alpha1.PgShardNode{}
 	var shards []pgshardv1alpha1.PgShardShard
 	for _, s := range list.Items {
-		if s.Spec.ClusterRef == cluster.Name {
-			shards = append(shards, s)
+		if s.Spec.ClusterRef != cluster.Name {
+			continue
 		}
+		if ref := s.Spec.NodeRef; ref != "" {
+			node, ok := nodes[ref]
+			if !ok {
+				var n pgshardv1alpha1.PgShardNode
+				err := r.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: ref}, &n)
+				switch {
+				case apierrors.IsNotFound(err):
+					nodes[ref] = nil
+				case err != nil:
+					return nil, nil, err
+				default:
+					nodes[ref] = &n
+				}
+				node = nodes[ref]
+			}
+			if node != nil {
+				s.Status.Instances = node.Status.Instances
+				s.Status.CurrentPrimary = node.Status.CurrentPrimary
+			} else {
+				// No node: publish the shard entry with NO endpoints rather
+				// than trust the stale mirrored status.
+				s.Status.Instances = nil
+				s.Status.CurrentPrimary = ""
+			}
+		}
+		shards = append(shards, s)
 	}
-	return shards, nil
+	return shards, nodes, nil
 }
 
-// resolveEndpoints maps every instance pod named in shard status to its
-// directly-dialable address. A pod that is missing or has no IP is simply
-// absent — the compiler then omits that endpoint, which is the fail-closed
-// posture (routers never dial a guess).
+// resolveEndpoints maps every instance pod to its directly-dialable address —
+// but ONLY when the live pod is still controlled by the node incarnation the
+// instance status describes. Names are reusable: a same-named replacement pod
+// under a recreated node must never inherit stale role/readiness evidence.
+// Anything unverifiable is simply absent; the compiler then omits that
+// endpoint (routers never dial a guess).
 func (r *PgShardRoutingReconciler) resolveEndpoints(
-	ctx context.Context, namespace string, shards []pgshardv1alpha1.PgShardShard,
+	ctx context.Context,
+	namespace string,
+	shards []pgshardv1alpha1.PgShardShard,
+	nodes map[string]*pgshardv1alpha1.PgShardNode,
 ) (map[string]pgshardv1alpha1.RoutingEndpoint, error) {
 	endpoints := map[string]pgshardv1alpha1.RoutingEndpoint{}
 	for _, shard := range shards {
+		node := nodes[shard.Spec.NodeRef]
+		if node == nil {
+			continue
+		}
 		for _, inst := range shard.Status.Instances {
 			if _, done := endpoints[inst.Pod]; done {
 				continue
@@ -162,7 +206,7 @@ func (r *PgShardRoutingReconciler) resolveEndpoints(
 				}
 				return nil, err
 			}
-			if pod.Status.PodIP == "" {
+			if !metav1.IsControlledBy(&pod, node) || pod.Status.PodIP == "" {
 				continue
 			}
 			endpoints[inst.Pod] = pgshardv1alpha1.RoutingEndpoint{
@@ -194,9 +238,12 @@ func (r *PgShardRoutingReconciler) cutoverGates(
 	}
 	var gates []pgshardv1alpha1.RoutingGate
 	for _, rs := range reshards.Items {
-		if rs.Spec.ClusterRef != cluster.Name ||
-			rs.Status.Phase != pgshardv1alpha1.ReshardCuttingOver ||
-			rs.Status.CutoverGateDeadline == nil {
+		// The gate follows the FIELD, never the phase: the cutover machine
+		// clears CutoverGateDeadline only after it has OBSERVED the switched
+		// serving set compiled into routing. A reordered phase transition can
+		// therefore never publish a fresh ungated epoch that still carries
+		// the pre-switch topology and re-admits writes to the old source.
+		if rs.Spec.ClusterRef != cluster.Name || rs.Status.CutoverGateDeadline == nil {
 			continue
 		}
 		source, ok := byName[rs.Spec.SourceShard]
@@ -267,11 +314,44 @@ func (r *PgShardRoutingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				Namespace: rs.Namespace, Name: rs.Spec.ClusterRef,
 			}}}
 		})
+	mapPod := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []ctrl.Request {
+			ref := metav1.GetControllerOf(obj)
+			if ref == nil || ref.Kind != "PgShardNode" {
+				return nil
+			}
+			var node pgshardv1alpha1.PgShardNode
+			if err := r.Get(ctx,
+				types.NamespacedName{Namespace: obj.GetNamespace(), Name: ref.Name}, &node); err != nil {
+				return nil
+			}
+			owner := metav1.GetControllerOf(&node)
+			if owner == nil {
+				return nil
+			}
+			switch owner.Kind {
+			case "PgShardCluster":
+				return []ctrl.Request{{NamespacedName: types.NamespacedName{
+					Namespace: node.Namespace, Name: owner.Name,
+				}}}
+			case "PgShardReshard":
+				var rs pgshardv1alpha1.PgShardReshard
+				if err := r.Get(ctx,
+					types.NamespacedName{Namespace: node.Namespace, Name: owner.Name}, &rs); err != nil {
+					return nil
+				}
+				return []ctrl.Request{{NamespacedName: types.NamespacedName{
+					Namespace: node.Namespace, Name: rs.Spec.ClusterRef,
+				}}}
+			}
+			return nil
+		})
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("pgshardrouting").
 		For(&pgshardv1alpha1.PgShardCluster{}).
 		Watches(&pgshardv1alpha1.PgShardShard{}, mapShard).
 		Watches(&pgshardv1alpha1.PgShardTableConfig{}, mapConfig).
 		Watches(&pgshardv1alpha1.PgShardReshard{}, mapReshard).
+		Watches(&corev1.Pod{}, mapPod).
 		Complete(r)
 }

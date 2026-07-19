@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard2/operator/api/v1alpha1"
 )
@@ -31,22 +32,33 @@ var _ = Describe("PgShardRouting compilation", func() {
 		return rt
 	}
 
-	makePod := func(name, ip string) {
+	// makeShard models the REAL placed-shard shape: the shard carries only
+	// NodeRef (its status mirror holds no instances); the NODE owns the pod
+	// and carries the instance view; the pod is controlled by the node.
+	makeShard := func(cluster, name, start, end, nodeName, podName, ip string) {
+		node := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ns},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{Name: "pg", Image: "pg"}},
 			},
 		}
+		Expect(controllerutil.SetControllerReference(node, pod, k8sClient.Scheme())).To(Succeed())
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.PodIP = ip
 		pod.Status.Phase = corev1.PodRunning
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-	}
+		node.Status.Phase = pgshardv1alpha1.NodeReady
+		node.Status.CurrentPrimary = podName
+		node.Status.Instances = []pgshardv1alpha1.InstanceState{
+			{Pod: podName, Ready: true, Role: "primary"},
+		}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
-	// makeShard fabricates a placed shard whose status mirrors a ready
-	// primary instance (as the shard controller maintains in production).
-	makeShard := func(cluster, name, start, end, pod string) {
 		s := &pgshardv1alpha1.PgShardShard{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardShardSpec{
@@ -55,14 +67,10 @@ var _ = Describe("PgShardRouting compilation", func() {
 				Replicas:   1,
 				Serving:    true,
 				Role:       pgshardv1alpha1.ShardRoleData,
+				NodeRef:    nodeName,
 			},
 		}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
-		s.Status.CurrentPrimary = pod
-		s.Status.Instances = []pgshardv1alpha1.InstanceState{
-			{Pod: pod, Ready: true, Role: "primary"},
-		}
-		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 	}
 
 	newCluster := func(name string) {
@@ -78,10 +86,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 	It("compiles routing with endpoints and bumps epochs monotonically", func() {
 		newCluster("rc1")
-		makePod("rc1-p0", "127.0.1.1")
-		makePod("rc1-p1", "127.0.1.2")
-		makeShard("rc1", "rc1-a", "", "80", "rc1-p0")
-		makeShard("rc1", "rc1-b", "80", "", "rc1-p1")
+		makeShard("rc1", "rc1-a", "", "80", "rc1-n0", "rc1-p0", "127.0.1.1")
+		makeShard("rc1", "rc1-b", "80", "", "rc1-n1", "rc1-p1", "127.0.1.2")
 
 		reconcile("rc1")
 		rt := getRouting("rc1")
@@ -114,10 +120,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 	It("keeps the last good routing when a compile fails", func() {
 		newCluster("rc2")
-		makePod("rc2-p0", "127.0.2.1")
-		makePod("rc2-p1", "127.0.2.2")
-		makeShard("rc2", "rc2-a", "", "80", "rc2-p0")
-		makeShard("rc2", "rc2-b", "80", "", "rc2-p1")
+		makeShard("rc2", "rc2-a", "", "80", "rc2-n0", "rc2-p0", "127.0.2.1")
+		makeShard("rc2", "rc2-b", "80", "", "rc2-n1", "rc2-p1", "127.0.2.2")
 		reconcile("rc2")
 		Expect(getRouting("rc2").Spec.Epoch).To(Equal(int64(1)))
 
@@ -141,10 +145,8 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 	It("emits and withdraws a cutover gate from a CuttingOver reshard", func() {
 		newCluster("rc3")
-		makePod("rc3-p0", "127.0.3.1")
-		makePod("rc3-p1", "127.0.3.2")
-		makeShard("rc3", "rc3-a", "", "80", "rc3-p0")
-		makeShard("rc3", "rc3-b", "80", "", "rc3-p1")
+		makeShard("rc3", "rc3-a", "", "80", "rc3-n0", "rc3-p0", "127.0.3.1")
+		makeShard("rc3", "rc3-b", "80", "", "rc3-n1", "rc3-p1", "127.0.3.2")
 		reconcile("rc3")
 
 		rs := &pgshardv1alpha1.PgShardReshard{
@@ -172,13 +174,56 @@ var _ = Describe("PgShardRouting compilation", func() {
 			pgshardv1alpha1.KeyRange{Start: "", End: "80"}))
 		gatedEpoch := rt.Spec.Epoch
 
-		// Leaving CuttingOver withdraws the gate with a fresh epoch.
+		// A phase transition alone must NOT withdraw the gate: a reordered
+		// status event could otherwise publish a fresh ungated epoch still
+		// carrying the pre-switch topology and re-admit writes.
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc3-split", Namespace: ns}, rs)).To(Succeed())
-		rs.Status.Phase = pgshardv1alpha1.ReshardCatchingUp
+		rs.Status.Phase = pgshardv1alpha1.ReshardSwitchedForward
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc3")
+		Expect(getRouting("rc3").Spec.Gates).To(HaveLen(1),
+			"the gate follows the deadline field, never the phase")
+
+		// Clearing the FIELD (the cutover machine does this only after
+		// observing the switched serving set) withdraws the gate.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc3-split", Namespace: ns}, rs)).To(Succeed())
+		rs.Status.CutoverGateDeadline = nil
 		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
 		reconcile("rc3")
 		rt = getRouting("rc3")
 		Expect(rt.Spec.Gates).To(BeEmpty())
 		Expect(rt.Spec.Epoch).To(BeNumerically(">", gatedEpoch))
+	})
+
+	It("never publishes an endpoint for a pod another node incarnation owns", func() {
+		newCluster("rc4")
+		makeShard("rc4", "rc4-a", "", "80", "rc4-n0", "rc4-p0", "127.0.4.1")
+		makeShard("rc4", "rc4-b", "80", "", "rc4-n1", "rc4-p1", "127.0.4.2")
+		reconcile("rc4")
+		rt := getRouting("rc4")
+		Expect(rt.Spec.Shards[0].Primary).NotTo(BeNil())
+
+		// Replace the pod under a DIFFERENT owner while the node status
+		// still names it: stale evidence must not bind to the new pod.
+		var pod corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc4-p0", Namespace: ns}, &pod)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &pod)).To(Succeed())
+		var otherNode pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc4-n1", Namespace: ns}, &otherNode)).To(Succeed())
+		replacement := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc4-p0", Namespace: ns},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "pg", Image: "pg"}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(&otherNode, replacement, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
+		replacement.Status.PodIP = "127.0.4.9"
+		Expect(k8sClient.Status().Update(ctx, replacement)).To(Succeed())
+
+		reconcile("rc4")
+		rt = getRouting("rc4")
+		Expect(rt.Spec.Shards[0].Primary).To(BeNil(),
+			"a foreign pod's address must never be published as this shard's primary")
 	})
 })
