@@ -19,7 +19,11 @@ import (
 
 var _ = Describe("PgShardRouting compilation", func() {
 	const ns = "default"
-	const rc3Split = "rc3-split"
+	const (
+		rc3Split = "rc3-split"
+		rc7Pod   = "rc7-p0"
+		rc8Split = "rc8-split"
+	)
 
 	reconcile := func(cluster string) {
 		r := &PgShardRoutingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -282,7 +286,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 	It("drops the primary when a same-named node incarnation replaces the attested one", func() {
 		newCluster("rc7")
-		makeShard("rc7", "rc7-a", "", "80", "rc7-n0", "rc7-p0", "127.0.7.1")
+		makeShard("rc7", "rc7-a", "", "80", "rc7-n0", rc7Pod, "127.0.7.1")
 		makeShard("rc7", "rc7-b", "80", "", "rc7-n1", "rc7-p1", "127.0.7.2")
 		reconcile("rc7")
 		Expect(getRouting("rc7").Spec.Shards[0].Primary).NotTo(BeNil())
@@ -294,7 +298,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc7-n0", Namespace: ns}, &node)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &node)).To(Succeed())
 		var pod corev1.Pod
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc7-p0", Namespace: ns}, &pod)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc7Pod, Namespace: ns}, &pod)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &pod)).To(Succeed())
 
 		fresh := &pgshardv1alpha1.PgShardNode{
@@ -303,7 +307,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		}
 		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
 		freshPod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "rc7-p0", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: rc7Pod, Namespace: ns},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{Name: "pg", Image: "pg"}},
 			},
@@ -313,9 +317,9 @@ var _ = Describe("PgShardRouting compilation", func() {
 		freshPod.Status.PodIP = "127.0.7.9"
 		Expect(k8sClient.Status().Update(ctx, freshPod)).To(Succeed())
 		fresh.Status.Phase = pgshardv1alpha1.NodeReady
-		fresh.Status.CurrentPrimary = "rc7-p0"
+		fresh.Status.CurrentPrimary = rc7Pod
 		fresh.Status.Instances = []pgshardv1alpha1.InstanceState{
-			{Pod: "rc7-p0", Ready: true, Role: "primary"},
+			{Pod: rc7Pod, Ready: true, Role: "primary"},
 		}
 		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
 
@@ -331,7 +335,7 @@ var _ = Describe("PgShardRouting compilation", func() {
 		reconcile("rc8")
 
 		rs := &pgshardv1alpha1.PgShardReshard{
-			ObjectMeta: metav1.ObjectMeta{Name: "rc8-split", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: rc8Split, Namespace: ns},
 			Spec: pgshardv1alpha1.PgShardReshardSpec{
 				ClusterRef:  "rc8",
 				SourceShard: "rc8-a",
@@ -349,9 +353,9 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 		// Deleting the reshard must NOT delete the only durable gate record:
 		// the finalizer keeps it, and the gate stays published.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc8Split, Namespace: ns}, rs)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc8Split, Namespace: ns}, rs)).To(Succeed())
 		Expect(rs.DeletionTimestamp).NotTo(BeNil())
 		reconcile("rc8")
 		Expect(getRouting("rc8").Spec.Gates).To(HaveLen(1),
@@ -359,12 +363,12 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 		// Clearing the gate (rollback semantics: SwitchCommitted false)
 		// releases the finalizer and the object goes away; the gate follows.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rc8Split, Namespace: ns}, rs)).To(Succeed())
 		rs.Status.CutoverGateDeadline = nil
 		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
 		reconcile("rc8")
 		Expect(apierrors.IsNotFound(
-			k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs))).To(BeTrue())
+			k8sClient.Get(ctx, types.NamespacedName{Name: rc8Split, Namespace: ns}, rs))).To(BeTrue())
 		reconcile("rc8")
 		Expect(getRouting("rc8").Spec.Gates).To(BeEmpty())
 	})
