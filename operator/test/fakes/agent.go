@@ -75,6 +75,11 @@ type FakeAgent struct {
 	// started). workflowErrors scripts a per-id error message reported with
 	// WORKFLOW_PHASE_ERROR. startWorkflowErr, when set, fails StartWorkflow.
 	startedWorkflows []*pgshardv1.StartWorkflowRequest
+	stoppedWorkflows []*pgshardv1.StopWorkflowRequest
+	droppedSlots     []*pgshardv1.DropSlotRequest
+	// activeSlots names slots the fake reports as still held by a consumer, so
+	// DropSlot answers FailedPrecondition until the name is cleared.
+	activeSlots      map[string]bool
 	workflowPhases   map[string]pgshardv1.WorkflowPhase
 	workflowErrors   map[string]string
 	workflowLsns     map[string]uint64
@@ -478,11 +483,28 @@ func (f *FakeAgent) StopWorkflow(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, "StopWorkflow")
+	// Mirror the real agent: slot cleanup is the source's DropSlot RPC, so
+	// StopWorkflow(drop_slot=true) is rejected. Guessing at a source slot name
+	// here would let a caller false-green an unimplemented path.
+	if req.GetDropSlot() {
+		return nil, status.Error(codes.Unimplemented,
+			"drop_slot is handled by the source agent's DropSlot")
+	}
+	f.stoppedWorkflows = append(f.stoppedWorkflows, req)
 	if f.workflowPhases == nil {
 		f.workflowPhases = map[string]pgshardv1.WorkflowPhase{}
 	}
 	f.workflowPhases[req.GetId()] = pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STOPPED
 	return &pgshardv1.StopWorkflowResponse{}, nil
+}
+
+// StoppedWorkflows returns recorded StopWorkflow requests.
+func (f *FakeAgent) StoppedWorkflows() []*pgshardv1.StopWorkflowRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.StopWorkflowRequest, len(f.stoppedWorkflows))
+	copy(out, f.stoppedWorkflows)
+	return out
 }
 
 func (f *FakeAgent) WatchWorkflows(
@@ -717,6 +739,44 @@ func (f *FakeAgent) DropDatabase(
 	delete(f.databases, req.Name)
 	delete(f.dbProvenance, req.Name)
 	return &pgshardv1.DropDatabaseResponse{}, nil
+}
+
+func (f *FakeAgent) DropSlot(
+	_ context.Context, req *pgshardv1.DropSlotRequest,
+) (*pgshardv1.DropSlotResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("DropSlot:" + req.GetSlot())
+	if f.podUID != "" && req.GetTargetPodUid() != "" && req.GetTargetPodUid() != f.podUID {
+		return nil, status.Errorf(codes.Aborted,
+			"request targets pod uid %s, but this agent serves %s", req.GetTargetPodUid(), f.podUID)
+	}
+	if f.activeSlots[req.GetSlot()] {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"replication slot %s is still active", req.GetSlot())
+	}
+	f.droppedSlots = append(f.droppedSlots, req)
+	return &pgshardv1.DropSlotResponse{}, nil
+}
+
+// DroppedSlots returns recorded DropSlot requests.
+func (f *FakeAgent) DroppedSlots() []*pgshardv1.DropSlotRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pgshardv1.DropSlotRequest, len(f.droppedSlots))
+	copy(out, f.droppedSlots)
+	return out
+}
+
+// SetSlotActive scripts DropSlot to report a slot as still consumer-held (or
+// clears it), so tests exercise the reaping retry.
+func (f *FakeAgent) SetSlotActive(slot string, active bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.activeSlots == nil {
+		f.activeSlots = map[string]bool{}
+	}
+	f.activeSlots[slot] = active
 }
 
 // Databases returns the shard databases the fake currently holds.

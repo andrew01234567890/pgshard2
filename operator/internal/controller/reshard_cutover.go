@@ -90,6 +90,37 @@ func (r *PgShardReshardReconciler) cleanupCutoverClaim(
 		return r.completeSwitch(ctx, reshard, &cluster, source)
 	}
 
+	// A committed switch's targets serve: re-parent them to the cluster before
+	// this finalizer is removed, or Kubernetes GC would delete live shards
+	// (and dedicated nodes / config maps) along with the reshard. A pre-commit
+	// delete intentionally skips this — its non-serving targets are meant to
+	// cascade away with the rolled-back reshard.
+	if reshard.Status.SwitchCommitted {
+		// Read the cluster UNCACHED: a stale cached NotFound or UID would let a
+		// delete drop the finalizer while serving targets stay reshard-owned and
+		// GC-eligible. On a genuine (authoritative) NotFound the cluster is gone
+		// and its own teardown reclaims the targets; on a UID mismatch (a
+		// same-name replacement) re-parenting would misadopt the serving targets,
+		// so hold for operator resolution rather than orphan or misadopt them.
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		var cluster pgshardv1alpha1.PgShardCluster
+		switch err := reader.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}, &cluster); {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return ctrl.Result{}, err
+		case reshard.Status.ClusterUID != string(cluster.UID):
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		default:
+			if res, done, err := r.reparentTargets(ctx, reshard, &cluster); err != nil || !done {
+				return res, err
+			}
+		}
+	}
+
 	// Pre-commit (or already switched): clear the gate request so the
 	// RoutingController withdraws its gate and removes its own finalizer —
 	// otherwise the object can never delete.

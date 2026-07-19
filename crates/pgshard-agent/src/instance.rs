@@ -163,7 +163,27 @@ pub trait Instance: Send + Sync + 'static {
         publication: &str,
         tables: &[(String, String)],
     ) -> anyhow::Result<Option<u64>>;
+
+    /// Drop the logical replication slot `slot` on `database`, refusing unless
+    /// it is INACTIVE (no consumer holds it), uses the pgoutput plugin, and
+    /// belongs to `database`. A slot that does not exist is a no-op (idempotent
+    /// cleanup). An ACTIVE slot returns an error so a caller retries once the
+    /// stopped consumer's walsender is reaped — never yanking a live slot.
+    async fn drop_slot(&self, database: &str, slot: &str) -> anyhow::Result<()>;
 }
+
+/// A replication slot named by a caller is still held by its consumer's
+/// walsender (drop refused until reaped), distinct from any other failure.
+#[derive(Debug)]
+pub struct SlotActive(pub String);
+
+impl std::fmt::Display for SlotActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "replication slot {} is still active", self.0)
+    }
+}
+
+impl std::error::Error for SlotActive {}
 
 /// An in-memory instance for tests: `snapshot` returns the scripted state and
 /// the commands mutate it the way a real instance would.
@@ -203,6 +223,7 @@ pub mod fake {
         publications: Mutex<Publications>,
         journals: Mutex<Vec<(String, Vec<u8>)>>,
         fenced_databases: Mutex<std::collections::BTreeSet<String>>,
+        dropped_slots: Mutex<Vec<String>>,
     }
 
     impl FakeInstance {
@@ -452,6 +473,11 @@ pub mod fake {
                 tables.to_vec(),
             );
             Ok(Some(1 << 30))
+        }
+
+        async fn drop_slot(&self, _database: &str, slot: &str) -> anyhow::Result<()> {
+            self.dropped_slots.lock().unwrap().push(slot.to_owned());
+            Ok(())
         }
     }
 }

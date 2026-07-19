@@ -121,6 +121,10 @@ func (r *PgShardReshardReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		result, err = r.reconcileReadyToCutover(ctx, &reshard)
 	case pgshardv1alpha1.ReshardCuttingOver:
 		result, err = r.reconcileCuttingOver(ctx, &reshard)
+	case pgshardv1alpha1.ReshardSwitchedForward:
+		result, err = r.reconcileSwitchedForward(ctx, &reshard)
+	case pgshardv1alpha1.ReshardFinalizing:
+		result, err = r.reconcileFinalizing(ctx, &reshard)
 	default:
 		return ctrl.Result{}, nil
 	}

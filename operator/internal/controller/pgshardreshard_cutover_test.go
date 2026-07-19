@@ -705,4 +705,116 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "croll", Namespace: ns}, &rt)).To(Succeed())
 		Expect(rt.Spec.Gates).To(BeEmpty())
 	})
+
+	It("re-parents the serving targets to the cluster and completes, retaining the fenced source", func() {
+		sourceAgent, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("fin")
+		name := "rco-fin"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		drive(reconcile, routingReconcile, "the switched-forward phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardSwitchedForward
+		})
+
+		targets := get(name).Status.TargetShards
+		Expect(targets).NotTo(BeEmpty())
+		// Before finalize the targets are reshard-owned (for mid-seed rollback GC).
+		rsObj := get(name)
+		for _, t := range targets {
+			sh := getShard(t)
+			Expect(metav1.IsControlledBy(&sh, &rsObj)).To(BeTrue())
+		}
+
+		drive(reconcile, routingReconcile, "the completed phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardCompleted
+		})
+
+		var cl pgshardv1alpha1.PgShardCluster
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cfin", Namespace: ns}, &cl)).To(Succeed())
+		rsNow := get(name)
+		for _, t := range targets {
+			sh := getShard(t)
+			Expect(sh.Spec.Serving).To(BeTrue())
+			Expect(metav1.IsControlledBy(&sh, &cl)).To(BeTrue(),
+				"a serving target must be re-parented to the cluster")
+			Expect(metav1.IsControlledBy(&sh, &rsNow)).To(BeFalse(),
+				"the reshard must no longer own a serving target, or completing it would destroy live shards")
+		}
+		// The source is RETAINED: hidden and still fenced (a committed switch is
+		// never un-fenced).
+		Expect(getShard("cfin-src").Spec.Serving).To(BeFalse())
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cfin-src"))
+		// Every target's forward workflow was stopped WITHOUT drop_slot (the
+		// slot lives on the source and is dropped by the source's DropSlot RPC).
+		stopped := targetAgent.StoppedWorkflows()
+		Expect(stopped).NotTo(BeEmpty())
+		for _, s := range stopped {
+			Expect(s.GetDropSlot()).To(BeFalse())
+		}
+		// Each target's forward slot was dropped on the source so no inactive
+		// slot retains WAL on the retained (shared-instance) source.
+		dropped := sourceAgent.DroppedSlots()
+		Expect(dropped).To(HaveLen(len(targets)))
+		for _, d := range dropped {
+			Expect(d.GetDatabase()).To(Equal("cfin-src"))
+			Expect(d.GetSlot()).To(HavePrefix("pgshard_"))
+		}
+		// The cutover cleanup finalizer is released; the source claim is dropped.
+		Expect(get(name).Finalizers).NotTo(ContainElement(cutoverClaimFinalizer))
+		Expect(getShard("cfin-src").Annotations).NotTo(HaveKey("pgshard.dev/cutover-claim"))
+	})
+
+	It("re-parents committed targets when a SwitchedForward reshard is deleted before finalizing", func() {
+		_, targetAgent, reconcile, routingReconcile, ids, _ := cutoverSetup("fdc")
+		name := "rco-fdc"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		for _, id := range ids {
+			targetAgent.SetWorkflowJournalLsn(id, barrier)
+		}
+		drive(reconcile, routingReconcile, "the switched-forward phase", func() bool {
+			return get(name).Status.Phase == pgshardv1alpha1.ReshardSwitchedForward
+		})
+		targets := get(name).Status.TargetShards
+		Expect(targets).NotTo(BeEmpty())
+
+		// Delete the reshard while it is committed but BEFORE it finalizes. The
+		// cleanup path must re-parent the serving targets to the cluster before
+		// dropping the finalizer, or real Kubernetes GC would delete live shards.
+		rs := get(name)
+		Expect(k8sClient.Delete(ctx, &rs)).To(Succeed())
+		drive(reconcile, routingReconcile, "the reshard to be gone", func() bool {
+			var got pgshardv1alpha1.PgShardReshard
+			return apierrors.IsNotFound(
+				k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &got))
+		})
+
+		var cl pgshardv1alpha1.PgShardCluster
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cfdc", Namespace: ns}, &cl)).To(Succeed())
+		for _, t := range targets {
+			var sh pgshardv1alpha1.PgShardShard
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: t, Namespace: ns}, &sh)).To(Succeed())
+			Expect(sh.Spec.Serving).To(BeTrue())
+			Expect(metav1.IsControlledBy(&sh, &cl)).To(BeTrue(),
+				"deleting a committed reshard must re-parent its serving targets to the cluster")
+		}
+	})
 })
