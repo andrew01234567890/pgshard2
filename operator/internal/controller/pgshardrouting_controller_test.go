@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -72,9 +73,17 @@ var _ = Describe("PgShardRouting compilation", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
-		// The shard controller mirrors CurrentPrimary only after the
-		// database verification chain passes; instances stay on the node.
+		// The shard controller publishes CurrentPrimary only after the full
+		// database verification chain passes; mirror the whole chain here as
+		// production records it (instances stay on the node).
 		s.Status.CurrentPrimary = podName
+		s.Status.DatabaseNode = nodeName
+		s.Status.DatabaseNodeUID = string(node.UID)
+		s.Status.DatabasePodUID = string(pod.UID)
+		apimeta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type: shardDatabaseReadyCondition, Status: metav1.ConditionTrue,
+			Reason: "Provisioned", Message: "test",
+		})
 		Expect(k8sClient.Status().Update(ctx, s)).To(Succeed())
 	}
 
@@ -269,6 +278,95 @@ var _ = Describe("PgShardRouting compilation", func() {
 
 		Expect(getRouting("rc6").Spec.Epoch).To(Equal(epoch),
 			"an active gate with no source must never compile away silently")
+	})
+
+	It("drops the primary when a same-named node incarnation replaces the attested one", func() {
+		newCluster("rc7")
+		makeShard("rc7", "rc7-a", "", "80", "rc7-n0", "rc7-p0", "127.0.7.1")
+		makeShard("rc7", "rc7-b", "80", "", "rc7-n1", "rc7-p1", "127.0.7.2")
+		reconcile("rc7")
+		Expect(getRouting("rc7").Spec.Shards[0].Primary).NotTo(BeNil())
+
+		// Recreate node AND pod under the same names: new UIDs, ready
+		// instance view — but the shard's attestation names the OLD
+		// incarnation. No primary may be published until re-verification.
+		var node pgshardv1alpha1.PgShardNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc7-n0", Namespace: ns}, &node)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &node)).To(Succeed())
+		var pod corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc7-p0", Namespace: ns}, &pod)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &pod)).To(Succeed())
+
+		fresh := &pgshardv1alpha1.PgShardNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc7-n0", Namespace: ns},
+			Spec:       pgshardv1alpha1.PgShardNodeSpec{Replicas: 1},
+		}
+		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
+		freshPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc7-p0", Namespace: ns},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "pg", Image: "pg"}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(fresh, freshPod, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, freshPod)).To(Succeed())
+		freshPod.Status.PodIP = "127.0.7.9"
+		Expect(k8sClient.Status().Update(ctx, freshPod)).To(Succeed())
+		fresh.Status.Phase = pgshardv1alpha1.NodeReady
+		fresh.Status.CurrentPrimary = "rc7-p0"
+		fresh.Status.Instances = []pgshardv1alpha1.InstanceState{
+			{Pod: "rc7-p0", Ready: true, Role: "primary"},
+		}
+		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+
+		reconcile("rc7")
+		Expect(getRouting("rc7").Spec.Shards[0].Primary).To(BeNil(),
+			"stale attestation must not bind to a same-named replacement incarnation")
+	})
+
+	It("pins a gating reshard with a finalizer until nothing load-bearing remains", func() {
+		newCluster("rc8")
+		makeShard("rc8", "rc8-a", "", "80", "rc8-n0", "rc8-p0", "127.0.8.1")
+		makeShard("rc8", "rc8-b", "80", "", "rc8-n1", "rc8-p1", "127.0.8.2")
+		reconcile("rc8")
+
+		rs := &pgshardv1alpha1.PgShardReshard{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc8-split", Namespace: ns},
+			Spec: pgshardv1alpha1.PgShardReshardSpec{
+				ClusterRef:  "rc8",
+				SourceShard: "rc8-a",
+				TargetRanges: []pgshardv1alpha1.KeyRange{
+					{Start: "", End: "40"}, {Start: "40", End: "80"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+		deadline := metav1.NewTime(time.Now().Add(time.Minute).Truncate(time.Second))
+		rs.Status.CutoverGateDeadline = &deadline
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc8")
+		Expect(getRouting("rc8").Spec.Gates).To(HaveLen(1))
+
+		// Deleting the reshard must NOT delete the only durable gate record:
+		// the finalizer keeps it, and the gate stays published.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		Expect(rs.DeletionTimestamp).NotTo(BeNil())
+		reconcile("rc8")
+		Expect(getRouting("rc8").Spec.Gates).To(HaveLen(1),
+			"a deleted-but-finalized reshard's gate must stand")
+
+		// Clearing the gate (rollback semantics: SwitchCommitted false)
+		// releases the finalizer and the object goes away; the gate follows.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs)).To(Succeed())
+		rs.Status.CutoverGateDeadline = nil
+		Expect(k8sClient.Status().Update(ctx, rs)).To(Succeed())
+		reconcile("rc8")
+		Expect(apierrors.IsNotFound(
+			k8sClient.Get(ctx, types.NamespacedName{Name: "rc8-split", Namespace: ns}, rs))).To(BeTrue())
+		reconcile("rc8")
+		Expect(getRouting("rc8").Spec.Gates).To(BeEmpty())
 	})
 
 	It("never publishes an endpoint for a pod another node incarnation owns", func() {

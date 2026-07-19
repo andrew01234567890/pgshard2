@@ -39,7 +39,7 @@ type PgShardRoutingReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardshards,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardtableconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgshard.dev,resources=pgshardreshards,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 func (r *PgShardRoutingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -175,6 +175,14 @@ func (r *PgShardRoutingReconciler) clusterShards(
 				// this exact node incarnation and pod) — copying the node's
 				// raw primary would bypass that per-database verification.
 				s.Status.Instances = node.Status.Instances
+				// The attestation must hold against the LIVE objects: names
+				// are deterministic, so a recreated node or pod could wear
+				// the recorded name with a different UID. Re-verify the full
+				// chain (DatabaseReady + node UID + pod UID) or publish no
+				// primary at all.
+				if !r.primaryStillVerified(ctx, &s, node) {
+					s.Status.CurrentPrimary = ""
+				}
 			} else {
 				// No node: publish the shard entry with NO endpoints rather
 				// than trust the stale mirrored status.
@@ -185,6 +193,28 @@ func (r *PgShardRoutingReconciler) clusterShards(
 		shards = append(shards, s)
 	}
 	return shards, nodes, nil
+}
+
+// primaryStillVerified re-checks the shard's database attestation against the
+// LIVE node and primary pod: DatabaseReady, the recorded node UID, and the
+// recorded pod UID must all match the objects currently wearing those names.
+func (r *PgShardRoutingReconciler) primaryStillVerified(
+	ctx context.Context,
+	shard *pgshardv1alpha1.PgShardShard,
+	node *pgshardv1alpha1.PgShardNode,
+) bool {
+	if shard.Status.CurrentPrimary == "" {
+		return false
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx,
+		client.ObjectKey{Namespace: shard.Namespace, Name: shard.Status.CurrentPrimary}, &pod); err != nil {
+		return false
+	}
+	if !metav1.IsControlledBy(&pod, node) {
+		return false
+	}
+	return databaseVerified(shard, node, &pod)
 }
 
 // resolveEndpoints maps every instance pod to its directly-dialable address —
@@ -248,11 +278,21 @@ func (r *PgShardRoutingReconciler) cutoverGates(
 		byName[shards[i].Name] = &shards[i]
 	}
 	var gates []pgshardv1alpha1.RoutingGate
-	for _, rs := range reshards.Items {
+	for i := range reshards.Items {
+		rs := &reshards.Items[i]
 		if rs.Spec.ClusterRef != cluster.Name {
 			continue
 		}
 		source := byName[rs.Spec.SourceShard]
+		// The reshard object is the ONLY durable record of an active gate or
+		// a committed-but-unflipped switch: deleting it would recompile
+		// ungated routing and re-admit writes to the old source. A finalizer
+		// holds the object while either is load-bearing.
+		holding := rs.Status.CutoverGateDeadline != nil ||
+			(rs.Status.SwitchCommitted && source != nil && source.Spec.Serving)
+		if err := r.syncGateFinalizer(ctx, rs, holding); err != nil {
+			return nil, err
+		}
 		// The gate follows the FIELD, never the phase: the cutover machine
 		// clears CutoverGateDeadline only after it has OBSERVED the switched
 		// serving set compiled into routing. A reordered phase transition can
@@ -289,6 +329,25 @@ func (r *PgShardRoutingReconciler) cutoverGates(
 		})
 	}
 	return gates, nil
+}
+
+// routingGateFinalizer pins a PgShardReshard while its gate or its committed
+// switch fence is what keeps writes off the old source.
+const routingGateFinalizer = "pgshard.dev/routing-gate"
+
+func (r *PgShardRoutingReconciler) syncGateFinalizer(
+	ctx context.Context, rs *pgshardv1alpha1.PgShardReshard, holding bool,
+) error {
+	has := controllerutil.ContainsFinalizer(rs, routingGateFinalizer)
+	switch {
+	case holding && !has:
+		controllerutil.AddFinalizer(rs, routingGateFinalizer)
+		return r.Update(ctx, rs)
+	case !holding && has:
+		controllerutil.RemoveFinalizer(rs, routingGateFinalizer)
+		return r.Update(ctx, rs)
+	}
+	return nil
 }
 
 // ensureRoutingOwned parents the routing object to its cluster so deletion
