@@ -453,6 +453,9 @@ func (r *PgShardReshardReconciler) gateCatchup(
 		return r.hold(reshard, "SourceStatusUnavailable",
 			fmt.Sprintf("source pod %s stopped being the verified primary during the status read", sourcePod.Name))
 	}
+	if status.GetWalWriteLsn() == nil {
+		return r.hold(reshard, "LagUnmeasurable", "the source reports no WAL write position")
+	}
 	writeLsn := status.GetWalWriteLsn().GetValue()
 	var minApplied uint64
 	for i, a := range applied {
@@ -732,6 +735,18 @@ func (r *PgShardReshardReconciler) seedTarget(
 	status, err := r.workflowStatus(ctx, targetAgent, id)
 	if err != nil {
 		return holdOn("WorkflowStatusUnavailable", err.Error())
+	}
+	// Re-confirm the TARGET pod remained the verified primary across the
+	// status RPC, mirroring the source-side check: a failover during the
+	// read would otherwise let a deposed instance's watermark gate cutover.
+	confirmPod, confirmNode, err := r.primaryEndpoint(ctx, reshard.Namespace, target.Spec.NodeRef)
+	if err != nil {
+		return false, nil, false, ctrl.Result{}, err
+	}
+	if confirmPod == nil || confirmPod.UID != targetPod.UID ||
+		!databaseVerified(&target, confirmNode, confirmPod) {
+		return holdOn("TargetUnready",
+			fmt.Sprintf("target shard %q primary changed during the status read", targetName))
 	}
 	switch status.GetPhase() {
 	case pgshardv1.WorkflowPhase_WORKFLOW_PHASE_STREAMING:

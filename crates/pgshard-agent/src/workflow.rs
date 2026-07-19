@@ -1041,12 +1041,6 @@ async fn run_workflow(
     // watermark STARTS at the slot's consistent point: everything at or
     // before it arrived via the snapshot copy, so an idle source (no commits
     // to stream) still reports an honest, convergeable position.
-    status.send_modify(|s| {
-        s.phase = v1::WorkflowPhase::Streaming as i32;
-        s.applied_lsn = Some(v1::Lsn {
-            value: consistent_point.0,
-        });
-    });
     repl.start_replication(&run.slot, &run.publication).await?;
     let mut applier = Applier::new(
         connect_sql(&config.target, &run.target_database).await?,
@@ -1054,6 +1048,15 @@ async fn run_workflow(
     )
     .await
     .map_err(|e| anyhow::anyhow!("applier: {e}"))?;
+    // Publish STREAMING (and the initial watermark) only once the stream AND
+    // the applier actually exist: publishing earlier would let the operator
+    // read a caught-up-looking status with no live consumer behind it.
+    status.send_modify(|s| {
+        s.phase = v1::WorkflowPhase::Streaming as i32;
+        s.applied_lsn = Some(v1::Lsn {
+            value: consistent_point.0,
+        });
+    });
     let mut decoder = PgOutputDecoder::new(4);
     let mut relations: HashMap<u32, RelFilter> = HashMap::new();
     // ALTER PUBLICATION mid-stream makes pgoutput silently omit changes with
