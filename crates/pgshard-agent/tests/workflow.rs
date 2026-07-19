@@ -752,12 +752,13 @@ async fn a_journal_barrier_converges_every_workflow_past_it() -> anyhow::Result<
 
     // The workflow must ACK the journal explicitly: journal_lsn is the
     // decoded message's own position — the database-local barrier the
-    // cutover compares, never an instance-global WAL read.
+    // cutover compares (>=: a later journal only raises it), never an
+    // instance-global WAL read.
     wait_for(
         &registry,
         "wf_journal",
         "the barrier acknowledgement",
-        |s| s.journal_lsn.as_ref().is_some_and(|l| l.value == frozen),
+        |s| s.journal_lsn.as_ref().is_some_and(|l| l.value >= frozen),
     )
     .await;
     Ok(())

@@ -170,8 +170,9 @@ fn check_provenance(value: &str) -> Result<(), Status> {
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-/// One journal id's single-flight slot: recorded (lsn, exact payload).
-type JournalSlot = Arc<tokio::sync::Mutex<Option<(u64, Vec<u8>)>>>;
+/// One journal id's single-flight slot: recorded (database, exact payload,
+/// lsn) — the retry must match ALL of what was emitted, not just the bytes.
+type JournalSlot = Arc<tokio::sync::Mutex<Option<(String, Vec<u8>, u64)>>>;
 
 #[tonic::async_trait]
 impl<I: Instance> AgentService for AgentSvc<I> {
@@ -551,24 +552,35 @@ impl<I: Instance> AgentService for AgentSvc<I> {
             let mut journals = self.journals.lock().await;
             journals.entry(req.id.clone()).or_default().clone()
         };
-        let mut recorded = slot.lock().await;
-        if let Some((lsn, prior)) = recorded.as_ref() {
-            if *prior != payload {
-                return Err(Status::failed_precondition(format!(
-                    "journal id {:?} was already emitted with a different payload",
-                    req.id
-                )));
+        // Same shape as create_restore_point: a DETACHED slot-owning task, so
+        // a caller cancelled between the COMMIT and the slot write cannot
+        // leave the slot empty and let a retry emit a SECOND journal record
+        // for the same cutover.
+        let instance = self.instance.clone();
+        let (id, database) = (req.id.clone(), req.database.clone());
+        let lsn = tokio::spawn(async move {
+            let mut recorded = slot.lock().await;
+            if let Some((db, prior, lsn)) = recorded.as_ref() {
+                if *db != database || *prior != payload {
+                    return Ok(Err(format!(
+                        "journal id {id:?} was already emitted with a different database or payload"
+                    )));
+                }
+                return Ok(Ok(*lsn));
             }
-            return Ok(Response::new(v1::EmitJournalResponse {
-                lsn: Some(v1::Lsn { value: *lsn }),
-            }));
-        }
-        let lsn = self
-            .instance
-            .emit_journal(&req.database, &payload)
+            let lsn = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                instance.emit_journal(&database, &payload),
+            )
             .await
-            .map_err(internal)?;
-        *recorded = Some((lsn, payload));
+            .map_err(|_| anyhow::anyhow!("journal emit {id:?} timed out; outcome unknown"))??;
+            *recorded = Some((database, payload, lsn));
+            Ok::<Result<u64, String>, anyhow::Error>(Ok(lsn))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("journal task failed: {e}")))?
+        .map_err(internal)?
+        .map_err(Status::failed_precondition)?;
         Ok(Response::new(v1::EmitJournalResponse {
             lsn: Some(v1::Lsn { value: lsn }),
         }))

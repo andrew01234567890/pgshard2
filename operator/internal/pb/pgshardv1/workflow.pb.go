@@ -559,9 +559,12 @@ type WorkflowStatus struct {
 	Error      string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
 	// The pgshard journal message most recently DECODED by this workflow (its
 	// own WAL position, as carried in the Message frame). The cutover freeze
-	// compares this against the emitted barrier's message LSN: an explicit
-	// acknowledgement, immune to instance-global WAL positions moved by other
-	// databases (which produce no frames on this slot).
+	// compares journal_lsn >= the emitted barrier's LSN — never equality:
+	// journal messages decode in WAL order, so a LATER journal (another
+	// reshard of the same database) can only raise this value, and passing
+	// the barrier's position still proves everything before it was decoded.
+	// An explicit acknowledgement, immune to instance-global WAL positions
+	// moved by other databases (which produce no frames on this slot).
 	JournalLsn    *Lsn `protobuf:"bytes,8,opt,name=journal_lsn,json=journalLsn,proto3" json:"journal_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
