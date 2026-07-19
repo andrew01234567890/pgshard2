@@ -76,6 +76,29 @@ func (r *PgShardReshardReconciler) cleanupCutoverClaim(
 		return ctrl.Result{}, nil
 	}
 	source := r.sourceForCleanup(ctx, reshard)
+
+	// A committed switch is the point of no return: it must COMPLETE (source
+	// hidden, targets serving) before the object may go, or clearing the gate
+	// while the source still serves would re-admit writes the targets have
+	// snapshotted past. Finish the switch, then this cleanup proceeds.
+	if reshard.Status.SwitchCommitted && source != nil && source.Spec.Serving {
+		var cluster pgshardv1alpha1.PgShardCluster
+		if err := r.Get(ctx,
+			client.ObjectKey{Namespace: reshard.Namespace, Name: reshard.Spec.ClusterRef}, &cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.completeSwitch(ctx, reshard, &cluster, source)
+	}
+
+	// Pre-commit (or already switched): clear the gate request so the
+	// RoutingController withdraws its gate and removes its own finalizer —
+	// otherwise the object can never delete.
+	if reshard.Status.CutoverGateDeadline != nil {
+		reshard.Status.CutoverGateDeadline = nil
+		if err := r.Status().Update(ctx, reshard); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if source != nil && reshard.Status.SourceFenced {
 		if res, ok, err := r.unfenceSource(ctx, reshard, source); err != nil || !ok {
 			return res, err
@@ -257,6 +280,15 @@ func (r *PgShardReshardReconciler) reconcileCuttingOver(
 		return ctrl.Result{RequeueAfter: quiesceAt.Sub(now) + time.Second}, nil
 	}
 
+	// Record "fence cleanup owed" DURABLY before the external fence side
+	// effect: a crash or failed status write after FenceWrites but before a
+	// later persist would otherwise leave the source read-only with
+	// SourceFenced=false, and cleanup would skip un-fencing.
+	if reshard.Status.CutoverFrozenLSN == 0 && !reshard.Status.SourceFenced {
+		reshard.Status.SourceFenced = true
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Step 3: freeze. First make the source provably write-quiescent — a
 	// timing margin alone cannot prove a write admitted just before lease
 	// expiry has committed, so the source database is set read-only and its
@@ -425,12 +457,6 @@ func (r *PgShardReshardReconciler) freezeSource(
 		default:
 			return r.holdCutover(reshard, "FenceFailed", err.Error())
 		}
-	}
-	// Record the fence DURABLY before the emit: a failed/rejected emit, a
-	// crash, or a deadline must still un-fence on cleanup.
-	if !reshard.Status.SourceFenced {
-		reshard.Status.SourceFenced = true
-		return ctrl.Result{Requeue: true}, nil
 	}
 	successors := make([]*pgshardv1.JournalSuccessor, 0, len(reshard.Status.TargetShards))
 	for i, name := range reshard.Status.TargetShards {

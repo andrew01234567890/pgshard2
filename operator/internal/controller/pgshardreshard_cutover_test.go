@@ -8,6 +8,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -289,6 +290,37 @@ var _ = Describe("PgShardReshard cutover", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "chappy", Namespace: ns}, &rt)).To(Succeed())
 		Expect(rt.Spec.Gates).To(BeEmpty())
 		Expect(switchedSetCompiled(&rt, "chappy-src", rs.Status.TargetShards)).To(BeTrue())
+	})
+
+	It("cleanly deletes a pre-commit cutover, withdrawing gate and un-fencing", func() {
+		sourceAgent, _, reconcile, routingReconcile, _ := cutoverSetup("del")
+		name := "rco-del"
+		for range 3 {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			if get(name).Status.Phase == pgshardv1alpha1.ReshardCuttingOver {
+				break
+			}
+		}
+		// Reach the freeze so the source is fenced and the gate is published.
+		drive(reconcile, routingReconcile, "the frozen barrier", func() bool {
+			return get(name).Status.CutoverFrozenLSN != 0
+		})
+		Expect(sourceAgent.FencedDatabases()).To(HaveKey("cdel-src"))
+
+		// Delete mid-cutover (delete-to-change-course). Cleanup must clear the
+		// gate, un-fence the source, release the claim, and let the object go.
+		rs := get(name)
+		Expect(k8sClient.Delete(ctx, &rs)).To(Succeed())
+		drive(reconcile, routingReconcile, "the reshard to be gone", func() bool {
+			var got pgshardv1alpha1.PgShardReshard
+			return apierrors.IsNotFound(
+				k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &got))
+		})
+		Expect(sourceAgent.FencedDatabases()).NotTo(HaveKey("cdel-src"),
+			"deletion must un-fence the source")
+		Expect(getShard("cdel-src").Annotations).NotTo(HaveKey("pgshard.dev/cutover-claim"),
+			"deletion must release the source claim")
 	})
 
 	It("rolls back to CatchingUp when the gate deadline expires uncommitted", func() {

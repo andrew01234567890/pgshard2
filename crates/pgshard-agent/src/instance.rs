@@ -126,6 +126,12 @@ pub trait Instance: Send + Sync + 'static {
     async fn switch_wal(&self, wait_archived: bool) -> anyhow::Result<u64>;
 
     /// Make `database` provably write-quiescent for the cutover freeze: set
+    /// (TRUST ASSUMPTION: `default_transaction_read_only` is a DEFAULT a
+    /// session may override, and the `pgshard_` application_name spare is
+    /// client-asserted — so "write-quiescent" holds only because the shard
+    /// database's write credentials belong solely to trusted pgshard
+    /// components, which never spoof the prefix nor request a read-write
+    /// transaction. Untrusted direct write access is out of M1 scope.)
     /// it `default_transaction_read_only` so every NEW session refuses writes,
     /// then terminate the in-flight client backends still inside a
     /// transaction so no write can commit AFTER the subsequent barrier. Their
