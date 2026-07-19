@@ -1059,6 +1059,10 @@ async fn run_workflow(
     });
     let mut decoder = PgOutputDecoder::new(4);
     let mut relations: HashMap<u32, RelFilter> = HashMap::new();
+    // The pgshard journal message decoded inside the CURRENT transaction, if
+    // any; acknowledged (published as journal_lsn) only once that
+    // transaction COMMITS — the barrier is real only when durably decoded.
+    let mut pending_journal: Option<u64> = None;
     // ALTER PUBLICATION mid-stream makes pgoutput silently omit changes with
     // no Relation message to betray it; the only defense is to poll the
     // catalog and fail loudly on drift (bounded by this interval — a failed
@@ -1094,6 +1098,16 @@ async fn run_workflow(
         };
         let msg = decoder.decode(&frame.data)?;
         let committed = matches!(msg, LogicalRepMsg::Commit(_));
+        if let LogicalRepMsg::Message(m) = &msg
+            && m.prefix == "pgshard"
+            && m.transactional
+        {
+            // The cutover freeze barrier: its OWN WAL position is the value
+            // the operator compares against the emitted journal's LSN — an
+            // explicit database-local acknowledgement, immune to WAL from
+            // other databases (which never produces frames on this slot).
+            pending_journal = Some(m.lsn.0);
+        }
         match &msg {
             LogicalRepMsg::Relation(rel) => {
                 let table = run
@@ -1202,8 +1216,12 @@ async fn run_workflow(
             let ack = applier.ack_lsn();
             repl.confirm(ack);
             repl.send_standby_status().await?;
+            let journal = pending_journal.take();
             status.send_modify(|s| {
                 s.applied_lsn = Some(v1::Lsn { value: ack.0 });
+                if let Some(j) = journal {
+                    s.journal_lsn = Some(v1::Lsn { value: j });
+                }
             });
         }
     }

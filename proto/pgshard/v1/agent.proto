@@ -214,6 +214,11 @@ message EmitJournalRequest {
   string database = 2;
   // Pod-identity fence, as elsewhere: ABORTED on mismatch.
   string target_pod_uid = 3;
+  // Idempotency identity: a retry with the same id and an IDENTICAL payload
+  // replays the recorded position instead of emitting a second journal
+  // record; the same id with a different payload is FAILED_PRECONDITION.
+  // Required.
+  string id = 4;
 }
 
 message EmitJournalResponse {

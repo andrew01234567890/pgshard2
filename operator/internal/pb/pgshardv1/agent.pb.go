@@ -1931,7 +1931,12 @@ type EmitJournalRequest struct {
 	// other. Required.
 	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
 	// Pod-identity fence, as elsewhere: ABORTED on mismatch.
-	TargetPodUid  string `protobuf:"bytes,3,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
+	TargetPodUid string `protobuf:"bytes,3,opt,name=target_pod_uid,json=targetPodUid,proto3" json:"target_pod_uid,omitempty"`
+	// Idempotency identity: a retry with the same id and an IDENTICAL payload
+	// replays the recorded position instead of emitting a second journal
+	// record; the same id with a different payload is FAILED_PRECONDITION.
+	// Required.
+	Id            string `protobuf:"bytes,4,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1983,6 +1988,13 @@ func (x *EmitJournalRequest) GetDatabase() string {
 func (x *EmitJournalRequest) GetTargetPodUid() string {
 	if x != nil {
 		return x.TargetPodUid
+	}
+	return ""
+}
+
+func (x *EmitJournalRequest) GetId() string {
+	if x != nil {
+		return x.Id
 	}
 	return ""
 }
@@ -2814,11 +2826,12 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\v2\x1a.pgshard.v1.WorkflowStatusR\x06status\"\x13\n" +
 	"\x11CheckpointRequest\"7\n" +
 	"\x12CheckpointResponse\x12!\n" +
-	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"\x8a\x01\n" +
+	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"\x9a\x01\n" +
 	"\x12EmitJournalRequest\x122\n" +
 	"\ajournal\x18\x01 \x01(\v2\x18.pgshard.v1.JournalEventR\ajournal\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12$\n" +
-	"\x0etarget_pod_uid\x18\x03 \x01(\tR\ftargetPodUid\"8\n" +
+	"\x0etarget_pod_uid\x18\x03 \x01(\tR\ftargetPodUid\x12\x0e\n" +
+	"\x02id\x18\x04 \x01(\tR\x02id\"8\n" +
 	"\x13EmitJournalResponse\x12!\n" +
 	"\x03lsn\x18\x01 \x01(\v2\x0f.pgshard.v1.LsnR\x03lsn\"\xec\x01\n" +
 	"\x12ShardStreamRequest\x12'\n" +

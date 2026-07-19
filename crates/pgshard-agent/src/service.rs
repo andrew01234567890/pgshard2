@@ -42,6 +42,12 @@ pub struct AgentSvc<I: Instance> {
     /// after an agent restart is out of scope for M1.
     restore_points:
         tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<RestorePoint>>>>>,
+    /// Journals already emitted, by request id — same single-flight shape as
+    /// restore_points: a retried EmitJournal must REPLAY its recorded
+    /// position (a second emit would give CDC consumers two journal records
+    /// for one cutover), and an id reused with a DIFFERENT payload is a
+    /// protocol violation, not a retry.
+    journals: tokio::sync::Mutex<HashMap<String, JournalSlot>>,
     /// Seeding workflows this agent runs (reshard target pull). A `None`
     /// config means the runner is not wired (no replication credentials or
     /// target conninfo) and the workflow RPCs answer Unimplemented.
@@ -62,6 +68,7 @@ impl<I: Instance> AgentSvc<I> {
             epoch: EpochGuard::new(),
             schema: SchemaLog::new(),
             restore_points: tokio::sync::Mutex::new(HashMap::new()),
+            journals: tokio::sync::Mutex::new(HashMap::new()),
             workflows: Arc::new(WorkflowRegistry::default()),
             workflow_config: None,
         }
@@ -162,6 +169,9 @@ fn check_provenance(value: &str) -> Result<(), Status> {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+/// One journal id's single-flight slot: recorded (lsn, exact payload).
+type JournalSlot = Arc<tokio::sync::Mutex<Option<(u64, Vec<u8>)>>>;
 
 #[tonic::async_trait]
 impl<I: Instance> AgentService for AgentSvc<I> {
@@ -527,17 +537,38 @@ impl<I: Instance> AgentService for AgentSvc<I> {
             )));
         }
         check_ident("database", &req.database, true)?;
+        if req.id.is_empty() {
+            return Err(Status::invalid_argument("id is required"));
+        }
         let journal = req
             .journal
             .ok_or_else(|| Status::invalid_argument("journal event is required"))?;
         if journal.source_shard.is_empty() {
             return Err(Status::invalid_argument("journal source_shard is required"));
         }
+        let payload = journal.encode_to_vec();
+        let slot = {
+            let mut journals = self.journals.lock().await;
+            journals.entry(req.id.clone()).or_default().clone()
+        };
+        let mut recorded = slot.lock().await;
+        if let Some((lsn, prior)) = recorded.as_ref() {
+            if *prior != payload {
+                return Err(Status::failed_precondition(format!(
+                    "journal id {:?} was already emitted with a different payload",
+                    req.id
+                )));
+            }
+            return Ok(Response::new(v1::EmitJournalResponse {
+                lsn: Some(v1::Lsn { value: *lsn }),
+            }));
+        }
         let lsn = self
             .instance
-            .emit_journal(&req.database, &journal.encode_to_vec())
+            .emit_journal(&req.database, &payload)
             .await
             .map_err(internal)?;
+        *recorded = Some((lsn, payload));
         Ok(Response::new(v1::EmitJournalResponse {
             lsn: Some(v1::Lsn { value: lsn }),
         }))
@@ -731,6 +762,7 @@ mod tests {
                     ..Default::default()
                 }),
                 database: "shard_src".into(),
+                id: "cutover-1".into(),
                 ..Default::default()
             }))
             .await
@@ -740,6 +772,39 @@ mod tests {
         let journals = s.instance.journals();
         assert_eq!(journals.len(), 1);
         assert_eq!(journals[0].0, "shard_src");
+
+        // An identical retry REPLAYS the recorded position (even after the
+        // WAL moved) without a second emit; a payload change under the same
+        // id is a protocol violation.
+        s.instance.set(|st| st.write_lsn = 0x99);
+        let retry = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "src".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retry.lsn.unwrap().value, 0x77);
+        assert_eq!(s.instance.journals().len(), 1, "no second emit");
+        let clash = s
+            .emit_journal(Request::new(v1::EmitJournalRequest {
+                journal: Some(v1::JournalEvent {
+                    source_shard: "other".into(),
+                    ..Default::default()
+                }),
+                database: "shard_src".into(),
+                id: "cutover-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -757,6 +822,7 @@ mod tests {
                 }),
                 database: "shard_src".into(),
                 target_pod_uid: "uid-stale".into(),
+                id: "cutover-1".into(),
             }))
             .await
             .unwrap_err();
@@ -769,6 +835,7 @@ mod tests {
         let err = s
             .emit_journal(Request::new(v1::EmitJournalRequest {
                 database: "shard_src".into(),
+                id: "cutover-1".into(),
                 ..Default::default()
             }))
             .await
